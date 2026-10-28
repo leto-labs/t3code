@@ -21,9 +21,43 @@ import {
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
   ContextHandoffBudgetError,
   ContextHandoffBackgroundWorkError,
+  ProviderUsageLimitError,
 } from "./failure.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+it("preserves a confirmed usage limit and reset through session wrappers", () => {
+  const resetAt = "2026-10-19T12:00:00.000Z";
+  const failure = makeProviderFailure({
+    cause: {
+      cause: {
+        cause: new ProviderUsageLimitError({
+          detail: "All eligible accounts are exhausted.",
+          resetAt,
+        }),
+      },
+    },
+    class: "provider_error",
+    message: "Provider session failed to open.",
+  });
+  assert.deepEqual(failure, {
+    class: "usage_limit",
+    message: "All eligible accounts are exhausted.",
+    code: "usageLimitExceeded",
+    retryable: null,
+    resetAt,
+  });
+});
+
+it("does not invent a reset for a usage limit without a valid reset time", () => {
+  for (const resetAt of [null, "invalid"]) {
+    const failure = makeProviderFailure({
+      cause: new ProviderUsageLimitError({ detail: "Allowance exhausted.", resetAt }),
+    });
+    assert.equal(failure.class, "usage_limit");
+    assert.notProperty(failure, "resetAt");
+  }
+});
 
 it("redacts credentials and URL secrets from provider failures", () => {
   const failure = makeProviderFailure({

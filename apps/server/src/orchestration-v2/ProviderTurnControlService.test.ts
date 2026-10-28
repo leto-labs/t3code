@@ -208,6 +208,7 @@ function layerSessions(
   return Layer.succeed(
     ProviderSessionManager.ProviderSessionManagerV2,
     ProviderSessionManager.ProviderSessionManagerV2.of({
+      validateModelSelection: () => Effect.void,
       shutdown: Effect.void,
       open: () => Effect.die("unused open"),
       get: (providerSessionId) =>

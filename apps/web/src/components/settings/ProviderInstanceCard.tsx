@@ -70,6 +70,7 @@ import { RedactedSensitiveText } from "./RedactedSensitiveText";
 import { SettingResetButton, SettingsRow, SettingsSection } from "./settingsLayout";
 import { AcpSessionManagementSection } from "./AcpSessionManagementSection";
 import { FoldedSettingsSection } from "./FoldedSettingsSection";
+import { readCodexAutoMembers } from "./CodexAutoPoolSection.logic";
 import { readCodexSetupMode } from "./CodexSetupSection.logic";
 import {
   type CustomModelSave,
@@ -810,6 +811,8 @@ export function ProviderInstanceCard({
 }: ProviderInstanceCardProps) {
   const gt = useGT();
   const m = useMessages();
+  const isCodexAuto =
+    instance.driver === "codex" && readCodexAutoMembers(instance.config) !== undefined;
   const enabled = projectOverride?.effectiveEnabled ?? resolveProviderInstanceEnabled(instance);
   const effectiveProvider = liveProvider && { ...liveProvider, enabled };
   const compatibility = enabled ? liveProvider?.compatibilityAdvisory : undefined;
@@ -1446,34 +1449,36 @@ export function ProviderInstanceCard({
           aria-disabled={readOnly || undefined}
           className={readOnly ? "opacity-50 select-none" : undefined}
         >
-          {runtimeFields}
+          {runtime ?? runtimeFields}
         </SettingsSection>
       ) : null}
 
-      <SettingsSection
-        title={gt("Environment")}
-        inert={readOnly || instanceLocks?.wholeEnvironment}
-        aria-disabled={readOnly || instanceLocks?.wholeEnvironment || undefined}
-        className={readOnly ? "opacity-50 select-none" : undefined}
-      >
-        {instanceLocks?.wholeEnvironment ? (
-          <ManagedNotice>{instanceLocks.reason}</ManagedNotice>
-        ) : null}
-        <div className={instanceLocks?.wholeEnvironment ? "opacity-50" : undefined}>
-          <ProviderEnvironmentSection
-            environment={genericEnvironment}
-            onChange={updateGenericEnvironment}
-            secretSources={secretSources}
-            environmentId={environmentId}
-            managed={
-              instanceLocks && {
-                names: instanceLocks.environmentNames,
-                reason: instanceLocks.reason,
+      {!isCodexAuto ? (
+        <SettingsSection
+          title={gt("Environment")}
+          inert={readOnly || instanceLocks?.wholeEnvironment}
+          aria-disabled={readOnly || instanceLocks?.wholeEnvironment || undefined}
+          className={readOnly ? "opacity-50 select-none" : undefined}
+        >
+          {instanceLocks?.wholeEnvironment ? (
+            <ManagedNotice>{instanceLocks.reason}</ManagedNotice>
+          ) : null}
+          <div className={instanceLocks?.wholeEnvironment ? "opacity-50" : undefined}>
+            <ProviderEnvironmentSection
+              environment={genericEnvironment}
+              onChange={updateGenericEnvironment}
+              secretSources={secretSources}
+              environmentId={environmentId}
+              managed={
+                instanceLocks && {
+                  names: instanceLocks.environmentNames,
+                  reason: instanceLocks.reason,
+                }
               }
-            }
-          />
-        </div>
-      </SettingsSection>
+            />
+          </div>
+        </SettingsSection>
+      ) : null}
       {environmentId !== undefined && liveProvider?.driver === "acpRegistry" ? (
         <AcpSessionManagementSection
           environmentId={environmentId}
@@ -1494,7 +1499,7 @@ export function ProviderInstanceCard({
               </T>
             </p>
             <ProviderModelsSection
-              canManageCustomModels={!readOnly}
+              canManageCustomModels={!readOnly && !isCodexAuto}
               canWritePreferences={canWriteSettings}
               instanceId={instanceId}
               driverKind={driverKind}
