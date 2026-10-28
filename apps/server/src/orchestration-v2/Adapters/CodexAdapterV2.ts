@@ -1527,11 +1527,13 @@ function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly stdioMcpServers?: ReadonlyArray<string>;
-  readonly modelSelection?: { readonly model: string };
+  readonly modelSelection?: Pick<ModelSelection, "model" | "options">;
+  readonly modelProvider?: string;
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }): {
   readonly cwd?: string;
   readonly model?: string;
+  readonly modelProvider?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
 } {
   const { mcpSession } = input;
@@ -1546,6 +1548,7 @@ function codexThreadRuntimeParams(input: {
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
+    ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
     config: {
       ...CODEX_THREAD_CONFIG,
       // One app-server serves many threads, so the id goes in per-thread shell config, not its env.
@@ -1561,6 +1564,17 @@ function codexThreadRuntimeParams(input: {
               ]),
             ),
           }),
+      ...(input.modelSelection?.options === undefined
+        ? {}
+        : Object.fromEntries(
+            input.modelSelection.options.flatMap((option) =>
+              option.id === "serviceTier"
+                ? [["service_tier", option.value]]
+                : option.id === "reasoningEffort"
+                  ? [["model_reasoning_effort", option.value]]
+                  : [],
+            ),
+          )),
       ...(t3Server === undefined
         ? {}
         : {
@@ -7962,6 +7976,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession: session,
           events: Stream.fromEffectRepeat(Queue.take(events)),
+          isReusable: client.isRunning,
           canReuseContextUsage: canReuseCodexContextUsage,
           normalizeThreadLoadModelSelection: normalizeCodexThreadLoadModelSelection,
           // Idle release can beat delayed subagent resumes: Codex reports them completed between turns with no resume-expected signal.
@@ -8314,6 +8329,33 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // unarchives it on the next turn.
               if (unloadInput.archive === true) {
                 yield* client.request("thread/archive", { threadId: nativeThreadId });
+              } else if (unloadInput.awaitWriterRelease === true) {
+                // Another process resumes from the shared session files, so this one must
+                // have released the writer first. A concurrent unload shares the same wait.
+                const pending = threadClosings.get(nativeThreadId);
+                if (pending !== undefined) {
+                  yield* Deferred.await(pending).pipe(Effect.timeout("8 seconds"));
+                } else {
+                  const closing = yield* Deferred.make<void>();
+                  threadClosings.set(nativeThreadId, closing);
+                  yield* Effect.gen(function* () {
+                    const response = yield* client.request("thread/unsubscribe", {
+                      threadId: nativeThreadId,
+                    });
+                    // Only a released subscription leads to thread/closed on this connection.
+                    if (response.status === "unsubscribed") yield* Deferred.await(closing);
+                    else yield* Deferred.succeed(closing, undefined);
+                  }).pipe(
+                    Effect.timeout("8 seconds"),
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        if (threadClosings.get(nativeThreadId) === closing) {
+                          threadClosings.delete(nativeThreadId);
+                        }
+                      }),
+                    ),
+                  );
+                }
               } else {
                 // A resume may already wait on the pending entry; replacing it would strand that wait.
                 if (!threadClosings.has(nativeThreadId)) {

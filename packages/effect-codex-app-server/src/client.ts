@@ -39,6 +39,7 @@ interface CodexAppServerClientRaw {
 export class CodexAppServerClient extends Context.Service<
   CodexAppServerClient,
   {
+    readonly isRunning: CodexProtocol.CodexAppServerPatchedProtocol["isRunning"];
     readonly raw: CodexAppServerClientRaw;
     readonly awaitTermination: Effect.Effect<never, CodexError.CodexAppServerError>;
     readonly request: <M extends CodexRpc.ClientRequestMethod>(
@@ -260,6 +261,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
 
   return CodexAppServerClient.of({
     awaitTermination: Deferred.await(termination),
+    isRunning: transport.isRunning,
     raw: {
       notifications: transport.incomingNotifications,
       requests: transport.incomingRequests,
