@@ -11,8 +11,22 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import { readAutoPools } from "@t3tools/contracts";
 
 const handlers = {
+  provider_usage_limits: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const registry = yield* ProviderRegistry.ProviderRegistry;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const pools = yield* settings.getSettings.pipe(
+        Effect.map((current) => readAutoPools(current.providerInstances)),
+        Effect.orElseSucceed(() => []),
+      );
+      return yield* registry.usageReport(input, pools);
+    }),
+  ),
   orchestrator_capabilities: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

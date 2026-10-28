@@ -2989,6 +2989,63 @@ describe("OrchestratorMcpService provider resolution", () => {
     }),
   );
 
+  it.effect("offers Auto pool members to agents only through their Auto instance", () =>
+    Effect.gen(function* () {
+      const autoId = ProviderInstanceId.make("codex_auto");
+      const memberId = ProviderInstanceId.make("codex_member");
+      const layerDependencies = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
+          getThreadRecords: () => Effect.succeed(parentProjection([])),
+        }),
+        ServerSettings.layerTest({
+          providerInstances: {
+            [autoId]: {
+              driver: ProviderDriverKind.make("codex"),
+              config: { autoPoolMemberIds: [memberId] },
+            },
+            [memberId]: { driver: ProviderDriverKind.make("codex") },
+          },
+        }),
+        providerRegistryLayer(
+          [codexInstanceId, autoId, memberId].map((instanceId) =>
+            providerSnapshot({
+              instanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+          ),
+        ),
+        adapterRegistryLayer([codexInstanceId, autoId, memberId]),
+        Layer.mock(ProjectService.ProjectService)({ getById: () => Effect.succeedNone }),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const capabilities = yield* service.capabilities(scope);
+        assert.deepEqual(
+          capabilities.providers.map((provider) => provider.providerInstanceId),
+          [codexInstanceId, autoId],
+        );
+        const error = yield* service
+          .delegateTask(scope, {
+            task: "Summarize the diff.",
+            target: { providerInstanceId: memberId },
+            mode: "async",
+            clientRequestId: "delegate-pool-member",
+          })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "invalid_request");
+        assert.include(error.message, "reserved for the codex_auto Auto pool. Select codex_auto");
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+    }),
+  );
+
   it.effect("reports the dispatch cause instead of the generic wrapper when delegating fails", () =>
     Effect.gen(function* () {
       const layerDependencies = Layer.mergeAll(

@@ -1,4 +1,9 @@
-import { CommandId, MessageId, type OrchestrationV2Command } from "@t3tools/contracts";
+import {
+  CommandId,
+  MessageId,
+  type OrchestrationV2Command,
+  type OrchestrationV2ProviderGoalStatus,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -15,11 +20,17 @@ import { routineSpan } from "@t3tools/shared/observability";
 
 export const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
 
+const limitRecoveryText = (goalStatus: OrchestrationV2ProviderGoalStatus | undefined) =>
+  goalStatus === "active" || goalStatus === "usage_limited"
+    ? "/goal resume"
+    : "Continue where you left off.";
+
 export function limitRecoveryCommand(
   thread: ProjectionStore.ProjectionLimitRecoveryCandidate,
   autoResume: boolean,
   nowMs: number,
   snooze = false,
+  goalStatus?: OrchestrationV2ProviderGoalStatus,
 ): OrchestrationV2Command | null {
   if (
     thread.status !== "failed" ||
@@ -71,7 +82,7 @@ export function limitRecoveryCommand(
     ...(recovery.requestId === undefined
       ? {}
       : { usageLimitRecoveryRequestId: recovery.requestId }),
-    text: "Continue where you left off.",
+    text: limitRecoveryText(goalStatus),
     attachments: [],
     dispatchMode: { type: "start_immediately" },
     createdBy: "agent",
@@ -113,15 +124,23 @@ const makeSweep = Effect.gen(function* () {
     });
     let acted = false;
     for (const thread of candidates) {
-      const command = limitRecoveryCommand(
+      const planned = limitRecoveryCommand(
         thread,
         preferences.autoResumeLimitedThreads,
         nowMs,
         preferences.snoozeLimitedThreads,
       );
-      if (command === null) continue;
+      if (planned === null) continue;
       acted = true;
       yield* Effect.gen(function* () {
+        let command = planned;
+        if (command.type === "message.dispatch") {
+          const current = yield* threads.getThreadRecords(thread.id, ["providerThreads"]);
+          const goal = current.providerThreads.find(
+            (providerThread) => providerThread.id === current.thread.activeProviderThreadId,
+          )?.goal;
+          command = { ...command, text: limitRecoveryText(goal?.status) };
+        }
         if (command.type === "thread.metadata.update" && command.limitRecovery != null) {
           yield* orchestrator.autoArmLimitRecovery({
             commandId: command.commandId,

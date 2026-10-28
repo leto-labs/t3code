@@ -1082,6 +1082,7 @@ export const layer: Layer.Layer<
       const sessionResult = yield* Effect.result(
         providerSessions.open({
           threadId: projection.thread.id,
+          projectId: projection.thread.projectId,
           providerSessionId,
           modelSelection: run.modelSelection,
           runtimePolicy: resolvedRuntimePolicy,

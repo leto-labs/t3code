@@ -69,7 +69,7 @@ describe("applyUsageLimitsUpdate", () => {
     expect(next).not.toBe(published);
     expect(next).toEqual({
       checkedAt: "2026-09-03T12:00:05.000Z",
-      windows: [{ ...session, usedPercent: 55 }, weekly],
+      windows: [{ ...session, usedPercent: 55, observedAt: "2026-09-03T12:00:05.000Z" }, weekly],
     });
   });
 
@@ -86,7 +86,11 @@ describe("applyUsageLimitsUpdate", () => {
   it("marks a first sparse update as unavailable", () => {
     expect(
       applyUsageLimitsUpdate({ previous: undefined, checkedAt, update: { windows: [weekly] } }),
-    ).toEqual({ checkedAt, windows: [weekly], unavailable: { reason: "probeFailed" } });
+    ).toEqual({
+      checkedAt,
+      windows: [{ ...weekly, observedAt: checkedAt }],
+      unavailable: { reason: "probeFailed" },
+    });
   });
 
   it("preserves reset credits and a $0 cap when a streamed window update changes usage", () => {
@@ -94,12 +98,14 @@ describe("applyUsageLimitsUpdate", () => {
     const next = applyUsageLimitsUpdate({
       previous: { ...published, resetCredits, zeroSpendCap: true },
       checkedAt: "2026-09-03T12:00:05.000Z",
-      update: { windows: [{ ...session, usedPercent: 55 }] },
+      update: {
+        windows: [{ ...session, usedPercent: 55, observedAt: "2026-09-03T12:00:05.000Z" }],
+      },
     });
 
     expect(next).toEqual({
       checkedAt: "2026-09-03T12:00:05.000Z",
-      windows: [{ ...session, usedPercent: 55 }, weekly],
+      windows: [{ ...session, usedPercent: 55, observedAt: "2026-09-03T12:00:05.000Z" }, weekly],
       resetCredits,
       zeroSpendCap: true,
     });
@@ -139,7 +145,11 @@ describe("resolveUsageLimitsAfterProbe", () => {
   it("keeps the last good windows through a failed probe but not an unsupported one", () => {
     const failed = { checkedAt, windows: [], unavailable: { reason: "probeFailed" as const } };
     const unsupported = { checkedAt, windows: [], unavailable: { reason: "unsupported" as const } };
-    expect(resolveUsageLimitsAfterProbe({ published, probed: failed })).toBe(published);
+    expect(resolveUsageLimitsAfterProbe({ published, probed: failed })).toEqual({
+      ...published,
+      lastAttemptAt: checkedAt,
+      lastAttemptFailed: true,
+    });
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
   });

@@ -461,6 +461,13 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
               )
             : runtimeMode;
         if (!replaying) {
+          yield* OrchestrationMcp.requireOutsideAutoPool(
+            (yield* ServerSettings.ServerSettingsService.pipe(
+              Effect.flatMap((settings) => settings.getSettings),
+              Effect.mapError(unavailable),
+            )).providerInstances,
+            modelSelection.instanceId,
+          );
           const providers = yield* (yield* ProviderRegistry.ProviderRegistry).getProviders;
           startedRuntimeMode = yield* resolveRuntimeMode(startedRuntimeMode, input.runtimeMode, {
             modelSelection,

@@ -13018,5 +13018,15 @@
       "v": "v"
     },
     " weitere unter Verknüpfte Elemente"
-  ]
+  ],
+  "b9de107e94b19863": "Codex Auto accounts",
+  "4c6af9804529ef87": "Choose the accounts Auto may use. Selected accounts are hidden from the composer and direct agent access. They can sign in separately but must share the server''s {path} session home.",
+  "c4a6cef0efe25e55": "No accounts selected",
+  "917d1f40bc138b37": "Auto is unavailable in the composer until you add accounts.",
+  "8dd7143b0e4c7134": "This account is currently disabled. Enable it before using the pool.",
+  "7d21cdb6dd3007c4": "Include {name} in Codex Auto",
+  "4d60ffc66135ebc0": "This selected account is missing or is no longer a direct Codex subscription. Remove it to repair the pool.",
+  "4094c65ec18e754e": "Remove {name} from Codex Auto",
+  "2ea284d2e9990409": "Supported models",
+  "d9db3b15d9f9a050": "Auto offers only models, reasoning options, and service tiers supported by every selected account. Manage model visibility and favorites in Models below."
 }
