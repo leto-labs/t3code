@@ -29,6 +29,7 @@ import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { makeLinkedThreadsChangeDetector } from "../pullRequest/linkedThreads.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import { makeNoPullRequestRechecks } from "./noPullRequestRechecks.ts";
 import {
@@ -129,6 +130,7 @@ export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
+  const settings = yield* ServerSettings.ServerSettingsService;
   const pendingBackfill = new Map<ThreadId, number>();
   const noPullRequestRechecks = makeNoPullRequestRechecks();
 
@@ -224,6 +226,7 @@ export const make = Effect.gen(function* () {
   const synchronize = Effect.fn("ThreadPullRequestServiceV2.synchronize")(function* (
     request: RefreshRequest,
   ) {
+    if (!(yield* ServerSettings.backgroundPullRequestRefreshEnabled(settings))) return;
     const [threadSnapshot, projectShells] = yield* Effect.all([
       readThreadSnapshot(request),
       projectStore.listShells(),

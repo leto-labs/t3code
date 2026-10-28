@@ -28,6 +28,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerActivation from "../serverActivation.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -106,6 +107,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const turnLookup = yield* Deferred.make<void>();
       const lookups: Array<{ readonly refresh: boolean }> = [];
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(domainEvents),
           getPullRequestSnapshot: () =>
@@ -205,6 +207,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const domainEvents = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
       const notified = yield* Queue.unbounded<void>();
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(domainEvents),
           getPullRequestSnapshot: () =>
@@ -294,6 +297,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const followUpQueued = yield* Deferred.make<void>();
       const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           // The batch arrives while the worker is busy with the startup sweep.
           streamDomainEvents: Stream.fromEffect(Deferred.await(sweepStarted)).pipe(
@@ -439,6 +443,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const sweepStarted = yield* Deferred.make<void>();
         const lookupCwds: Array<string> = [];
         const dependencies = Layer.mergeAll(
+          ServerSettings.ServerSettingsService.layerTest(),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.never,
             getPullRequestSnapshot: () =>
@@ -546,6 +551,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const lookups: Array<{ readonly cwd: string; readonly branch: string }> = [];
           const dispatched: Array<OrchestrationV2ServerCommand> = [];
           const dependencies = Layer.mergeAll(
+            ServerSettings.ServerSettingsService.layerTest(),
             Layer.mock(Orchestrator.OrchestratorV2)({
               streamDomainEvents: Stream.fromQueue(domainEvents),
               getPullRequestSnapshot: () =>
@@ -706,6 +712,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const childLookup = yield* Deferred.make<void>();
       const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.fromQueue(domainEvents),
           getPullRequestSnapshot: ({ threadId }) =>
@@ -831,6 +838,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const sweeps = yield* Queue.unbounded<void>();
       const lookups: Array<{ readonly cwd: string; readonly branch: string }> = [];
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.never,
           getPullRequestSnapshot: () =>
@@ -947,6 +955,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const sweepStarted = yield* Deferred.make<void>();
         const commands: Array<OrchestrationV2ServerCommand> = [];
         const dependencies = Layer.mergeAll(
+          ServerSettings.ServerSettingsService.layerTest(),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.never,
             getPullRequestSnapshot: () =>
@@ -1058,6 +1067,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const commands: Array<OrchestrationV2ServerCommand> = [];
         let snapshotThread: unknown;
         const dependencies = Layer.mergeAll(
+          ServerSettings.ServerSettingsService.layerTest(),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.never,
             getPullRequestSnapshot: (options) =>
@@ -1200,6 +1210,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const lookups: Array<Parameters<GitManager.GitManager["Service"]["branchPullRequest"]>[1]> =
         [];
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.never,
           getPullRequestSnapshot: () =>
@@ -1337,6 +1348,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
       const sweeps = yield* Queue.unbounded<void>();
       const commands: Array<OrchestrationV2ServerCommand> = [];
       const dependencies = Layer.mergeAll(
+        ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(Orchestrator.OrchestratorV2)({
           streamDomainEvents: Stream.never,
           getPullRequestSnapshot: () =>

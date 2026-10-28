@@ -13051,5 +13051,8 @@
   "4d60ffc66135ebc0": "This selected account is missing or is no longer a direct Codex subscription. Remove it to repair the pool.",
   "4094c65ec18e754e": "Remove {name} from Codex Auto",
   "2ea284d2e9990409": "Supported models",
-  "d9db3b15d9f9a050": "Auto offers only models, reasoning options, and service tiers supported by every selected account. Manage model visibility and favorites in Models below."
+  "d9db3b15d9f9a050": "Auto offers only models, reasoning options, and service tiers supported by every selected account. Manage model visibility and favorites in Models below.",
+  "c0021c5cd80c3c09": "Background pull request refresh",
+  "c6437499a4369737": "Discover and refresh pull requests in the background. Turn off to reduce server and network activity. Manual PR commands remain available.",
+  "4416a616b35a8a38": "PR discovery polling disable lookup performance network"
 }
