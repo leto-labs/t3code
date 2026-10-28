@@ -3729,6 +3729,7 @@ it.effect(
           threadId: secondThreadId,
           providerSessionId,
           now,
+          nativeThreadId: "native-thread-b",
         });
         const firstRunId = idAllocator.derive.run({ threadId: firstThreadId, ordinal: 1 });
         yield* eventSink.write({
@@ -3802,7 +3803,7 @@ it.effect(
         yield* settings.updateSettings({ linkedEnvironmentsEnabled: true });
         yield* resumeSecondThread;
         assert.equal((yield* Ref.get(state)).resumeCount, 4);
-        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread-b"]);
         const subscribe = firstRuntime.subscribeEvents;
         assert.isDefined(subscribe);
         if (subscribe === undefined) return;
@@ -3836,14 +3837,18 @@ it.effect(
         yield* resumeSecondThread;
         assert.equal((yield* Ref.get(state)).resumeCount, 5);
 
-        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          "native-thread-b",
+          "native-thread-b",
+        ]);
 
         yield* manager.detach({ providerSessionId, threadId: firstThreadId });
         assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
         assert.equal((yield* Ref.get(state)).closeCount, 0);
         assert.equal((yield* Ref.get(state)).interruptCount, 1);
         assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
-          "native-thread",
+          "native-thread-b",
+          "native-thread-b",
           "native-thread",
         ]);
 
@@ -4167,18 +4172,21 @@ it.effect(
     }),
 );
 
-it.effect(
-  "ProviderSessionManagerV2 re-attaching a thread waits for its in-flight unload, then reloads it",
-  () =>
+it.effect.each(["in-flight", "failed", "reassigned", "reassigned-failed"] as const)(
+  "ProviderSessionManagerV2 re-attaches after its %s unload completes",
+  (mode) =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
       const unloadStarted = yield* Deferred.make<void>();
       const releaseUnload = yield* Deferred.make<void>();
       let resumesBeforeUnload: number | undefined;
+      let unloadAttempts = 0;
       const beforeUnload = Effect.gen(function* () {
         yield* Deferred.succeed(unloadStarted, undefined);
         yield* Deferred.await(releaseUnload);
         resumesBeforeUnload = (yield* Ref.get(state)).resumeCount;
+        if (mode.endsWith("failed") && unloadAttempts++ === 0)
+          return yield* Effect.die("Writer lock still held");
       });
       const effect = Effect.gen(function* () {
         const eventSink = yield* EventSink.EventSinkV2;
@@ -4239,16 +4247,57 @@ it.effect(
         });
         yield* resume;
 
+        if (mode.startsWith("reassigned")) {
+          // The account switch commits before the old session's detach effect.
+          yield* eventSink.write({
+            events: [
+              {
+                id: yield* idAllocator.allocate.event({ threadId }),
+                type: "provider-thread.updated",
+                threadId,
+                driver: CODEX_DRIVER,
+                occurredAt: now,
+                payload: {
+                  ...providerThread,
+                  providerInstanceId: ProviderInstanceId.make("codex_other"),
+                  providerSessionId: idAllocator.derive.providerSession({
+                    providerInstanceId: ProviderInstanceId.make("codex_other"),
+                  }),
+                },
+              },
+            ],
+          });
+          yield* Deferred.succeed(releaseUnload, undefined);
+          const detached = yield* manager.detach({ providerSessionId, threadId }).pipe(Effect.exit);
+          assert.equal(detached._tag, mode.endsWith("failed") ? "Failure" : "Success");
+          if (mode.endsWith("failed")) {
+            yield* manager.detach({ providerSessionId, threadId });
+          }
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["native-thread"]);
+          assert.equal((yield* Ref.get(state)).closeCount, 0);
+          yield* resume;
+          assert.equal((yield* Ref.get(state)).resumeCount, 2);
+          return;
+        }
+
         const detach = yield* manager
           .detach({ providerSessionId, threadId })
-          .pipe(Effect.forkScoped);
+          .pipe(Effect.exit, Effect.forkScoped);
         yield* Deferred.await(unloadStarted);
-        const reattach = yield* resume.pipe(Effect.forkScoped);
-        yield* Effect.yieldNow;
-        yield* Effect.yieldNow;
-        yield* Deferred.succeed(releaseUnload, undefined);
-        yield* Fiber.join(detach);
-        yield* Fiber.join(reattach);
+        if (mode.endsWith("failed")) {
+          yield* Deferred.succeed(releaseUnload, undefined);
+          assert.equal((yield* Fiber.join(detach))._tag, "Failure");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          yield* manager.detach({ providerSessionId, threadId });
+          yield* resume;
+        } else {
+          const reattach = yield* resume.pipe(Effect.forkScoped);
+          yield* Effect.yieldNow;
+          yield* Effect.yieldNow;
+          yield* Deferred.succeed(releaseUnload, undefined);
+          assert.equal((yield* Fiber.join(detach))._tag, "Success");
+          yield* Fiber.join(reattach);
+        }
 
         assert.equal(resumesBeforeUnload, 1);
         assert.equal((yield* Ref.get(state)).resumeCount, 2);
@@ -4259,6 +4308,226 @@ it.effect(
       yield* effect.pipe(
         Effect.provide(layerTest({ state, idleTimeoutMs: 1000, beforeUnload })),
         Effect.scoped,
+      );
+    }),
+);
+
+function runIdleThreadUnloadScenario(
+  name: string,
+  scenario: (input: {
+    readonly state: Ref.Ref<TestProviderRuntimeState>;
+    readonly manager: ProviderSessionManager.ProviderSessionManagerV2Shape;
+    readonly providerSessionId: ProviderSessionId;
+    readonly threadA: ThreadId;
+    readonly startTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
+    readonly endTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
+    readonly resume: (threadId: ThreadId) => Effect.Effect<void>;
+  }) => Effect.Effect<void, ProviderSessionManager.ProviderSessionManagerV2Error>,
+  options: {
+    readonly hasPendingBackgroundWorkForThread?: Effect.Effect<boolean>;
+    readonly beforeUnload?: Effect.Effect<void>;
+  } = {},
+) {
+  return Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadA = ThreadId.make(`thread-provider-session-manager-${name}-a`);
+      const threadB = ThreadId.make(`thread-provider-session-manager-${name}-b`);
+      const providerSessionId = idAllocator.derive.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+      });
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId: threadA, now }),
+          yield* makeThreadCreatedEvent({ idAllocator, threadId: threadB, now }),
+        ],
+      });
+      const runtime = yield* manager.open({
+        threadId: threadA,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* manager.open({ threadId: threadB, providerSessionId, modelSelection, runtimePolicy });
+      const providerThreadOf = (threadId: ThreadId) =>
+        makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+          nativeThreadId: `native-${threadId}`,
+        });
+      const resume = (threadId: ThreadId) =>
+        runtime
+          .resumeThread({
+            providerThread: providerThreadOf(threadId),
+            threadId,
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.asVoid, Effect.orDie);
+      const startTurn = (threadId: ThreadId, ordinal: number) =>
+        Effect.gen(function* () {
+          yield* resume(threadId);
+          const runId = idAllocator.derive.run({ threadId, ordinal });
+          yield* runtime.startTurn({
+            appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+            threadId,
+            runId,
+            runOrdinal: ordinal,
+            providerTurnOrdinal: ordinal,
+            attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+            rootNodeId: idAllocator.derive.rootNode({ runId }),
+            providerThread: providerThreadOf(threadId),
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: yield* idAllocator.allocate.message({ threadId, ordinal }),
+              text: "turn",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy,
+          });
+        }).pipe(Effect.orDie);
+      const subscribe = runtime.subscribeEvents;
+      assert.isDefined(subscribe);
+      const endTurn = (threadId: ThreadId, ordinal: number) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const subscription = yield* Effect.acquireRelease(subscribe!, (sub) => sub.close);
+            const received = yield* subscription.events.pipe(
+              Stream.filter((event) => event.type === "turn.terminal"),
+              Stream.runHead,
+              Effect.forkScoped,
+            );
+            const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+            assert.isDefined(queue);
+            yield* Queue.offer(queue!, {
+              type: "turn.terminal",
+              driver: CODEX_DRIVER,
+              providerThreadId: providerThreadOf(threadId).id,
+              providerTurnId: idAllocator.derive.providerTurn({
+                driver: CODEX_DRIVER,
+                nativeTurnId: `native-turn-${threadId}-${ordinal}`,
+              }),
+              runOrdinal: ordinal,
+              status: "completed",
+              failure: null,
+              threadDisposition: "reusable",
+            });
+            yield* Fiber.join(received);
+          }),
+        ).pipe(Effect.orDie);
+
+      yield* startTurn(threadB, 1);
+      yield* scenario({
+        state,
+        manager,
+        providerSessionId,
+        threadA,
+        startTurn,
+        endTurn,
+        resume,
+      });
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          ...(options.beforeUnload === undefined ? {} : { beforeUnload: options.beforeUnload }),
+          ...(options.hasPendingBackgroundWorkForThread === undefined
+            ? {}
+            : { hasPendingBackgroundWorkForThread: options.hasPendingBackgroundWorkForThread }),
+        }),
+      ),
+    );
+  });
+}
+
+it.effect(
+  "ProviderSessionManagerV2 unloads a shared-runtime thread left idle, and reloads it on its next turn",
+  () =>
+    runIdleThreadUnloadScenario(
+      "idle-unload",
+      ({ state, manager, providerSessionId, threadA, startTurn, endTurn, resume }) =>
+        Effect.gen(function* () {
+          yield* startTurn(threadA, 1);
+          assert.equal((yield* Ref.get(state)).resumeCount, 2);
+          yield* endTurn(threadA, 1);
+
+          yield* TestClock.adjust("500 millis");
+          yield* startTurn(threadA, 2);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+
+          yield* endTurn(threadA, 2);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+          assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+          assert.equal((yield* Ref.get(state)).closeCount, 0);
+
+          const resumes = (yield* Ref.get(state)).resumeCount;
+          yield* resume(threadA);
+          assert.equal((yield* Ref.get(state)).resumeCount, resumes + 1);
+        }),
+    ),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 retains a failed idle unload for detach without a durable binding",
+  () =>
+    Effect.gen(function* () {
+      const failUnload = yield* Ref.make(true);
+      yield* runIdleThreadUnloadScenario(
+        "idle-unload-retry",
+        ({ state, manager, providerSessionId, threadA, startTurn, endTurn }) =>
+          Effect.gen(function* () {
+            yield* startTurn(threadA, 1);
+            yield* endTurn(threadA, 1);
+            yield* TestClock.adjust("1 second");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+            yield* Ref.set(failUnload, false);
+            yield* manager.detach({ providerSessionId, threadId: threadA });
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+              `native-${threadA}`,
+            ]);
+          }),
+        {
+          beforeUnload: Ref.get(failUnload).pipe(
+            Effect.flatMap((fail) => (fail ? Effect.die("Writer lock still held") : Effect.void)),
+          ),
+        },
+      );
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 keeps an idle shared-runtime thread loaded while its background work runs",
+  () =>
+    Effect.gen(function* () {
+      const pendingWork = yield* Ref.make(true);
+      yield* runIdleThreadUnloadScenario(
+        "idle-unload-pinned",
+        ({ state, threadA, startTurn, endTurn }) =>
+          Effect.gen(function* () {
+            yield* startTurn(threadA, 1);
+            yield* endTurn(threadA, 1);
+            yield* TestClock.adjust("3 seconds");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+
+            yield* Ref.set(pendingWork, false);
+            yield* TestClock.adjust("1 second");
+            assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+              `native-${threadA}`,
+            ]);
+          }),
+        { hasPendingBackgroundWorkForThread: Ref.get(pendingWork) },
       );
     }),
 );

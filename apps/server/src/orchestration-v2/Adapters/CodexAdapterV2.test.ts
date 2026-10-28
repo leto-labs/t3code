@@ -2846,6 +2846,132 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ),
       ),
   );
+  it.effect.each(["closed", "missing", "notLoaded"] as const)(
+    "waits for writer release after unsubscribe: %s",
+    (mode) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "unload-thread";
+        const acked = yield* Deferred.make<void>();
+        const releaseClosed = yield* Deferred.make<void>();
+        const releaseAck = yield* Deferred.make<void>();
+        const preamble = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId: "unused",
+          prompt: "unused",
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: `unload-thread-${mode}`,
+          entries: [
+            ...preamble.slice(0, 5),
+            {
+              type: "expect_outbound",
+              label: "thread/unsubscribe",
+              frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+            },
+            {
+              type: "emit_inbound",
+              label: "unsubscribe-ack",
+              frame: {
+                id: 3,
+                result: { status: mode === "notLoaded" ? "notLoaded" : "unsubscribed" },
+              },
+            },
+            ...(mode === "notLoaded"
+              ? []
+              : [
+                  {
+                    type: "emit_inbound" as const,
+                    label: "closed",
+                    frame: { method: "thread/closed", params: { threadId: nativeThreadId } },
+                  },
+                ]),
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          () => Effect.void,
+          () => Effect.void,
+          undefined,
+          (entry) =>
+            entry.label === "unsubscribe-ack"
+              ? Deferred.succeed(acked, undefined).pipe(Effect.andThen(Deferred.await(releaseAck)))
+              : entry.label === "closed"
+                ? Deferred.await(releaseClosed)
+                : Effect.void,
+        );
+        const unload = yield* harness.runtime.unloadThread!({
+          providerThread: harness.providerThread,
+        }).pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(acked);
+        const concurrentUnload = yield* harness.runtime.unloadThread!({
+          providerThread: harness.providerThread,
+        }).pipe(Effect.exit, Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseAck, undefined);
+        if (mode !== "notLoaded") {
+          assert.isUndefined(unload.pollUnsafe());
+          if (mode === "missing") yield* TestClock.adjust("8 seconds");
+          else yield* Deferred.succeed(releaseClosed, undefined);
+        }
+        const result = yield* Fiber.join(unload);
+        assert.equal(result._tag, mode === "missing" ? "Failure" : "Success");
+        assert.equal((yield* Fiber.join(concurrentUnload))._tag, result._tag);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect("keeps the app-server failure as the cause when an unload is rejected", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "unload-thread-rejected";
+      const preamble = codexReplayPreamble({
+        nativeThreadId,
+        nativeTurnId: "unused",
+        prompt: "unused",
+      });
+      const transcript = makeCodexReplayTranscript({
+        scenario: "unload-thread-rejected",
+        entries: [
+          ...preamble.slice(0, 5),
+          {
+            type: "expect_outbound",
+            label: "thread/unsubscribe",
+            frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+          },
+          {
+            type: "emit_inbound",
+            label: "thread/unsubscribe",
+            frame: { id: 3, error: { code: -32600, message: "invalid thread id" } },
+          },
+        ],
+      });
+      const harness = yield* makeCodexReplayHarness(transcript);
+      const error = yield* harness.runtime.unloadThread!({
+        providerThread: harness.providerThread,
+      }).pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterProtocolError");
+      const cause = error._tag === "ProviderAdapterProtocolError" ? error.cause : undefined;
+      assert.equal((cause as { _tag?: string } | undefined)?._tag, "CodexAppServerRequestError");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
 
   it.effect("resumes a provider thread without requesting or decoding its history", () =>
     Effect.scoped(

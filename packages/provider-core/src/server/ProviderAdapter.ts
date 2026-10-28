@@ -615,6 +615,8 @@ export type ProviderAdapterV2SubagentOutcome = {
 };
 
 export interface ProviderAdapterV2SessionRuntime {
+  /** False after an internal process replacement failed; reopen rather than reuse that runtime. */
+  readonly isReusable?: Effect.Effect<boolean>;
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;

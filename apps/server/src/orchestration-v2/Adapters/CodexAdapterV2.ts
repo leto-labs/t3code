@@ -1406,11 +1406,13 @@ const CODEX_DIRECT_ONLY_T3_TOOL = "t3_thread_wait";
 function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
-  readonly modelSelection?: { readonly model: string };
+  readonly modelSelection?: Pick<ModelSelection, "model" | "options">;
+  readonly modelProvider?: string;
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }): {
   readonly cwd?: string;
   readonly model?: string;
+  readonly modelProvider?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
 } {
   const { mcpSession } = input;
@@ -1425,12 +1427,24 @@ function codexThreadRuntimeParams(input: {
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
+    ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
     config: {
       ...CODEX_THREAD_CONFIG,
       // One app-server serves many threads, so the id goes in per-thread shell config, not its env.
       ...(input.threadId === null
         ? {}
         : { [`shell_environment_policy.set.${PortScanner.AGENT_THREAD_ENV}`]: input.threadId }),
+      ...(input.modelSelection?.options === undefined
+        ? {}
+        : Object.fromEntries(
+            input.modelSelection.options.flatMap((option) =>
+              option.id === "serviceTier"
+                ? [["service_tier", option.value]]
+                : option.id === "reasoningEffort"
+                  ? [["model_reasoning_effort", option.value]]
+                  : [],
+            ),
+          )),
       ...(t3Server === undefined
         ? {}
         : {
@@ -1761,6 +1775,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,
+        });
+        // Unload waits for thread/closed: only then has Codex released the native writer.
+        const threadClosures = new Map<string, Deferred.Deferred<void>>();
+        yield* client.handleServerNotification("thread/closed", ({ threadId }) => {
+          const closed = threadClosures.get(threadId);
+          return closed === undefined
+            ? Effect.void
+            : Deferred.succeed(closed, undefined).pipe(Effect.asVoid);
         });
         const additionalContextByThread = yield* Ref.make(
           new Map<
@@ -7113,6 +7135,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession: session,
           events: Stream.fromEffectRepeat(Queue.take(events)),
+          isReusable: client.isRunning,
           canReuseContextUsage: canReuseCodexContextUsage,
           // Idle release can beat delayed subagent resumes: Codex reports them completed between turns with no resume-expected signal.
           hasPendingBackgroundWork: Effect.gen(function* () {
@@ -7375,13 +7398,28 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
               ),
           ),
-          // Dropping this connection's subscription lets the shared app-server
-          // shut the native thread (and its MCP servers) down once it is idle.
+          // Unsubscribe acknowledges before shutdown; only thread/closed releases
+          // the native writer so another auth overlay can safely resume it.
           unloadThread: Effect.fn("CodexAdapterV2.unloadThread")(
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
-              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId });
+              const pending = threadClosures.get(nativeThreadId);
+              if (pending !== undefined)
+                return yield* Deferred.await(pending).pipe(Effect.timeout("8 seconds"));
+              const closed = yield* Deferred.make<void>();
+              threadClosures.set(nativeThreadId, closed);
+              yield* Effect.gen(function* () {
+                const response = yield* client.request("thread/unsubscribe", {
+                  threadId: nativeThreadId,
+                });
+                // Only a released subscription leads to thread/closed on this connection.
+                if (response.status === "unsubscribed") yield* Deferred.await(closed);
+                else yield* Deferred.succeed(closed, undefined);
+              }).pipe(
+                Effect.timeout("8 seconds"),
+                Effect.ensuring(Effect.sync(() => threadClosures.delete(nativeThreadId))),
+              );
             },
             (effect, unloadInput) =>
               effect.pipe(

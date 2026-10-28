@@ -1338,6 +1338,12 @@ export const layer: Layer.Layer<
           return yield* loadFromProvider(Effect.fail(resumed.failure));
         }
 
+        // A portable handoff cannot replace Codex's native reasoning and tool history.
+        // Keep the native ref intact so a failed resume can be retried after recovery.
+        if (session.driver === "codex" && resumed._tag === "Failure") {
+          return yield* loadFromProvider(Effect.fail(resumed.failure));
+        }
+
         yield* Effect.logWarning("Recovering provider context in a fresh native session", {
           driver: session.driver,
           providerThreadId: providerThread.id,
