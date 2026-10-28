@@ -1314,6 +1314,8 @@ const make = Effect.gen(function* () {
           : old
             ? `inactive for ${Math.floor((now - activityAt) / DAY_MS)} days`
             : `settled for ${settledDays} days`;
+        const onMerge =
+          settings.worktreeOnMerge && serverSettings.backgroundPullRequestRefreshEnabled;
         const notDueReason =
           !deleted && settings.worktreeAfterDays !== null
             ? `inactive for ${Math.floor((now - activityAt) / DAY_MS)} of ${settings.worktreeAfterDays} days`
@@ -1321,7 +1323,7 @@ const make = Effect.gen(function* () {
               ? settledFor === null
                 ? "not settled"
                 : `settled for ${settledDays} of ${settings.worktreeSettledAfterDays} days`
-              : settings.worktreeOnMerge
+              : onMerge
                 ? "not merged"
                 : unchangedApplies
                   ? "has commits beyond the default branch"
@@ -1336,7 +1338,7 @@ const make = Effect.gen(function* () {
               : "no rules apply",
           );
         // Only Git-based rules can make a not-yet-due worktree eligible, so skip Git otherwise.
-        if (!eligible && !unchangedApplies && !settings.worktreeOnMerge) return keep(notDueReason);
+        if (!eligible && !unchangedApplies && !onMerge) return keep(notDueReason);
         // Re-read this path's threads and sessions so new activity cancels removal; full per-worktree snapshots take seconds.
         const blockedSinceCheck = Effect.fnUntraced(function* () {
           const latestProjects = yield* projectStore.listShells();
@@ -1577,7 +1579,7 @@ const make = Effect.gen(function* () {
               remote === null
                 ? "no commits beyond the project branch"
                 : "no commits beyond the default branch";
-          if (!eligible && remote !== null && settings.worktreeOnMerge && thread.branch !== null) {
+          if (!eligible && remote !== null && onMerge && thread.branch !== null) {
             const pullRequest = yield* gitManager.branchPullRequest(
               { cwd: worktreePath, branch: thread.branch },
               { refresh: true },
