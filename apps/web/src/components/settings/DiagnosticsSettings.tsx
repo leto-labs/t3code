@@ -48,6 +48,7 @@ import {
   formatShortProcessName,
 } from "./DiagnosticsSettings.logic";
 import { ExpandableText } from "./ExpandableText";
+import { ClientConnectionDiagnostics } from "./ClientConnectionDiagnostics";
 import { ResourceTelemetryDiagnostics } from "./ResourceTelemetryDiagnostics";
 import { formatCpuTime } from "./ResourceTelemetryDiagnostics.logic";
 import { SettingsPageContainer, SettingsSection } from "./settingsLayout";
@@ -965,6 +966,7 @@ function DiagnosticsSettingsBody() {
               ? gt("Checking diagnostics access…")
               : diagnosticsAccess.error}
         </p>
+        <ClientConnectionDiagnostics environmentId={environmentId} />
       </SettingsPageContainer>
     );
   }
@@ -972,6 +974,8 @@ function DiagnosticsSettingsBody() {
   return (
     <SettingsPageContainer width="expanded" className="gap-10">
       <ResourceTelemetryDiagnostics environmentId={environmentId} />
+
+      <ClientConnectionDiagnostics environmentId={environmentId} />
 
       <SettingsSection
         title={gt("Live Processes")}

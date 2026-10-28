@@ -5687,5 +5687,8 @@
   "99451a5d2d40440f": "已由 {by} 撤回。",
   "3ee30a50b70fffab": "已由 {by} 撤回：{reason}",
   "201490988858b511": "已由 {by} 撤回",
-  "46d614fa7b4bf1e5": "工作流运行"
+  "46d614fa7b4bf1e5": "工作流运行",
+  "97d594c690529a79": "T3 connections",
+  "6eb6becf92d74b2d": "{phase} · RTT {rtt} · {reconnects, plural, one {{reconnects} reconnect} other {{reconnects} reconnects}}",
+  "fd72d067b54bcaed": "n/a"
 }
