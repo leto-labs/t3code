@@ -18,6 +18,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/rpc";
 
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { connectionDiagnostics } from "../connection/diagnostics.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 
@@ -350,6 +351,10 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                           (reason) => reason._tag === "Fail" && isRpcClientError(reason.error),
                         );
                       if (isTransportFailure) {
+                        connectionDiagnostics.recordStreamFailure(
+                          supervisor.target.environmentId,
+                          tag,
+                        );
                         return Stream.fromEffect(
                           Effect.logWarning(
                             "Durable RPC subscription lost its transport; waiting for the next session.",
