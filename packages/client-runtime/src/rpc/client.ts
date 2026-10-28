@@ -27,6 +27,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/rpc";
 
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import { connectionDiagnostics } from "../connection/diagnostics.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 
@@ -406,6 +407,12 @@ function subscribeDynamicMapped<TTag extends EnvironmentSubscriptionRpcTag, A>(
                       // rather than restart, so it keeps waiting for the next session.
                       const resubscribesOnSameSession =
                         tag !== ORCHESTRATION_V2_WS_METHODS.searchThreadStream;
+                      if (isTransportFailure) {
+                        connectionDiagnostics.recordStreamFailure(
+                          supervisor.target.environmentId,
+                          tag,
+                        );
+                      }
                       if (isTransportFailure && !resubscribesOnSameSession) {
                         return Stream.fromEffect(
                           Effect.logWarning(

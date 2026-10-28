@@ -40,6 +40,10 @@ import type {
   PreparedConnection,
 } from "../connection/model.ts";
 import {
+  connectionDiagnostics,
+  type ConnectionDiagnosticsPath,
+} from "../connection/diagnostics.ts";
+import {
   ConnectionBlockedError,
   ConnectionTransientError as ConnectionTransientErrorClass,
 } from "../connection/model.ts";
@@ -138,6 +142,21 @@ function serverConfigReplayEvents(
 const isSocketErrorReason = Schema.is(Socket.SocketErrorReason);
 const PING_TIMEOUT_SECONDS = Duration.toSeconds(PING_TIMEOUT);
 
+function diagnosticsPath(connection: PreparedConnection): ConnectionDiagnosticsPath {
+  if (connection.target._tag === "RelayConnectionTarget") return "relay";
+  if (connection.target._tag === "SshConnectionTarget") return "ssh";
+  if (
+    connection.target._tag === "PrimaryConnectionTarget" &&
+    /(?:^|\.)ts\.net(?::|\/|$)/u.test(connection.target.httpBaseUrl)
+  ) {
+    return "tailscale";
+  }
+  return connection.target._tag === "PrimaryConnectionTarget" ||
+    connection.target._tag === "BearerConnectionTarget"
+    ? "direct"
+    : "unknown";
+}
+
 function mapSessionRpcError(
   error: InitialConfigError | ProbeError | ServerConfigSubscriptionError | ConnectionAttemptError,
   via: "relay" | "direct",
@@ -202,6 +221,8 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
     yield* Effect.annotateCurrentSpan({
       "connection.environment.id": connection.environmentId,
     });
+    connectionDiagnostics.setPath(connection.environmentId, diagnosticsPath(connection));
+    connectionDiagnostics.setPhase(connection.environmentId, "connecting");
 
     const connected = yield* Deferred.make<void>();
     const disconnected = yield* Deferred.make<never, ConnectionTransientError>();
@@ -233,10 +254,24 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
     const mapRpcError = (error: Parameters<typeof mapSessionRpcError>[0]) =>
       mapSessionRpcError(error, via, socketFailure);
     const hooks = RpcClient.ConnectionHooks.of({
-      onConnect: Deferred.succeed(connected, undefined).pipe(Effect.asVoid),
-      onDisconnect: Effect.suspend(() => Deferred.fail(disconnected, socketFailure())).pipe(
+      onConnect: Deferred.succeed(connected, undefined).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => connectionDiagnostics.setPhase(connection.environmentId, "connected")),
+        ),
         Effect.asVoid,
       ),
+      onDisconnect: Effect.suspend(() => {
+        connectionDiagnostics.recordSocketError(
+          connection.environmentId,
+          pingTimedOut
+            ? "ping-timeout"
+            : Deferred.isDoneUnsafe(connected)
+              ? "socket-closed"
+              : "socket-open-failed",
+        );
+        connectionDiagnostics.setPhase(connection.environmentId, "disconnected");
+        return Deferred.fail(disconnected, socketFailure());
+      }).pipe(Effect.asVoid),
     });
     // The protocol never reopens its socket, so every frame counted here came
     // from this session's one socket.
@@ -520,11 +555,13 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
           const result = yield* protocolClient[WS_METHODS.serverProbe]({}).pipe(
             Effect.mapError(mapRpcError),
           );
+          const receivedAtMs = yield* Clock.currentTimeMillis;
+          connectionDiagnostics.recordProbe(connection.environmentId, receivedAtMs - requestedAtMs);
           if (result.serverTime !== undefined) {
             recordServerClock(connection.environmentId, {
               serverTimeMs: Date.parse(result.serverTime),
               requestedAtMs,
-              receivedAtMs: yield* Clock.currentTimeMillis,
+              receivedAtMs,
             });
           }
         }),
