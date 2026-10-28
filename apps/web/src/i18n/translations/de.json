@@ -12196,5 +12196,10 @@
   "27d76249d09eb69f": "Review-Leitfaden bereit",
   "faa3bb26abb39c93": "Review-Leitfaden fehlgeschlagen",
   "b7df38b7d8792d78": "Leitfaden öffnen",
-  "9e91e9a77b664e4e": "Review-Leitfaden konnte nicht gestartet werden"
+  "9e91e9a77b664e4e": "Review-Leitfaden konnte nicht gestartet werden",
+  "cc23adf97be9b9f7": "Waiting for the plan to finish…",
+  "2c25e8438ff46cbc": "Loading complete plan…",
+  "e0b9d613565f3d7d": "Complete plan is unavailable.",
+  "0d93a52e07f98b21": "Retry loading plan",
+  "51c2ec5549024750": "Load complete plan"
 }
