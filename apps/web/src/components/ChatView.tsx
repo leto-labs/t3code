@@ -17,10 +17,9 @@ import { useComposerSelection } from "./chat/useComposerSelection";
 import { useProjectCloneBanner } from "./chat/useProjectCloneBanner";
 import { useAttachmentPreviewHandoff } from "./chat/useAttachmentPreviewHandoff";
 import {
-  applyOptimisticUserMessagesAction,
-  createOptimisticBlobPreviews,
-  emptyOptimisticUserMessages,
-  reconcileOptimisticUserMessages,
+  serverUserMessages,
+  updatePendingSends,
+  usePendingSends,
 } from "./chat/optimisticUserMessages";
 import { useTimelineRewind } from "./chat/useTimelineRewind";
 import { useThreadLifecycle } from "./chat/useThreadLifecycle";
@@ -547,15 +546,7 @@ export default function ChatView(props: ChatViewProps) {
     };
   })() as MessagesTimelineHistoryControls | undefined;
   const committedServerMessageIds = deriveCommittedServerUserMessageIds(serverVisibleTurnItems);
-  // Queued messages have no turn item until starting, so cancellation must retire their optimistic rows
-  // separately.
-  const serverAcknowledgedUserMessageIds = (() => {
-    const ids = new Set(committedServerMessageIds);
-    for (const message of serverProjection?.messages ?? []) {
-      if (message.role === "user") ids.add(message.id);
-    }
-    return ids;
-  })();
+  const serverShownUserMessages = serverUserMessages(serverProjection, committedServerMessageIds);
   const settings = useEnvironmentSettings(environmentId);
   const clientSettingsHydrated = useClientSettingsHydrated();
   const timestampFormat = settings.timestampFormat;
@@ -629,26 +620,10 @@ export default function ChatView(props: ChatViewProps) {
   };
   const citeAssistantTextStable = useStableCallback(citeAssistantText);
   const [isWorkspaceFileDragActive, setIsWorkspaceFileDragActive] = useState(false);
-  const [optimisticBlobPreviews] = useState(createOptimisticBlobPreviews);
-  const [heldOptimisticUserMessages, setHeldOptimisticUserMessages] = useState(() =>
-    emptyOptimisticUserMessages(threadId),
-  );
-  // Acknowledged messages leave the timeline in the same render the server's copy enters it.
-  const optimisticState = reconcileOptimisticUserMessages(
-    heldOptimisticUserMessages,
-    threadId,
-    serverAcknowledgedUserMessageIds,
-  );
-  if (optimisticState !== heldOptimisticUserMessages) {
-    // Idempotent, and a discarded render only delays revocation to the thread's end.
-    optimisticBlobPreviews.handOff(optimisticState);
-    setHeldOptimisticUserMessages(optimisticState);
-  }
-  const optimisticUserMessages = optimisticState.messages;
+  const pendingSends = usePendingSends(routeThreadKey, serverShownUserMessages);
+  const optimisticUserMessages = pendingSends.messages;
   const setOptimisticUserMessages = (action: SetStateAction<ChatMessage[]>) =>
-    setHeldOptimisticUserMessages((state) =>
-      applyOptimisticUserMessagesAction(state, threadId, action),
-    );
+    updatePendingSends(routeThreadKey, action);
   // Draft ids survive promotion and expire on navigation, keeping the pending resend scoped correctly.
   const [workLocallyResendDraftId, setWorkLocallyResendDraftId] = useState<DraftId | null>(null);
   const [feedbackSubmissionsByThreadKey, setFeedbackSubmissionsByThreadKey] = useState<
@@ -1484,11 +1459,9 @@ export default function ChatView(props: ChatViewProps) {
   const openFileAttachmentStable = useStableCallback(openFileAttachment);
   const { timelineAttachmentUrlById } = useAttachmentPreviewHandoff({
     environmentId,
-    threadId,
+    threadKey: routeThreadKey,
     serverVisibleTurnItems,
-    handoff: optimisticState.handoff,
-    blobPreviews: optimisticBlobPreviews,
-    setOptimisticUserMessages: setHeldOptimisticUserMessages,
+    handoff: pendingSends.handoff,
   });
   const anchoredTimelineMessages = feedbackSubmissions.flatMap((submission) =>
     submission.status === "interrupted"
@@ -2924,10 +2897,6 @@ export default function ChatView(props: ChatViewProps) {
     setDockedDraftHeroThreadKey,
     setSetupQueueSendThreadKey,
     setOptimisticUserMessages,
-    optimisticBlobPreviews: {
-      track: (message) => optimisticBlobPreviews.track(threadId, message),
-      release: (message) => optimisticBlobPreviews.release(threadId, message),
-    },
     setFeedbackSubmissionsByThreadKey,
     setThreadError,
     setKeepFullHistory,
@@ -3068,8 +3037,7 @@ export default function ChatView(props: ChatViewProps) {
     queuedRunCount > 0 ||
     optimisticUserMessages.some(
       (message) =>
-        message.inputIntent === "queued_turn" &&
-        !serverProjection?.messages.some((committed) => committed.id === message.id),
+        message.inputIntent === "queued_turn" && !serverShownUserMessages?.queued.has(message.id),
     );
   const scrollToEndSummary =
     [childInputNow?.waitingLabel ?? null, queuedRunCount === 0 ? null : `${queuedRunCount} queued`]

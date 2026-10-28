@@ -1,24 +1,16 @@
-import { type EnvironmentId, type MessageId, type ThreadId } from "@t3tools/contracts";
-import { useAtomValue } from "@effect/atom-react";
-import { type Dispatch, type SetStateAction, useEffect } from "react";
+import { type EnvironmentId, type MessageId } from "@t3tools/contracts";
+import { useAtomMount } from "@effect/atom-react";
 import { selectHandoffImageResources } from "../../session-logic";
 import type { useQuietThreadVisibleTurnItems } from "../../state/entities";
 import { useAssetUrls } from "../../assets/assetUrls";
-import {
-  dropOptimisticHandoff,
-  loadedHandoffMessageIdsAtom,
-  type OptimisticBlobPreviews,
-  type OptimisticUserMessages,
-} from "./optimisticUserMessages";
+import { handoffPreloadsAtom, type PendingSends } from "./optimisticUserMessages";
 
 interface AttachmentPreviewHandoffInput {
   readonly environmentId: EnvironmentId;
-  readonly threadId: ThreadId;
+  readonly threadKey: string;
   readonly serverVisibleTurnItems: ReturnType<typeof useQuietThreadVisibleTurnItems>;
   /** Blob previews of acknowledged messages, by message id; they stand in for the server's copy. */
-  readonly handoff: OptimisticUserMessages["handoff"];
-  readonly blobPreviews: OptimisticBlobPreviews;
-  readonly setOptimisticUserMessages: Dispatch<SetStateAction<OptimisticUserMessages>>;
+  readonly handoff: PendingSends["handoff"];
 }
 
 /**
@@ -27,18 +19,8 @@ interface AttachmentPreviewHandoffInput {
  * server previews load.
  */
 export function useAttachmentPreviewHandoff(input: AttachmentPreviewHandoffInput) {
-  const {
-    environmentId,
-    threadId,
-    serverVisibleTurnItems,
-    blobPreviews,
-    setOptimisticUserMessages,
-  } = input;
+  const { environmentId, threadKey, serverVisibleTurnItems } = input;
   const handoffByMessageId = input.handoff;
-
-  // Blob URLs are a browser resource owned per thread; leaving the thread or the view ends them.
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- revokes the thread's blob preview URLs when the thread changes or the view unmounts
-  useEffect(() => () => blobPreviews.revokeThread(threadId), [blobPreviews, threadId]);
 
   const serverAttachmentResources = selectHandoffImageResources(
     Object.keys(handoffByMessageId).length === 0
@@ -58,9 +40,8 @@ export function useAttachmentPreviewHandoff(input: AttachmentPreviewHandoffInput
     }),
   );
 
-  // Each handoff whose server previews are all minted, as [messageId, serverUrls, blobUrls].
-  const pendingPreloads: Array<readonly [MessageId, ReadonlyArray<string>, ReadonlyArray<string>]> =
-    [];
+  // Each handoff whose server previews are all minted, as [threadKey, messageId, serverUrls].
+  const pendingPreloads: Array<readonly [string, MessageId, ReadonlyArray<string>]> = [];
   for (const row of serverVisibleTurnItems) {
     if (row.item.type !== "user_message") continue;
     const handoffUrls = handoffByMessageId[row.item.messageId];
@@ -77,21 +58,9 @@ export function useAttachmentPreviewHandoff(input: AttachmentPreviewHandoffInput
     ) {
       continue;
     }
-    pendingPreloads.push([row.item.messageId, serverPreviewUrls, handoffUrls]);
+    pendingPreloads.push([threadKey, row.item.messageId, serverPreviewUrls]);
   }
-  const loadedHandoffMessageIds = useAtomValue(
-    loadedHandoffMessageIdsAtom(JSON.stringify(pendingPreloads)),
-  );
-  // The handoff is state of the rendering ChatView, so dropping a loaded one here is React's
-  // adjust-state-while-rendering pattern; the preload atom has already revoked its blobs.
-  if (loadedHandoffMessageIds.length > 0) {
-    setOptimisticUserMessages((state) =>
-      loadedHandoffMessageIds.reduce(
-        (next, messageId) => dropOptimisticHandoff(next, threadId, messageId),
-        state,
-      ),
-    );
-  }
+  useAtomMount(handoffPreloadsAtom(JSON.stringify(pendingPreloads)));
 
   const timelineAttachmentUrlById = (() => {
     const urls = new Map(serverAttachmentUrlById);

@@ -1,122 +1,129 @@
-import type { MessageId, ThreadId } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
+import { getUserQueuedThreadRuns } from "@t3tools/client-runtime/state/thread-workflows";
+import type { MessageId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { AsyncResult, Atom } from "effect/reactivity";
-import type { SetStateAction } from "react";
+import { Atom } from "effect/reactivity";
+import { type SetStateAction, useEffect } from "react";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
 import type { ChatMessage } from "../../types";
 import { collectUserMessageBlobPreviewUrls } from "../ChatView.logic";
 
 /**
- * Messages shown before the server echoes them. An acknowledged message leaves `messages` in the
- * render its ack arrives, so it never reappears even if the server later drops its row. Its blob
- * previews stay in `handoff` until the server's copies load (see useAttachmentPreviewHandoff).
+ * Sends a thread shows before the server does, kept per scoped thread key so they outlive ChatView
+ * remounts and thread switches. The store owns their blob previews: a preview is revoked when no
+ * pending message or handoff references it any more.
  */
-export interface OptimisticUserMessages {
-  readonly threadId: ThreadId;
+export interface PendingSends {
   readonly messages: ChatMessage[];
+  /** Sends the server's queue has shown; one that leaves the queue without a turn item retires. */
+  readonly queued: ReadonlySet<MessageId>;
+  /** Blob previews of committed sends, by message id, shown until the server's copies load. */
   readonly handoff: Readonly<Record<string, ReadonlyArray<string>>>;
 }
 
-export function emptyOptimisticUserMessages(threadId: ThreadId): OptimisticUserMessages {
-  return { threadId, messages: [], handoff: {} };
+/** What a loaded server projection shows of the thread's user messages. */
+export interface ServerUserMessages {
+  /** Messages with a user_message turn item. */
+  readonly committed: ReadonlySet<MessageId>;
+  /** Messages with a user-queued run. */
+  readonly queued: ReadonlySet<MessageId>;
 }
 
+const EMPTY_PENDING_SENDS: PendingSends = { messages: [], queued: new Set(), handoff: {} };
+
+export const pendingSendsAtom = Atom.family((threadKey: string) =>
+  Atom.make(EMPTY_PENDING_SENDS).pipe(Atom.keepAlive, Atom.withLabel(`pending-sends:${threadKey}`)),
+);
+
 /**
- * The view's state for `threadId`: the previous thread's messages are released when the thread
- * changes, and acknowledged messages are moved out of `messages`. Returns `state` when nothing changes.
+ * A server row in `projection.messages` alone does not acknowledge a send: queued messages land
+ * there before their run, so only a turn item or a queued run replaces the pending row.
  */
-export function reconcileOptimisticUserMessages(
-  state: OptimisticUserMessages,
-  threadId: ThreadId,
-  acknowledgedIds: ReadonlySet<MessageId>,
-): OptimisticUserMessages {
-  if (state.threadId !== threadId) return emptyOptimisticUserMessages(threadId);
-  if (!state.messages.some((message) => acknowledgedIds.has(message.id))) return state;
-  const messages: ChatMessage[] = [];
-  const handoff: Record<string, ReadonlyArray<string>> = { ...state.handoff };
+export function serverUserMessages(
+  projection: Parameters<typeof getUserQueuedThreadRuns>[0] | null,
+  committed: ReadonlySet<MessageId>,
+): ServerUserMessages | null {
+  if (projection === null) return null;
+  return {
+    committed,
+    queued: new Set(getUserQueuedThreadRuns(projection).map((run) => run.userMessageId)),
+  };
+}
+
+/** Returns `state` when the server view changes nothing. */
+export function reconcilePendingSends(
+  state: PendingSends,
+  server: ServerUserMessages | null,
+): PendingSends {
+  if (server === null || state.messages.length === 0) return state;
+  const retires = (message: ChatMessage) =>
+    server.committed.has(message.id) ||
+    (state.queued.has(message.id) && !server.queued.has(message.id));
+  const changed = state.messages.some(
+    (message) =>
+      retires(message) || (server.queued.has(message.id) && !state.queued.has(message.id)),
+  );
+  if (!changed) return state;
+  const handoff = { ...state.handoff };
   for (const message of state.messages) {
-    if (!acknowledgedIds.has(message.id)) {
-      messages.push(message);
-      continue;
-    }
+    if (!server.committed.has(message.id)) continue;
     const previewUrls = collectUserMessageBlobPreviewUrls(message);
     if (previewUrls.length > 0) handoff[message.id] = previewUrls;
   }
-  return { ...state, messages, handoff };
+  const messages = state.messages.filter((message) => !retires(message));
+  const queued = new Set(
+    messages.flatMap((message) => (server.queued.has(message.id) ? [message.id] : [])),
+  );
+  return { messages, queued, handoff };
 }
 
-/** Applies a send-path update. An update for a thread the view has since left is dropped. */
-export function applyOptimisticUserMessagesAction(
-  state: OptimisticUserMessages,
-  threadId: ThreadId,
-  action: SetStateAction<ChatMessage[]>,
-): OptimisticUserMessages {
-  if (state.threadId !== threadId) return state;
-  const next = typeof action === "function" ? action(state.messages) : action;
-  const unchanged =
-    next.length === state.messages.length &&
-    next.every((message, index) => message === state.messages[index]);
-  return unchanged ? state : { ...state, messages: next };
+function previewUrlsOf(state: PendingSends): string[] {
+  return [
+    ...state.messages.flatMap(collectUserMessageBlobPreviewUrls),
+    ...Object.values(state.handoff).flat(),
+  ];
 }
 
-export function dropOptimisticHandoff(
-  state: OptimisticUserMessages,
-  threadId: ThreadId,
-  messageId: MessageId,
-): OptimisticUserMessages {
-  if (state.threadId !== threadId || !(messageId in state.handoff)) return state;
-  const { [messageId]: _released, ...handoff } = state.handoff;
-  return { ...state, handoff };
+function writePendingSends(threadKey: string, update: (state: PendingSends) => PendingSends) {
+  const atom = pendingSendsAtom(threadKey);
+  const current = appAtomRegistry.get(atom);
+  const next = update(current);
+  if (next === current) return;
+  appAtomRegistry.set(atom, next);
+  const kept = new Set(previewUrlsOf(next));
+  for (const previewUrl of previewUrlsOf(current)) {
+    if (!kept.has(previewUrl)) URL.revokeObjectURL(previewUrl);
+  }
 }
 
-/**
- * Blob previews a chat view owns per thread. Revocation cannot run in a state updater, so handlers
- * revoke here and leaving the thread revokes the rest. A handed-off preview still stands in for the
- * server's row, so releasing its message (a send failing after the ack) leaves it to the handoff.
- */
-export interface OptimisticBlobPreviews {
-  readonly track: (threadId: ThreadId, message: ChatMessage) => void;
-  readonly handOff: (state: OptimisticUserMessages) => void;
-  readonly revoke: (threadId: ThreadId, previewUrls: ReadonlyArray<string>) => void;
-  readonly release: (threadId: ThreadId, message: ChatMessage) => void;
-  readonly revokeThread: (threadId: ThreadId) => void;
+/** A send-path update; a message it removes, such as a failed send, releases its previews. */
+export function updatePendingSends(threadKey: string, action: SetStateAction<ChatMessage[]>) {
+  writePendingSends(threadKey, (state) => {
+    const messages = typeof action === "function" ? action(state.messages) : action;
+    return messages === state.messages ? state : { ...state, messages };
+  });
 }
 
-export function createOptimisticBlobPreviews(): OptimisticBlobPreviews {
-  const ownedByThread = new Map<ThreadId, Set<string>>();
-  const handedOff = new Set<string>();
-  const revoke = (threadId: ThreadId, previewUrls: ReadonlyArray<string>) => {
-    const owned = ownedByThread.get(threadId);
-    for (const previewUrl of previewUrls) {
-      owned?.delete(previewUrl);
-      handedOff.delete(previewUrl);
-      if (typeof URL !== "undefined") URL.revokeObjectURL(previewUrl);
+function dropPendingHandoff(threadKey: string, messageId: MessageId) {
+  writePendingSends(threadKey, (state) => {
+    if (!(messageId in state.handoff)) return state;
+    const { [messageId]: _released, ...handoff } = state.handoff;
+    return { ...state, handoff };
+  });
+}
+
+/** The thread's pending sends as of `server`; acknowledged sends leave in the render it shows them. */
+export function usePendingSends(threadKey: string, server: ServerUserMessages | null) {
+  const stored = useAtomValue(pendingSendsAtom(threadKey));
+  const state = reconcilePendingSends(stored, server);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- persists what the server showed into the store that outlives this view
+  useEffect(() => {
+    if (state !== stored) {
+      writePendingSends(threadKey, (current) => reconcilePendingSends(current, server));
     }
-  };
-  return {
-    track: (threadId, message) => {
-      const previewUrls = collectUserMessageBlobPreviewUrls(message);
-      if (previewUrls.length === 0) return;
-      const owned = ownedByThread.get(threadId) ?? new Set<string>();
-      for (const previewUrl of previewUrls) owned.add(previewUrl);
-      ownedByThread.set(threadId, owned);
-    },
-    handOff: (state) => {
-      for (const previewUrls of Object.values(state.handoff)) {
-        for (const previewUrl of previewUrls) handedOff.add(previewUrl);
-      }
-    },
-    revoke,
-    release: (threadId, message) =>
-      revoke(
-        threadId,
-        collectUserMessageBlobPreviewUrls(message).filter((url) => !handedOff.has(url)),
-      ),
-    revokeThread: (threadId) => {
-      revoke(threadId, [...(ownedByThread.get(threadId) ?? [])]);
-      ownedByThread.delete(threadId);
-    },
-  };
+  }, [threadKey, server, state, stored]);
+  return state;
 }
 
 // Server asset URLs carry a signed token, so the error keeps only where the image was loaded from.
@@ -145,36 +152,27 @@ const preloadImage = Effect.fn("optimisticUserMessages.preloadImage")(function* 
 });
 
 /**
- * Loads one handoff's server previews, keyed by `[serverUrls, blobUrls]`. Once they have all
- * loaded the blobs are no longer shown, so they are revoked here, once per load. A failed load
- * keeps the handoff, and its blobs, until the thread is left.
+ * Loads one handoff's server previews, keyed by `[threadKey, messageId, serverUrls]`. Once they
+ * have all loaded the handoff ends, which revokes its blobs. A failed load keeps the handoff.
  */
 const handoffPreloadAtom = Atom.family((key: string) => {
-  const [serverUrls, blobUrls] = JSON.parse(key) as [string[], string[]];
+  const [threadKey, messageId, serverUrls] = JSON.parse(key) as [string, MessageId, string[]];
   return Atom.make(
     typeof Image === "undefined"
       ? Effect.never
       : Effect.forEach(serverUrls, preloadImage, { concurrency: "unbounded", discard: true }).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              for (const blobUrl of blobUrls) URL.revokeObjectURL(blobUrl);
-            }),
-          ),
+          Effect.tap(() => Effect.sync(() => dropPendingHandoff(threadKey, messageId))),
         ),
   );
 });
 
 /**
- * The message ids, among `[messageId, serverUrls, blobUrls]` entries, whose server previews have
- * loaded. Each handoff preloads in its own atom, so a change to the set does not restart the rest.
+ * Mounts a preload per `[threadKey, messageId, serverUrls]` entry. Each runs in its own atom, so a
+ * change to the set does not restart the rest.
  */
-export const loadedHandoffMessageIdsAtom = Atom.family((key: string) => {
-  const preloads = JSON.parse(key) as Array<[MessageId, string[], string[]]>;
-  return Atom.make((get) =>
-    preloads.flatMap(([messageId, serverUrls, blobUrls]) =>
-      AsyncResult.isSuccess(get(handoffPreloadAtom(JSON.stringify([serverUrls, blobUrls]))))
-        ? [messageId]
-        : [],
-    ),
-  );
+export const handoffPreloadsAtom = Atom.family((key: string) => {
+  const preloads = JSON.parse(key) as Array<[string, MessageId, string[]]>;
+  return Atom.make((get) => {
+    for (const preload of preloads) get.mount(handoffPreloadAtom(JSON.stringify(preload)));
+  });
 });

@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
 import { createEnvironmentSessionAtoms } from "@t3tools/client-runtime/state/session";
 import {
   type AuthEnvironmentScope,
@@ -7,6 +8,7 @@ import {
   sessionGrantsScope,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
+import * as Cause from "effect/Cause";
 import { AsyncResult, Atom } from "effect/reactivity";
 
 import { connectionAtomRuntime } from "../connection/runtime";
@@ -38,8 +40,15 @@ export function sessionHasScope(
   result: AsyncResult.AsyncResult<AuthSessionState, unknown>,
   scope: AuthEnvironmentScope,
 ): boolean {
-  const session = AsyncResult.getOrElse(result, () => null);
-  return result._tag !== "Failure" && session !== null && sessionGrantsScope(session, scope);
+  const session = Option.getOrNull(AsyncResult.value(result));
+  if (session === null || !sessionGrantsScope(session, scope)) return false;
+  if (result._tag !== "Failure") return true;
+
+  // AsyncResult keeps the last successful value on a Failure. Keep using that
+  // grant only for a transport failure so a brief reconnect does not turn the
+  // whole UI read-only. Auth failures must remove access immediately.
+  const error = Cause.squash(result.cause);
+  return isTransportConnectionErrorMessage(error instanceof Error ? error.message : String(error));
 }
 
 const environmentsWithScopeAtom = Atom.family((key: string) => {

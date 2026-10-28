@@ -203,3 +203,27 @@ it("stays inside the timeline scroller instead of growing the chat column", asyn
   const column = screen.getByTestId("column").element();
   expect(column.scrollHeight).toBe(column.clientHeight);
 });
+
+it("keeps the optimistic queued row while the server message precedes its queue run", async () => {
+  setup();
+  const messageId = MessageId.make("message:queued-race");
+  state.projection = { projection: { messages: [{ id: messageId }] } };
+  state.workflow = {
+    activeRun: { id: "run:active" },
+    canPromoteToSteer: false,
+    canReorder: false,
+    queuedRuns: [],
+  };
+
+  await using _screen = await renderQueue({
+    optimisticMessages: [
+      {
+        id: messageId,
+        inputIntent: "queued_turn",
+        text: "Keep this queued message visible",
+      },
+    ],
+  });
+
+  await expect.element(page.getByText("Keep this queued message visible")).toBeVisible();
+});
