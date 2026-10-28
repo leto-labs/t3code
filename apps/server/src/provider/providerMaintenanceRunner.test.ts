@@ -194,6 +194,7 @@ function makeRegistry(
     });
 
     const registry: ProviderRegistry.ProviderRegistry["Service"] = {
+      usageReport: () => Effect.succeed({ observedAt: "2026-10-17T00:00:00.000Z", instances: [] }),
       getProviders: Ref.get(providersRef),
       refresh: () => Ref.get(providersRef),
       refreshInstance: () => Ref.get(providersRef),

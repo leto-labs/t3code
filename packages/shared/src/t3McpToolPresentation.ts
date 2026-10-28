@@ -145,6 +145,10 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     ["Get", "Getting", "Got", "orchestration capabilities"],
     "capabilities",
   ),
+  provider_usage_limits: tool(
+    ["Read", "Reading", "Read", "provider usage limits"],
+    "environment-read",
+  ),
   delegate_task: tool(["Delegate", "Delegating", "Delegated", "a child task"], "delegate"),
   task_status: tool(["Get", "Getting", "Got", "delegated task status"], "task-status"),
   task_cancel: tool(

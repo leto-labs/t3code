@@ -35,7 +35,10 @@ describe("codexRateLimitsToLimits", () => {
         snapshot: { limitId: "spark" },
         rateLimitsByLimitId: { codex: snapshot },
       }),
-    ).toEqual({ checkedAt, windows });
+    ).toEqual({
+      checkedAt,
+      windows: windows.map((window) => ({ ...window, observedAt: checkedAt })),
+    });
     expect(codexRateLimitsToUpdate(snapshot)).toEqual({ windows });
   });
 
@@ -54,6 +57,7 @@ describe("codexRateLimitsToLimits", () => {
       windows: [
         {
           id: "primary",
+          observedAt: checkedAt,
           kind: "session",
           label: "Session",
           usedPercent: 12,
@@ -62,6 +66,7 @@ describe("codexRateLimitsToLimits", () => {
         },
         {
           id: "secondary",
+          observedAt: checkedAt,
           kind: "weekly",
           label: "Weekly",
           usedPercent: 47,
@@ -81,6 +86,7 @@ describe("codexRateLimitsToLimits", () => {
     ).toEqual([
       {
         id: "primary",
+        observedAt: checkedAt,
         kind: "monthly",
         label: "Monthly",
         usedPercent: 80,
@@ -89,7 +95,7 @@ describe("codexRateLimitsToLimits", () => {
     ]);
   });
 
-  it("selects the main Codex allowance and leaves Spark out", () => {
+  it("keeps model-specific allowances in separate rows alongside the main allowance", () => {
     const spark = {
       limitId: "codex_bengalfox",
       individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
@@ -105,15 +111,21 @@ describe("codexRateLimitsToLimits", () => {
           codex: { secondary: { usedPercent: 42, windowDurationMins: 10080 } },
         },
       }).windows,
-    ).toEqual([
-      {
-        id: "secondary",
-        kind: "weekly",
-        label: "Weekly",
-        usedPercent: 42,
-        windowDurationMins: 10080,
-      },
-    ]);
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "secondary", usedPercent: 42, observedAt: checkedAt }),
+        expect.objectContaining({
+          id: "codex_bengalfox:primary",
+          limitId: "codex_bengalfox",
+          usedPercent: 0,
+        }),
+        expect.objectContaining({
+          id: "codex_bengalfox:secondary",
+          limitId: "codex_bengalfox",
+          usedPercent: 90,
+        }),
+      ]),
+    );
   });
 
   it.each([undefined, null, {}])(
@@ -125,6 +137,24 @@ describe("codexRateLimitsToLimits", () => {
       );
     },
   );
+
+  it("does not show a model-specific legacy snapshot as the main allowance", () => {
+    expect(
+      codexRateLimitsToLimits({
+        checkedAt,
+        snapshot: {
+          limitId: "codex_bengalfox",
+          secondary: { usedPercent: 90 },
+        },
+      }).windows,
+    ).toEqual([
+      expect.objectContaining({
+        id: "codex_bengalfox:secondary",
+        limitId: "codex_bengalfox",
+        usedPercent: 90,
+      }),
+    ]);
+  });
 });
 
 describe("codexRateLimitsToUpdate", () => {
@@ -170,7 +200,7 @@ describe("codexRateLimitsToUpdate", () => {
     expect(codexRateLimitsToUpdate({ planType: "plus" })).toBeUndefined();
   });
 
-  it("ignores Spark notifications so they cannot overwrite the main allowance", () => {
+  it("namespaces model-specific notifications so they cannot overwrite the main allowance", () => {
     expect(
       codexRateLimitsToUpdate({
         limitId: "codex_bengalfox",
@@ -178,7 +208,12 @@ describe("codexRateLimitsToUpdate", () => {
         primary: { usedPercent: 0, windowDurationMins: 300 },
         secondary: { usedPercent: 90, windowDurationMins: 10080 },
       }),
-    ).toBeUndefined();
+    ).toEqual({
+      windows: [
+        expect.objectContaining({ id: "codex_bengalfox:primary" }),
+        expect.objectContaining({ id: "codex_bengalfox:secondary" }),
+      ],
+    });
     expect(
       codexRateLimitsToUpdate({
         limitId: "codex",

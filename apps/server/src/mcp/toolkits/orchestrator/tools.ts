@@ -39,6 +39,9 @@ import {
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
 import { McpSchema, Tool, Toolkit } from "effect/ai";
+import { ProviderUsageReport, ProviderUsageReportInput } from "@t3tools/contracts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
 
@@ -349,7 +352,19 @@ const EnvironmentUnlinkTool = Tool.make("t3_environment_unlink", {
   .annotate(Tool.Idempotent, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenWhileLinksOff);
 
+const ProviderUsageLimitsTool = Tool.make("provider_usage_limits", {
+  description:
+    "Read provider quota snapshots without credentials. Returns used and remaining percentages, window durations, absolute reset times, checkedAt, freshness and unavailable/error status per instance. Optional refresh performs a bounded usage probe; it never purchases or redeems credits. Percentages are account-relative, not comparable token capacities.",
+  parameters: ProviderUsageReportInput,
+  success: ProviderUsageReport,
+  dependencies: [ProviderRegistry.ProviderRegistry, ServerSettings.ServerSettingsService],
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
 export const OrchestratorToolkit = Toolkit.make(
+  ProviderUsageLimitsTool,
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

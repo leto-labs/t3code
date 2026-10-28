@@ -35,6 +35,35 @@ export class ContextHandoffBackgroundWorkError extends Schema.TaggedError<Contex
   }
 }
 
+export class ProviderUsageLimitError extends Schema.TaggedError<ProviderUsageLimitError>()(
+  "ProviderUsageLimitError",
+  { detail: Schema.String, resetAt: Schema.NullOr(Schema.String) },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+const isProviderUsageLimitError = Schema.is(ProviderUsageLimitError);
+
+function usageLimitCause(cause: unknown): ProviderUsageLimitError | undefined {
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < 16 && cause != null && !seen.has(cause); depth++) {
+    seen.add(cause);
+    try {
+      if (Cause.isCause(cause)) {
+        cause = Cause.squash(cause);
+        continue;
+      }
+      if (isProviderUsageLimitError(cause)) return cause;
+      if (typeof cause !== "object") break;
+      cause = (cause as Record<string, unknown>).cause;
+    } catch {
+      break;
+    }
+  }
+  return undefined;
+}
+
 export const MAX_PROVIDER_FAILURE_MESSAGE_LENGTH = 4_096;
 const MAX_PROVIDER_FAILURE_CODE_LENGTH = 128;
 
@@ -262,23 +291,29 @@ export function makeProviderFailure(input: {
   readonly retryable?: boolean | null;
   readonly resetAt?: string | null;
 }): OrchestrationV2ProviderFailure {
+  const usageLimit = usageLimitCause(input.cause);
+  const failureClass = usageLimit ? "usage_limit" : (input.class ?? "unknown");
+  const resetAt = usageLimit?.resetAt ?? input.resetAt;
   const curated = curatedCauseMessages(input.cause);
   const rawMessage =
-    input.message ?? curated.known ?? curated.category ?? DEFAULT_PROVIDER_FAILURE_MESSAGE;
+    usageLimit?.message ??
+    input.message ??
+    curated.known ??
+    curated.category ??
+    DEFAULT_PROVIDER_FAILURE_MESSAGE;
   const message = boundedText(rawMessage, MAX_PROVIDER_FAILURE_MESSAGE_LENGTH);
-  const rawCode = input.code ?? stringField(input.cause, "code") ?? null;
+  const rawCode =
+    input.code ?? (usageLimit ? "usageLimitExceeded" : stringField(input.cause, "code")) ?? null;
   const code =
     rawCode === null ? null : boundedText(rawCode, MAX_PROVIDER_FAILURE_CODE_LENGTH) || null;
 
   return {
-    class: input.class ?? "unknown",
+    class: failureClass,
     message: message || DEFAULT_PROVIDER_FAILURE_MESSAGE,
     code,
     retryable: input.retryable ?? null,
-    ...(input.class === "usage_limit" &&
-    input.resetAt != null &&
-    Number.isFinite(Date.parse(input.resetAt))
-      ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(input.resetAt)) }
+    ...(failureClass === "usage_limit" && resetAt != null && Number.isFinite(Date.parse(resetAt))
+      ? { resetAt: DateTime.formatIso(DateTime.makeUnsafe(resetAt)) }
       : {}),
   };
 }

@@ -210,6 +210,25 @@ describe("AddProviderInstanceDialog environment routing", () => {
     });
   });
 
+  it("drops the Codex Auto draft when another provider is chosen under Show more", async () => {
+    setup();
+    await using _screen = await render(dialog());
+    await act(async () => radio("Codex Auto")!.click());
+    await click("Show more");
+    const moreFx = [...document.querySelectorAll<HTMLElement>('[role="radio"]')]
+      .filter((element) => element.textContent?.trim() === "fx")
+      .at(-1);
+    await act(async () => moreFx!.click());
+    await click("Next");
+    await click("Next");
+    await click("Add instance");
+    expect(settingsHooks.mutate).toHaveBeenCalledWith({
+      operation: "create",
+      instanceId: "fx",
+      instance: { driver: "fx", enabled: true, displayName: "fx" },
+    });
+  });
+
   it("awaits an atomic create before closing and retains prepared ACP metadata", async () => {
     setup();
     const mutation = deferred<{ readonly _tag: "Success"; readonly value: unknown }>();

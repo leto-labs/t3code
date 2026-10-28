@@ -163,8 +163,9 @@ function runsOffNativeBranch(input: {
   const nativeTurnId = (run: OrchestrationV2Run) => {
     const attempt = attempts.find((candidate) => candidate.id === run.activeAttemptId);
     if (attempt === undefined) return null;
-    const ref = providerTurns.find(
-      (turn) => turn.id === attempt.providerTurnId || turn.runAttemptId === attempt.id,
+    const ref = (
+      providerTurns.find((turn) => turn.id === attempt.providerTurnId) ??
+      providerTurns.findLast((turn) => turn.runAttemptId === attempt.id)
     )?.nativeTurnRef;
     return ref?.strength === "strong" ? ref.nativeId : null;
   };

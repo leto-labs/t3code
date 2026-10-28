@@ -15,6 +15,7 @@ import {
   disallowedProviderMessage,
   isManagedDriverAllowed,
   isProviderDriverKind,
+  readCodexAutoPoolMemberIds,
   resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import {
@@ -82,9 +83,21 @@ function isProviderEnabledForProject(
   if (!provider) {
     return false;
   }
+  if (isCodexAutoPoolOnly(config, provider.instanceId)) return false;
   return config?.settings
     ? resolveProjectProviderInstanceEnabled(config.settings, projectId, provider.instanceId)
     : provider.enabled;
+}
+
+function isCodexAutoPoolOnly(
+  config: T3ServerConfig | null | undefined,
+  instanceId: ModelSelection["instanceId"],
+): boolean {
+  return Object.values(config?.settings?.providerInstances ?? {}).some(
+    (instance) =>
+      instance.driver === "codex" &&
+      readCodexAutoPoolMemberIds(instance.config).some((member) => member === instanceId),
+  );
 }
 
 function isProjectDisabledOverride(
@@ -168,6 +181,7 @@ export function isModelSelectionUnavailable(
   if (!config || !selection) {
     return false;
   }
+  if (isCodexAutoPoolOnly(config, selection.instanceId)) return true;
   const provider = config.providers.find(
     (candidate) => candidate.instanceId === selection.instanceId,
   );

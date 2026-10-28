@@ -2,6 +2,7 @@ import { pipe } from "effect/Function";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
+  readCodexAutoPoolMemberIds,
   resolveProjectProviderInstanceEnabled,
   type ModelSelection,
   type ProjectId,
@@ -35,6 +36,8 @@ export interface ProviderInstanceEntry {
   readonly acpRegistryIconUrl?: string | undefined;
   readonly continuationGroupKey?: string | undefined;
   readonly enabled: boolean;
+  /** Codex accounts selected by an Auto pool are runtime-enabled but never directly selectable. */
+  readonly poolOnly: boolean;
   readonly installed: boolean;
   readonly status: ServerProviderState;
   readonly isDefault: boolean;
@@ -45,11 +48,18 @@ export interface ProviderInstanceEntry {
 
 /** Disabled instances may retain ready status until reconciliation. */
 export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled && entry.isAvailable && entry.status === "ready";
+  return !entry.poolOnly && entry.enabled && entry.isAvailable && entry.status === "ready";
 }
 
-export function isProviderInstancePickerVisible(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled;
+export function isProviderInstancePickerVisible(
+  entry: ProviderInstanceEntry,
+  visibleModels: ReadonlyArray<Pick<ServerProviderModel, "slug">> = entry.models,
+): boolean {
+  // An empty native catalog still needs a setup/error entry. A populated
+  // catalog with every model hidden is an explicit picker preference.
+  return (
+    !entry.poolOnly && entry.enabled && (entry.models.length === 0 || visibleModels.length > 0)
+  );
 }
 
 export function deriveProviderInstanceEntries(
@@ -70,6 +80,7 @@ export function deriveProviderInstanceEntries(
         : {}),
       continuationGroupKey: snapshot.continuation?.groupKey,
       enabled: snapshot.enabled,
+      poolOnly: false,
       installed: snapshot.installed,
       status: snapshot.status,
       isDefault,
@@ -116,10 +127,18 @@ export function applyProviderInstanceSettings(
   settings: Pick<ServerSettings, "providerInstances" | "projectSettingsOverrides">,
   projectId: ProjectId | null,
 ): ReadonlyArray<ProviderInstanceEntry> {
+  const poolOnlyIds = new Set(
+    Object.values(settings.providerInstances).flatMap((instance) =>
+      instance.driver === "codex" ? readCodexAutoPoolMemberIds(instance.config) : [],
+    ),
+  );
   return entries.map((entry) => {
     const enabled = resolveProjectProviderInstanceEnabled(settings, projectId, entry.instanceId);
+    const poolOnly = poolOnlyIds.has(entry.instanceId);
     return applyProviderInstanceBranding(
-      enabled === entry.enabled ? entry : { ...entry, enabled },
+      enabled === entry.enabled && poolOnly === entry.poolOnly
+        ? entry
+        : { ...entry, enabled, poolOnly },
       settings,
     );
   });
@@ -209,7 +228,7 @@ export function getDefaultProviderInstanceModel(
 }
 
 const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolean =>
-  entry.enabled && entry.isAvailable;
+  !entry.poolOnly && entry.enabled && entry.isAvailable;
 
 export function resolveSelectableProviderInstanceEntry(
   entries: ReadonlyArray<ProviderInstanceEntry>,
