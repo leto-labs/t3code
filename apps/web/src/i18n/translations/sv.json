@@ -12220,5 +12220,18 @@
   "45a9c97bfaa12d35": "Checking message delivery",
   "3ff1ccb6afbe7478": "The connection dropped while sending. Waiting for the server state before retrying.",
   "9d963ab2dc03c3a6": "Message delivered",
-  "a4b498ce3af70d20": "The connection dropped after the server accepted it."
+  "a4b498ce3af70d20": "The connection dropped after the server accepted it.",
+  "fce65a0214b5e4d6": "T3 Connect relay",
+  "7f085162305f115d": "Direct",
+  "5fb6b389a65cd1ff": "Client connection",
+  "9c98cd4b60ef78af": "Copy client connection diagnostics",
+  "787a0172c2c6a952": "Copy",
+  "5bb1f978b69ec427": "Path",
+  "8f5e67a13a772110": "State",
+  "9822be163aa2dfa8": "Probe RTT",
+  "8f37c37b81400fae": "Reconnects",
+  "56d4641e6d2d4209": "Socket errors {count}",
+  "95b16531052aa05d": "Stream failures {count}",
+  "b8f536e05eab8bd5": "Last error {kind}",
+  "0ef7303e14dbf9da": "Recent probes {values} ms"
 }

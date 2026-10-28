@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { T, useGT } from "gt-react-native";
-import { useState } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -22,6 +22,8 @@ import { ListActionRow as SettingsActionRow } from "../../components/ui/ListActi
 import { SettingsScreen } from "../settings/components/SettingsScreen";
 import { SettingsSection } from "../settings/components/SettingsSection";
 import { SettingsSwitchRow } from "../settings/components/SettingsSwitchRow";
+import { connectionDiagnostics } from "@t3tools/client-runtime/connection";
+import { useEnvironments } from "../../state/environments";
 import {
   formatStartupCrashReport,
   parseStartupCrashRecords,
@@ -85,6 +87,7 @@ export function SettingsDiagnosticsRouteScreen() {
   const state = useCrashLogState();
   const gt = useGT();
   const [copied, setCopied] = useState(false);
+  const { environments } = useEnvironments();
 
   const records = state.status === "ready" ? state.records : [];
   const copyReport = async () => {
@@ -105,6 +108,18 @@ export function SettingsDiagnosticsRouteScreen() {
       >
         {crashReportingAvailable ? <CrashReportsSetting /> : null}
 
+        {environments.length > 0 ? (
+          <SettingsSection title={gt("T3 connections")}>
+            {environments.map((environment, index) => (
+              <T3ConnectionRow
+                key={environment.environmentId}
+                environmentId={environment.environmentId}
+                label={environment.label}
+                first={index === 0}
+              />
+            ))}
+          </SettingsSection>
+        ) : null}
         <SettingsSection title={gt("Startup crashes")}>
           {state.status === "loading" ? (
             <View className="items-center gap-3 px-6 py-8">
@@ -200,6 +215,37 @@ function CrashReportsSetting() {
           app version, and the device model and OS version to the T3 Code team. Each launch also
           sends startup timings. Reports carry a random ID for this install.
         </T>
+      </Text>
+    </View>
+  );
+}
+
+function T3ConnectionRow(props: {
+  readonly environmentId: string;
+  readonly label: string;
+  readonly first: boolean;
+}) {
+  const { environmentId } = props;
+  const subscribe = useCallback(
+    (listener: () => void) => connectionDiagnostics.subscribe(environmentId, listener),
+    [environmentId],
+  );
+  const getSnapshot = () => connectionDiagnostics.snapshot(environmentId);
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const rtt = snapshot.recentRttMs.at(-1);
+  const gt = useGT();
+  return (
+    <View className={props.first ? "gap-1.5 p-4" : "gap-1.5 border-t border-border-subtle p-4"}>
+      <Text className="text-base text-foreground">{props.label}</Text>
+      <Text className="text-sm text-foreground-muted">
+        {gt(
+          "{phase} · RTT {rtt} · {reconnects, plural, one {{reconnects} reconnect} other {{reconnects} reconnects}}",
+          {
+            phase: snapshot.phase,
+            rtt: rtt === undefined ? gt("n/a") : `${Math.round(rtt)} ms`,
+            reconnects: snapshot.reconnects,
+          },
+        )}
       </Text>
     </View>
   );
