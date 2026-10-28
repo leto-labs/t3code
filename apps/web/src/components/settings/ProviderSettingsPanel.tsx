@@ -106,6 +106,8 @@ import { TextGeneratorsSettings } from "./TextGeneratorsSettings";
 import { UsageProviderSettings } from "./UsageProviderSettings";
 import { ProviderSetupSection, readAntigravityAuthMethod } from "./ProviderSetupSection";
 import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
+import { AutoPoolSection } from "./AutoPoolSection";
+import { readAutoPoolMembers } from "./AutoPoolSection.logic";
 import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
 import { readCodexSetupMode } from "./CodexSetupSection.logic";
 import { providerClients } from "./providerDriverMeta";
@@ -1359,7 +1361,9 @@ function ProviderInstanceRow({
         onReset: () => actions.writeProjectOverride(instanceId, undefined),
       }
     : undefined;
-  const codexSetupMode = driver === "codex" ? readCodexSetupMode(instance.config) : null;
+  const isAutoPool = readAutoPoolMembers(instance.config) !== undefined;
+  const codexSetupMode =
+    driver === "codex" && !isAutoPool ? readCodexSetupMode(instance.config) : null;
   const recommendedVersion = liveProvider?.compatibilityAdvisory?.recommendedVersion;
   const canInstallRecommended =
     !readOnly &&
@@ -1386,7 +1390,16 @@ function ProviderInstanceRow({
       onSelect={mode === "list" ? () => actions.selectInstance(instanceId) : undefined}
       readOnly={readOnly}
       runtime={
-        mode === "editor" && codexSetupMode === "managed" ? (
+        mode === "editor" && isAutoPool ? (
+          <AutoPoolSection
+            environmentId={environmentId}
+            driver={driver}
+            value={instance.config}
+            onChange={async (config) => {
+              await actions.enableInstance(instanceId, { ...instance, config });
+            }}
+          />
+        ) : mode === "editor" && codexSetupMode === "managed" ? (
           <CodexManagedRuntimeFields
             environmentId={environmentId}
             instanceId={instanceId}
@@ -1432,6 +1445,7 @@ function ProviderInstanceRow({
           />
         ) : mode === "editor" &&
           !readOnly &&
+          !isAutoPool &&
           liveProvider &&
           (liveProvider.setup?.canAuthenticate ||
             (liveProvider.driver === "acpRegistry" && liveProvider.installed)) ? (

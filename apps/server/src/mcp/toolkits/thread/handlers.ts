@@ -26,6 +26,8 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadToolkit } from "./tools.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import { requireOutsideAutoPool } from "../../OrchestratorMcpService.ts";
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -233,6 +235,11 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     writesThread((input) =>
       Effect.gen(function* () {
         const modelSelection = yield* required(input.modelSelection, "modelSelection");
+        const settings = yield* ServerSettings.ServerSettingsService.pipe(
+          Effect.flatMap((service) => service.getSettings),
+          Effect.mapError(unavailable),
+        );
+        yield* requireOutsideAutoPool(settings.providerInstances, modelSelection.instanceId);
         const {
           threads,
           projection: { thread },

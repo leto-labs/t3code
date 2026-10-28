@@ -63,6 +63,7 @@ import { ProviderWizardAuthenticationStep } from "./ProviderWizardAuthentication
 import { resolveOfficialAcpRegistryIconUrl } from "./AcpRegistryIcon";
 import { AddManagedCodexAccountDialog } from "./CodexSetupSection";
 import { MultipleAccountsNote } from "./MultipleAccountsNote";
+import { AutoPoolSection } from "./AutoPoolSection";
 import { ProviderEnvironmentSection } from "./ProviderInstanceCard";
 import { useSecretSources } from "./SecretSourceInput";
 
@@ -73,7 +74,19 @@ const DEFAULT_DRIVER_OPTION = providerClients.definitions[0]!;
 const DRIVER_OPTIONS = providerClients.definitions.filter(
   (option) => option.driverKind !== ACP_REGISTRY_DRIVER_KIND,
 );
-const FEATURED_DRIVER_OPTIONS = DRIVER_OPTIONS.filter((option) => option.featured !== false);
+/** An Auto pool is an instance of its driver whose config lists member accounts. */
+const AUTO_POOL_OPTIONS = [
+  // oxlint-disable-next-line t3code/no-untranslated-copy -- product name
+  { driverKind: DEFAULT_DRIVER_KIND, label: "Codex Auto", value: "codex-auto", id: "codex_auto" },
+].flatMap(({ driverKind, label, value, id }) => {
+  const definition = providerClients.get(driverKind);
+  return definition ? [{ ...definition, label, optionValue: value, autoInstanceId: id }] : [];
+});
+type AutoPoolOption = (typeof AUTO_POOL_OPTIONS)[number];
+const FEATURED_DRIVER_OPTIONS = [
+  ...DRIVER_OPTIONS.filter((option) => option.featured !== false),
+  ...AUTO_POOL_OPTIONS,
+];
 const MORE_DRIVER_OPTIONS = DRIVER_OPTIONS.filter((option) => option.featured === false);
 const EMPTY_CONFIG_DRAFT: Record<string, unknown> = {};
 function validateInstanceId(
@@ -99,8 +112,8 @@ function ProviderOptionGrid({
   onValueChange,
   ...labelProps
 }: {
-  readonly options: ReadonlyArray<ProviderClientDefinition>;
-  readonly value: ProviderDriverKind;
+  readonly options: ReadonlyArray<ProviderClientDefinition & { readonly optionValue?: string }>;
+  readonly value: string;
   readonly disabled: boolean;
   readonly onValueChange: (value: string) => void;
   readonly "aria-label"?: string;
@@ -116,8 +129,8 @@ function ProviderOptionGrid({
     >
       {options.map((option) => (
         <RadioPrimitive.Root
-          key={option.driverKind}
-          value={option.driverKind}
+          key={option.optionValue ?? option.driverKind}
+          value={option.optionValue ?? option.driverKind}
           className="relative flex cursor-pointer items-center gap-3 rounded-lg bg-card px-3 py-3 text-left text-muted-foreground outline-none ring-1 ring-black/5 hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring data-checked:bg-primary/8 data-checked:text-foreground data-checked:ring-2 data-checked:ring-inset data-checked:ring-primary data-checked:hover:bg-primary/8 dark:bg-white/3 dark:ring-white/5 dark:hover:bg-white/5 dark:data-checked:bg-primary/15 dark:data-checked:ring-primary dark:data-checked:hover:bg-primary/15"
         >
           <ProviderInstanceIcon
@@ -181,6 +194,7 @@ export function AddProviderInstanceDialog({
     isManagedDriverAllowed(managedPolicy, option.driverKind),
   );
   const acpRegistryAllowed = isManagedDriverAllowed(managedPolicy, ACP_REGISTRY_DRIVER_KIND);
+  const [autoPool, setAutoPool] = useState<AutoPoolOption | null>(null);
   const [driver, setDriver] = useState<ProviderDriverKind>(
     () =>
       (featuredDriverOptions[0] ?? moreDriverOptions[0])?.driverKind ??
@@ -208,7 +222,8 @@ export function AddProviderInstanceDialog({
     ...Object.keys(settings.providerInstances ?? {}),
   ]);
 
-  const driverOption = providerClients.get(driver) ?? DEFAULT_DRIVER_OPTION;
+  const driverOption = autoPool ?? providerClients.get(driver) ?? DEFAULT_DRIVER_OPTION;
+  const draftKey = autoPool?.optionValue ?? driver;
   const isAcpRegistry = driver === ACP_REGISTRY_DRIVER_KIND;
   const showRegistrySearch =
     !createdInstanceId &&
@@ -223,13 +238,13 @@ export function AddProviderInstanceDialog({
     accentColor: "",
     instanceIdOverride: null,
   };
-  const { label, accentColor, instanceIdOverride } = identityByDriver[driver] ?? defaultIdentity;
+  const { label, accentColor, instanceIdOverride } = identityByDriver[draftKey] ?? defaultIdentity;
   const instanceId =
     instanceIdOverride ??
     deriveAvailableInstanceId(
       (candidateLabel) => {
         if (!candidateLabel.trim() || candidateLabel === driverOption.label) {
-          return isAcpRegistry ? `${driver}_custom` : driver;
+          return autoPool?.autoInstanceId ?? (isAcpRegistry ? `${driver}_custom` : driver);
         }
         return deriveInstanceId(driver, candidateLabel);
       },
@@ -242,7 +257,8 @@ export function AddProviderInstanceDialog({
   const identityStep = 1;
   const previewLabel = label.trim() || gt("{provider} Workspace", { provider: driverOption.label });
 
-  const configDraft = configByDriver[driver] ?? EMPTY_CONFIG_DRAFT;
+  const configDraft =
+    configByDriver[draftKey] ?? (autoPool ? { autoPoolMemberIds: [] } : EMPTY_CONFIG_DRAFT);
   const isLocalAcp = isAcpRegistry && isManualAcpConfiguration && configDraft.source === "local";
   const localCommandPath =
     typeof configDraft.commandPath === "string" ? configDraft.commandPath.trim() : "";
@@ -265,22 +281,24 @@ export function AddProviderInstanceDialog({
     setConfigByDriver((existing) => {
       const next = { ...existing };
       if (config === undefined || Object.keys(config).length === 0) {
-        delete next[driver];
+        delete next[draftKey];
       } else {
-        next[driver] = config;
+        next[draftKey] = config;
       }
       return next;
     });
   };
   const selectDriver = (value: string) => {
-    setDriver(ProviderDriverKind.make(value));
+    const pool = AUTO_POOL_OPTIONS.find((option) => option.optionValue === value) ?? null;
+    setAutoPool(pool);
+    setDriver(pool?.driverKind ?? ProviderDriverKind.make(value));
     setIsManualAcpConfiguration(false);
     setHasAttemptedSubmit(false);
   };
   const setIdentityDraft = (update: Partial<ProviderIdentityDraft>) => {
     setIdentityByDriver((existing) => ({
       ...existing,
-      [driver]: { ...(existing[driver] ?? defaultIdentity), ...update },
+      [draftKey]: { ...(existing[draftKey] ?? defaultIdentity), ...update },
     }));
   };
 
@@ -315,6 +333,7 @@ export function AddProviderInstanceDialog({
   };
 
   const handleAcpPrepared = (agent: AcpRegistrySearchAgent) => {
+    setAutoPool(null);
     setDriver(ACP_REGISTRY_DRIVER_KIND);
     const nextLabel = agent.name;
     const registryIconUrl = resolveOfficialAcpRegistryIconUrl(agent.icon);
@@ -344,6 +363,7 @@ export function AddProviderInstanceDialog({
   };
 
   const handleManualAcpConfiguration = () => {
+    setAutoPool(null);
     setDriver(ACP_REGISTRY_DRIVER_KIND);
     setSelectedAcp(null);
     setIsManualAcpConfiguration(true);
@@ -362,6 +382,7 @@ export function AddProviderInstanceDialog({
   };
 
   const handleLocalAcpConfiguration = () => {
+    setAutoPool(null);
     setDriver(ACP_REGISTRY_DRIVER_KIND);
     setSelectedAcp(null);
     setIsManualAcpConfiguration(true);
@@ -390,8 +411,10 @@ export function AddProviderInstanceDialog({
 
     const config =
       driver === "codex"
-        ? { ...configByDriver[driver], setupMode: "existing" }
-        : (configByDriver[driver] ?? {});
+        ? { ...configDraft, setupMode: "existing" }
+        : autoPool
+          ? configDraft
+          : (configByDriver[draftKey] ?? {});
     const hasConfig = Object.keys(config).length > 0;
     const normalizedAccentColor = normalizeProviderAccentColor(accentColor);
 
@@ -500,7 +523,7 @@ export function AddProviderInstanceDialog({
                 </div>
                 <ProviderOptionGrid
                   options={featuredDriverOptions}
-                  value={driver}
+                  value={autoPool?.optionValue ?? driver}
                   disabled={isPreparingRegistryAgent}
                   onValueChange={selectDriver}
                   aria-labelledby="add-instance-driver-label"
@@ -735,17 +758,26 @@ export function AddProviderInstanceDialog({
 
               {!isAcpRegistry && driverSettingsFields.length > 0 ? (
                 <SettingsGroup variant="plain" className={cn(wizardStep !== 2 && "hidden")}>
-                  <ProviderSettingsForm
-                    definition={driverOption}
-                    value={configDraft}
-                    idPrefix={`add-provider-${driver}`}
-                    variant="settings"
-                    onChange={setConfigDraft}
-                    managed={
-                      driverLocks && { keys: driverLocks.configKeys, reason: driverLocks.reason }
-                    }
-                    environmentId={environmentId}
-                  />
+                  {autoPool ? (
+                    <AutoPoolSection
+                      environmentId={environmentId}
+                      driver={driver}
+                      value={configDraft}
+                      onChange={setConfigDraft}
+                    />
+                  ) : (
+                    <ProviderSettingsForm
+                      definition={driverOption}
+                      value={configDraft}
+                      idPrefix={`add-provider-${driver}`}
+                      variant="settings"
+                      onChange={setConfigDraft}
+                      managed={
+                        driverLocks && { keys: driverLocks.configKeys, reason: driverLocks.reason }
+                      }
+                      environmentId={environmentId}
+                    />
+                  )}
                 </SettingsGroup>
               ) : !isAcpRegistry && wizardStep === 2 ? (
                 <div className="grid gap-2">
@@ -771,7 +803,7 @@ export function AddProviderInstanceDialog({
               >
                 {wizardStep === 0 ? gt("Cancel") : gt("Back")}
               </Button>
-              {wizardStep === 0 && driver === "codex" ? (
+              {wizardStep === 0 && driver === "codex" && !autoPool ? (
                 <>
                   <Button variant="outline" size="sm" onClick={() => navigateToStep(1)}>
                     <T>Configure manually</T>

@@ -65,6 +65,8 @@ import {
   isOrchestrationV2WorkActive,
   latestProviderTurnForAttempt,
   resolveProjectProviderInstanceEnabled,
+  autoPoolMemberRejection,
+  autoPoolOwnerId,
   SECRET_REQUEST_UNSAVED_NOTE,
 } from "@t3tools/contracts";
 import { getProviderOptionCurrentValue, withLegacyUltracodeEffort } from "@t3tools/shared/model";
@@ -454,6 +456,17 @@ export const requireAdvertisedModel = (provider: ServerProvider, model: string) 
         : `Model ${model} needs provider ${provider.instanceId} at ${withV(updateRequired.minVersion)} or newer, but the detected CLI is ${detectedVersion === null ? "an unknown version" : withV(detectedVersion)}. Ask the user to update it or point the provider's binary path at a newer install.`,
     ),
   );
+};
+
+/** Agents reach an Auto pool member only through its Auto instance. */
+export const requireOutsideAutoPool = (
+  providerInstances: Readonly<Record<string, { readonly config?: unknown }>>,
+  instanceId: string,
+) => {
+  const owner = autoPoolOwnerId(providerInstances, instanceId);
+  return owner === undefined
+    ? Effect.void
+    : Effect.fail(failure("invalid_request", autoPoolMemberRejection(instanceId, owner)));
 };
 
 function providerConstraints(
@@ -1714,13 +1727,17 @@ const make = Effect.gen(function* () {
     const requestedInstanceId = input.target?.providerInstanceId;
     const requestedDriver = input.target?.driverKind;
     const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
+    const { providerInstances } = yield* serverSettings.getSettings.pipe(
+      Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
+    );
     let instanceId = requestedInstanceId;
 
     if (instanceId === undefined && requestedDriver !== undefined) {
       const candidates = input.providers.filter(
         (provider) =>
           provider.driver === requestedDriver &&
-          orchestrationCapableInstanceIds.has(provider.instanceId),
+          orchestrationCapableInstanceIds.has(provider.instanceId) &&
+          autoPoolOwnerId(providerInstances, provider.instanceId) === undefined,
       );
       if (candidates.length === 0) {
         return yield* failure(
@@ -1760,6 +1777,9 @@ const make = Effect.gen(function* () {
       }
     }
     instanceId ??= input.parent.thread.modelSelection.instanceId;
+    // A receipt replay starts no work, so later pool changes must not fail it.
+    if (input.skipProjectEnablementFilter !== true)
+      yield* requireOutsideAutoPool(providerInstances, instanceId);
 
     const provider = input.providers.find((candidate) => candidate.instanceId === instanceId);
     if (provider === undefined) {
@@ -2460,6 +2480,12 @@ const make = Effect.gen(function* () {
       }
       const modelSelection =
         parent?.thread.modelSelection ?? (yield* projectDefaultModelSelection(project));
+      yield* requireOutsideAutoPool(
+        (yield* serverSettings.getSettings.pipe(
+          Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
+        )).providerInstances,
+        modelSelection.instanceId,
+      );
       // Never end on a lone high surrogate, which renders as a broken character.
       const derivedTitle = (input.prompt.split("\n")[0]?.trim() ?? "")
         .slice(0, 80)
@@ -2833,6 +2859,10 @@ const make = Effect.gen(function* () {
       const settings = yield* serverSettings.getSettings.pipe(
         Effect.mapError(() => failure("orchestration_error", "Unable to read server settings.")),
       );
+      const agentProviders = providers.filter(
+        (provider) =>
+          autoPoolOwnerId(settings.providerInstances, provider.instanceId) === undefined,
+      );
       const inherited = parent?.thread.modelSelection;
       const searchTerms = input.search?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
       return {
@@ -2849,7 +2879,7 @@ const make = Effect.gen(function* () {
           ) ?? [],
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
-        providers: providers.map((provider) => {
+        providers: agentProviders.map((provider) => {
           // Snapshots list instances any project enables; delegate_task checks the caller's project.
           const enabledForCaller =
             parent === undefined ||

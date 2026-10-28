@@ -16,6 +16,7 @@ import type {
 import {
   isManagedDriverAllowed,
   isProviderDriverKind,
+  autoPoolOwnerId,
   resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
 import {
@@ -97,9 +98,17 @@ function isProviderEnabledForProject(
   if (!provider) {
     return false;
   }
+  if (isAutoPoolMember(config, provider.instanceId)) return false;
   return config?.settings
     ? resolveProjectProviderInstanceEnabled(config.settings, projectId, provider.instanceId)
     : provider.enabled;
+}
+
+function isAutoPoolMember(
+  config: T3ServerConfig | null | undefined,
+  instanceId: ModelSelection["instanceId"],
+): boolean {
+  return autoPoolOwnerId(config?.settings?.providerInstances ?? {}, instanceId) !== undefined;
 }
 
 function isProjectDisabledOverride(
@@ -193,6 +202,7 @@ export function isModelSelectionUnavailable(
   if (!config || !selection) {
     return false;
   }
+  if (isAutoPoolMember(config, selection.instanceId)) return true;
   const provider = config.providers.find(
     (candidate) => candidate.instanceId === selection.instanceId,
   );

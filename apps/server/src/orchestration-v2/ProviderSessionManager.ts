@@ -15,6 +15,7 @@ import {
   OrchestrationV2RuntimeRequest,
   type OrchestrationV2Subagent,
   ProviderInstanceId,
+  type ProjectId,
   ProviderSessionId,
   type RunId,
   ThreadId,
@@ -243,9 +244,17 @@ export const ProviderSessionManagerV2Error = Schema.Union([
 export type ProviderSessionManagerV2Error = typeof ProviderSessionManagerV2Error.Type;
 
 export interface ProviderSessionManagerV2Shape {
+  readonly validateModelSelection: (
+    selection: ModelSelection,
+    projectId?: ProjectId,
+  ) => Effect.Effect<
+    void,
+    ProviderAdapter.ProviderAdapterV2Error | ProviderAdapterRegistry.ProviderAdapterRegistryV2Error
+  >;
   readonly shutdown: Effect.Effect<void>;
   readonly open: (input: {
     readonly threadId: ThreadId;
+    readonly projectId?: ProjectId;
     readonly providerSessionId: ProviderSessionId;
     readonly modelSelection: ModelSelection;
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
@@ -3241,6 +3250,14 @@ export const layerWithOptions = (
       );
 
       return ProviderSessionManagerV2.of({
+        validateModelSelection: (selection, projectId) =>
+          registry
+            .get(selection.instanceId)
+            .pipe(
+              Effect.flatMap(
+                (adapter) => adapter.validateModelSelection?.(selection, projectId) ?? Effect.void,
+              ),
+            ),
         shutdown,
         open: (input) =>
           sessionOpen.withLock(
@@ -3322,6 +3339,7 @@ export const layerWithOptions = (
                   input.modelSelection.instanceId,
                   adapter.openSession({
                     threadId: input.threadId,
+                    ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
                     providerSessionId: input.providerSessionId,
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,

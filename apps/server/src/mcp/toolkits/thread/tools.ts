@@ -27,6 +27,7 @@ import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
@@ -162,6 +163,7 @@ const ThreadConfigureTool = Tool.make("t3_thread_configure", {
     modelSelection: Schema.optional(ModelSelection),
   }),
   success: Schema.Union([threadConfiguration, OrchestrationV2DispatchCommandResult]),
+  dependencies: [...commandTool.dependencies, ServerSettings.ServerSettingsService],
 }).annotate(Tool.Destructive, true);
 
 const ThreadTransferTool = Tool.make("t3_thread_transfer", {

@@ -245,7 +245,11 @@ it.effect.each([
         ensureTranscript: () => Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 }),
       }),
     ),
-    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+        validateModelSelection: () => Effect.void,
+      }),
+    ),
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
         getThreadRecords: () =>

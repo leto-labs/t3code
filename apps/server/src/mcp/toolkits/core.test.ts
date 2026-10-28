@@ -92,6 +92,7 @@ const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
   Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
   Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
   Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+  Layer.provide(ServerSettings.layerTest()),
 );
 
 const threadId = ThreadId.make("mcp-core-thread");
@@ -937,6 +938,7 @@ it.effect("search names the calling thread, so an agent can tell its own match a
       McpHttpServer.layerThreadToolkit.pipe(
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
         Layer.provide(NodeCrypto.layer),
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
         Layer.provide(
           Layer.mock(ThreadSearch.ThreadSearch)({
@@ -1031,6 +1033,93 @@ it.effect("a read-only client reads threads and is refused every write before it
   ),
 );
 const dispatched: Array<string> = [];
+
+it.effect(
+  "exposes provider allowance as a read-only tool using the backend snapshot service",
+  () => {
+    const calls: Array<unknown> = [];
+    const report = {
+      observedAt: "2026-10-17T12:00:00.000Z",
+      instances: [
+        {
+          instanceId: ProviderInstanceId.make("codex_personal"),
+          driver: ProviderDriverKind.make("codex"),
+          displayName: "Personal",
+          checkedAt: "2026-10-17T12:00:00.000Z",
+          lastAttemptAt: "2026-10-17T12:00:00.000Z",
+          stale: false,
+          status: "available" as const,
+          windows: [
+            {
+              id: "primary",
+              kind: "session" as const,
+              label: "Session",
+              usedPercent: 25,
+              remainingPercent: 75,
+              resetsAt: "2026-10-17T23:00:00.000Z",
+            },
+          ],
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const result = yield* server
+        .callTool({
+          name: "provider_usage_limits",
+          arguments: { instanceIds: ["codex_personal", "codex_pool"], refresh: true },
+        })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, clientScope("auto")),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toEqual(report);
+      // Members stay requestable; the report folds them into their Auto entry.
+      expect(calls).toEqual([
+        {
+          input: { instanceIds: ["codex_personal", "codex_pool"], refresh: true },
+          pools: [{ instanceId: "codex_auto", memberIds: ["codex_pool"], maxRunningTurns: 3 }],
+        },
+      ]);
+    }).pipe(
+      Effect.provide(
+        layerOrchestratorToolkit.pipe(
+          Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
+          Layer.provide(
+            ServerSettings.layerTest({
+              providerInstances: {
+                [ProviderInstanceId.make("codex_auto")]: {
+                  driver: ProviderDriverKind.make("codex"),
+                  config: { autoPoolMemberIds: ["codex_pool"] },
+                },
+              },
+            }),
+          ),
+          Layer.provide(
+            Layer.mock(ProviderRegistry.ProviderRegistry)({
+              usageReport: (input, pools) =>
+                Effect.sync(() => {
+                  calls.push({ input, pools });
+                  return report;
+                }),
+            }),
+          ),
+          Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+          Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+          Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+          Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+          Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+          Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+          Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+          Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+        ),
+      ),
+    );
+  },
+);
 
 it.effect("hides act-as-caller tools from a client caller", () =>
   Effect.gen(function* () {
@@ -1178,6 +1267,7 @@ it.effect.each([
       McpHttpServer.layerThreadToolkit.pipe(
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
         Layer.provide(NodeCrypto.layer),
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
         Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -1217,6 +1307,7 @@ it.effect("run_scheduled_task_now reports why a started run failed to dispatch",
       McpHttpServer.layerThreadToolkit.pipe(
         Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
         Layer.provide(NodeCrypto.layer),
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
         Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),

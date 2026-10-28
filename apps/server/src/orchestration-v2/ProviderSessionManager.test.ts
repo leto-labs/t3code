@@ -19,7 +19,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
-  type ProviderSessionId,
+  ProviderSessionId,
   RunId,
   ThreadId,
   TurnItemId,

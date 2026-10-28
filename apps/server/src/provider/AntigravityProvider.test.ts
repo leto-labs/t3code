@@ -844,7 +844,12 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         });
         yield* harness.provider.snapshot.refresh;
         yield* Deferred.await(failedReadApplied);
-        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(limits);
+        // The retained read records that the newer attempt failed.
+        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual({
+          ...limits,
+          lastAttemptAt: "2026-10-09T12:01:00.000Z",
+          lastAttemptFailed: true,
+        });
         yield* harness.provider.onSignedOut;
         expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
         yield* Ref.set(usage, {

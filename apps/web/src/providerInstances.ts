@@ -2,6 +2,7 @@ import { pipe } from "effect/Function";
 import {
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
+  readAutoPools,
   resolveProjectProviderInstanceEnabled,
   type ModelSelection,
   type ProjectId,
@@ -35,6 +36,8 @@ export interface ProviderInstanceEntry {
   readonly acpRegistryIconUrl?: string | undefined;
   readonly continuationGroupKey?: string | undefined;
   readonly enabled: boolean;
+  /** Accounts selected by an Auto pool are runtime-enabled but never directly selectable. */
+  readonly poolOnly: boolean;
   readonly installed: boolean;
   readonly status: ServerProviderState;
   readonly isDefault: boolean;
@@ -68,6 +71,7 @@ function isProviderInstanceHealthy(entry: ProviderInstanceEntry): boolean {
 
 /** Also true after a check that only failed or ran late: an earlier check's models stay offered. */
 export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boolean {
+  if (entry.poolOnly) return false;
   if (isProviderInstanceHealthy(entry)) return true;
   const { subProviders, auth, modelsRetained } = entry.snapshot;
   if (!entry.enabled || !entry.isAvailable || subProviders !== undefined) return false;
@@ -81,8 +85,15 @@ export function isProviderInstancePickerReady(entry: ProviderInstanceEntry): boo
   );
 }
 
-export function isProviderInstancePickerVisible(entry: ProviderInstanceEntry): boolean {
-  return entry.enabled;
+export function isProviderInstancePickerVisible(
+  entry: ProviderInstanceEntry,
+  visibleModels: ReadonlyArray<Pick<ServerProviderModel, "slug">> = entry.models,
+): boolean {
+  // An empty native catalog still needs a setup/error entry. A populated
+  // catalog with every model hidden is an explicit picker preference.
+  return (
+    !entry.poolOnly && entry.enabled && (entry.models.length === 0 || visibleModels.length > 0)
+  );
 }
 
 export function deriveProviderInstanceEntries(
@@ -103,6 +114,7 @@ export function deriveProviderInstanceEntries(
         : {}),
       continuationGroupKey: snapshot.continuation?.groupKey,
       enabled: snapshot.enabled,
+      poolOnly: false,
       installed: snapshot.installed,
       status: snapshot.status,
       isDefault,
@@ -149,10 +161,16 @@ export function applyProviderInstanceSettings(
   settings: Pick<ServerSettings, "providerInstances" | "projectSettingsOverrides">,
   projectId: ProjectId | null,
 ): ReadonlyArray<ProviderInstanceEntry> {
+  const poolOnlyIds = new Set<string>(
+    readAutoPools(settings.providerInstances).flatMap((pool) => pool.memberIds),
+  );
   return entries.map((entry) => {
     const enabled = resolveProjectProviderInstanceEnabled(settings, projectId, entry.instanceId);
+    const poolOnly = poolOnlyIds.has(entry.instanceId);
     return applyProviderInstanceBranding(
-      enabled === entry.enabled ? entry : { ...entry, enabled },
+      enabled === entry.enabled && poolOnly === entry.poolOnly
+        ? entry
+        : { ...entry, enabled, poolOnly },
       settings,
     );
   });
@@ -242,7 +260,7 @@ export function getDefaultProviderInstanceModel(
 }
 
 const isSelectableProviderInstanceEntry = (entry: ProviderInstanceEntry): boolean =>
-  entry.enabled && entry.isAvailable;
+  !entry.poolOnly && entry.enabled && entry.isAvailable;
 
 export function resolveSelectableProviderInstanceEntry(
   entries: ReadonlyArray<ProviderInstanceEntry>,

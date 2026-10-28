@@ -7,6 +7,9 @@ import {
   type SecretReference,
   type ServerProvider,
   type ServerProviderUpdateState,
+  type ProviderUsageReportInput,
+  type ProviderUsageReport,
+  type AutoPoolConfig,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -54,6 +57,8 @@ import {
   latestProviderVersionCacheKeys,
 } from "@t3tools/provider-core/server/maintenanceResolver";
 import type { ProviderSnapshotSource } from "./builtInProviderCatalog.ts";
+import { providerUsageReport } from "./providerUsageReport.ts";
+import { AutoPoolAccountLoad } from "./AutoPoolAccountLoad.ts";
 
 export type ProviderMaintenanceActionKind = "update";
 
@@ -61,6 +66,11 @@ export class ProviderRegistry extends Context.Service<
   ProviderRegistry,
   {
     readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
+    /** `pools` folds each Auto pool's members into its entry. */
+    readonly usageReport: (
+      input: ProviderUsageReportInput,
+      pools?: readonly AutoPoolConfig[],
+    ) => Effect.Effect<ProviderUsageReport>;
 
     readonly refresh: (
       provider?: ProviderDriverKind,
@@ -270,6 +280,7 @@ const mergeProviderModels = (
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
+  if (provider.authoritativeModels) return nextModels;
   const shouldRetainMissingModels = shouldRetainMissingProviderModels(provider);
   const updateRequiredSlugs = new Set(provider.updateRequiredModels?.map((model) => model.slug));
   const unavailableSubProviders = new Set(
@@ -1397,6 +1408,34 @@ export const layer = Layer.effect(
 
     return {
       getProviders: Ref.get(providersRef),
+      usageReport: Effect.fn("ProviderRegistry.usageReport")(function* (input, pools = []) {
+        let providers = yield* Ref.get(providersRef);
+        const requested = (instanceId: ProviderInstanceId) =>
+          input.instanceIds === undefined || input.instanceIds.includes(instanceId);
+        const poolMembers = new Set<string>(
+          pools.filter((pool) => requested(pool.instanceId)).flatMap((pool) => pool.memberIds),
+        );
+        const selected = (provider: ServerProvider) =>
+          requested(provider.instanceId) || poolMembers.has(provider.instanceId);
+        if (input.refresh) {
+          yield* Effect.forEach(
+            providers.filter(selected),
+            (provider) =>
+              refreshInstance(provider.instanceId).pipe(
+                Effect.timeoutOption("20 seconds"),
+                Effect.catchCause(recoverRefreshFailure),
+              ),
+            { concurrency: 4 },
+          );
+          providers = yield* Ref.get(providersRef);
+        }
+        const load = yield* AutoPoolAccountLoad;
+        return providerUsageReport(
+          providers.filter(selected),
+          DateTime.formatIso(yield* DateTime.now),
+          { pools, runningTurns: (accountKey) => load.count(accountKey, "") },
+        );
+      }),
       refresh: (provider?: ProviderDriverKind) =>
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>
