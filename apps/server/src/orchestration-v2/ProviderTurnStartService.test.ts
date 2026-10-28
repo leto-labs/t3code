@@ -497,6 +497,7 @@ function makeLocalCommandHarness(input: {
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
   readonly resumeFailure?: ProviderAdapter.ProviderAdapterV2Error;
+  readonly providerDriver?: "codex" | "antigravity";
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -565,7 +566,8 @@ function makeLocalCommandHarness(input: {
   const providerThread: OrchestrationV2ThreadProjection["providerThreads"][number] = {
     id: providerThreadId,
     driver: ProviderDriverKind.make(
-      input.nativeGoals === undefined ? "codex" : (input.goalDriver ?? "opencode"),
+      input.providerDriver ??
+        (input.nativeGoals === undefined ? "codex" : (input.goalDriver ?? "opencode")),
     ),
     providerInstanceId: newInstanceId,
     providerSessionId: input.missingProviderSession === true ? null : providerSessionId,
@@ -1128,6 +1130,16 @@ function makeLocalCommandHarness(input: {
       ),
     ),
   );
+  const resumeThread = vi.fn(() =>
+    Effect.fail(
+      input.resumeFailure ??
+        new ProviderAdapter.ProviderAdapterEventStreamError({
+          driver: providerThread.driver,
+          providerSessionId,
+          cause: "native thread is gone",
+        }),
+    ),
+  );
   const fallbackEnsureThread = vi.fn(() => Effect.succeed(providerThread));
   const providerSession = {
     id: providerSessionId,
@@ -1158,15 +1170,7 @@ function makeLocalCommandHarness(input: {
   const resumeFallbackSession = {
     driver: providerThread.driver,
     providerSession,
-    resumeThread: () =>
-      Effect.fail(
-        input.resumeFailure ??
-          new ProviderAdapter.ProviderAdapterEventStreamError({
-            driver: providerThread.driver,
-            providerSessionId,
-            cause: "native thread is gone",
-          }),
-      ),
+    resumeThread,
     ensureThread: fallbackEnsureThread,
   };
   const startTurn = vi.fn((_turn: ProviderAdapter.ProviderAdapterV2TurnInput) => Effect.void);
@@ -1454,6 +1458,7 @@ function makeLocalCommandHarness(input: {
     layer,
     interruptRun,
     settledRuns,
+    resumeThread,
     getThreadRecords,
     getTurnStartContext,
     getRuntimeRecoveryProjection,
@@ -3451,6 +3456,84 @@ effectIt.effect("fails the run instead of replacing a native thread another clie
   }),
 );
 
+effectIt.effect("fails a starting run when its last start attempt cannot load the thread", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      ensureThreadFailure: new Error("Pi RPC read failed: pi process exited with code 1."),
+    });
+
+    yield* harness.start;
+
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    const projection = harness.projection();
+    expect(projection.runs.at(-1)).toMatchObject({ status: "failed", startedAt: null });
+    expect(projection.attempts[0]).toMatchObject({ status: "failed", startedAt: null });
+    expect(projection.nodes[0]).toMatchObject({ status: "failed", startedAt: null });
+    expect(projection.turnItems).toMatchObject([
+      {
+        type: "error",
+        title: "Provider turn failed to start",
+        failure: {
+          class: "provider_error",
+          message: "Pi RPC read failed: pi process exited with code 1.",
+        },
+      },
+    ]);
+  }),
+);
+
+effectIt.effect("leaves the run starting when a thread-load failure will be retried", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      ensureThreadFailure: new Error("pi process exited with code 1"),
+    });
+
+    const error = yield* harness.startWithRetry.pipe(Effect.flip);
+
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+  }),
+);
+
+effectIt.effect("keeps a thread-load failure retryable when terminal persistence fails", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      ensureThreadFailure: new Error("pi process exited with code 1"),
+      writeFailure: new Error("database unavailable"),
+    });
+
+    const error = yield* harness.start.pipe(Effect.flip);
+
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.events).toEqual([]);
+  }),
+);
+
+effectIt.effect(
+  "keeps a store failure after the provider loaded the thread typed and retryable",
+  () =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        providerDriver: "antigravity",
+        historyReadFailureAfterFallback: new Error("database unavailable"),
+      });
+
+      const error = yield* harness.start.pipe(Effect.flip);
+
+      expect(error._tag).toBe("ProviderTurnStartError");
+      expect((error.cause as { _tag?: string } | undefined)?._tag).toBe("ProjectionStoreReadError");
+      expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+      expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+      expect(harness.events).toEqual([]);
+    }),
+);
+
 effectIt.effect("does not mistake a failed state read for a superseded run", () =>
   Effect.gen(function* () {
     const harness = makeLocalCommandHarness({ text: "Continue", failReadsAfterRunning: true });
@@ -3590,5 +3673,51 @@ effectIt.effect("rejects citation expansion before opening a provider session", 
       },
     ]);
     expect(harness.projection().messages[0]?.text).toBe(text);
+  }),
+);
+
+const codexResumeFailure = (cause: string) =>
+  new ProviderAdapter.ProviderAdapterResumeThreadError({
+    driver: ProviderDriverKind.make("codex"),
+    providerSessionId: ProviderSessionId.make("new-provider-session"),
+    providerThreadId: ProviderThreadId.make("new-provider-thread"),
+    cause,
+  });
+
+effectIt.effect.each(["thread not found", "database is locked"])(
+  "preserves the Codex native ref and reports a resume failure: %s",
+  (resumeFailure) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        resumeFailure: codexResumeFailure(resumeFailure),
+      });
+      const before = harness.projection().providerThreads.at(-1)?.nativeThreadRef;
+      yield* harness.start;
+      expect(harness.resumeThread).toHaveBeenCalledOnce();
+      expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.projection().providerThreads.at(-1)?.nativeThreadRef).toEqual(before);
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      expect(harness.projection().turnItems).toMatchObject([
+        { type: "error", failure: { message: resumeFailure } },
+      ]);
+      expect(harness.events.some((event) => event.type === "context-handoff.updated")).toBe(false);
+    }),
+);
+
+effectIt.effect("keeps a failed Codex resume retryable without creating another session", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      resumeFailure: codexResumeFailure("thread not found"),
+    });
+    const before = harness.projection().providerThreads.at(-1)?.nativeThreadRef;
+    const error = yield* harness.startWithRetry.pipe(Effect.flip);
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
+    expect(harness.projection().providerThreads.at(-1)?.nativeThreadRef).toEqual(before);
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.events).toEqual([]);
   }),
 );

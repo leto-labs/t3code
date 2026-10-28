@@ -2246,8 +2246,6 @@ export const layerWithOptions = (
                   ) {
                     return [null, current];
                   }
-                  const idleThreadUnloads = new Map(latest.idleThreadUnloads);
-                  idleThreadUnloads.delete(input.providerThreadId);
                   // A native thread a fresh session replaced is not what the app thread has loaded.
                   const isCurrent = isLoadKeyFor(
                     latest.loadedProviderThreadKeyByThread.get(input.threadId),
@@ -2261,7 +2259,6 @@ export const layerWithOptions = (
                   updated.set(key, {
                     ...latest,
                     loadedProviderThreadKeyByThread,
-                    idleThreadUnloads,
                   });
                   return [isCurrent, updated];
                 },
@@ -2292,6 +2289,14 @@ export const layerWithOptions = (
                     linkedEnvironmentsByThread.delete(input.threadId);
                     return new Map(current).set(key, { ...latest, linkedEnvironmentsByThread });
                   }),
+                ),
+                // Tracked until here so a detach still finds the writer if this unload fails.
+                Effect.andThen(
+                  updateIdleThreadUnload(
+                    input.providerSessionId,
+                    input.providerThreadId,
+                    (current) => (current?.generation === input.generation ? undefined : current),
+                  ),
                 ),
                 Effect.catchCause((cause) =>
                   Effect.logWarning("orchestration-v2.driver-session.idle-unload-failed", {
@@ -3257,7 +3262,14 @@ export const layerWithOptions = (
               const key = sessionKey(input.providerSessionId);
               const live = (yield* Ref.get(sessions)).get(key);
               if (live !== undefined) yield* releaseForLinkedEnvironments(live);
-              const existing = (yield* Ref.get(sessions)).get(key);
+              let existing = (yield* Ref.get(sessions)).get(key);
+              if (existing?.runtime.isReusable && !(yield* existing.runtime.isReusable)) {
+                yield* releaseEntry({
+                  providerSessionId: input.providerSessionId,
+                  reason: "runtime_error",
+                });
+                existing = undefined;
+              }
               if (existing !== undefined) {
                 const attached = existing.attachedThreadIds.has(input.threadId);
                 if (!attached && !existing.supportsMultipleProviderThreads) {
@@ -3538,7 +3550,16 @@ export const layerWithOptions = (
           function* (input) {
             const key = sessionKey(input.providerSessionId);
             const currentEntry = (yield* Ref.get(sessions)).get(key);
-            let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> = [];
+            // A switch has already reassigned the durable record by the time
+            // its detach effect runs. The old runtime still owns this writer.
+            const retainedProviderThreads = [...(currentEntry?.idleThreadUnloads.values() ?? [])]
+              .filter((pending) => pending.threadId === input.threadId)
+              .map((pending) => pending.providerThread);
+            const retainedProviderThreadIds = new Set(
+              retainedProviderThreads.map((thread) => thread.id),
+            );
+            let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> =
+              retainedProviderThreads;
             if (currentEntry?.supportsMultipleProviderThreads === true) {
               const projection = yield* Effect.option(
                 projectionStore.getThreadRecords(input.threadId, [
@@ -3552,6 +3573,9 @@ export const layerWithOptions = (
                     .filter((thread) => thread.providerSessionId === input.providerSessionId)
                     .map((thread) => [thread.id, thread] as const),
                 );
+                for (const retained of retainedProviderThreads) {
+                  providerThreads.set(retained.id, retained);
+                }
                 detachedProviderThreads = [...providerThreads.values()];
                 const activeTurns = projection.value.providerTurns.filter(
                   (turn) => turn.status === "running" && providerThreads.has(turn.providerThreadId),
@@ -3608,11 +3632,12 @@ export const layerWithOptions = (
                       return pruned;
                     })()
                   : entry.mcpCredentialIdByThread;
+              // Pending idle unloads stop here, but stay tracked until the detach unloads them.
               const idleThreadUnloads = new Map(entry.idleThreadUnloads);
               const idleUnloadFibers: Array<Fiber.Fiber<void, never>> = [];
               for (const [providerThreadId, pending] of entry.idleThreadUnloads) {
                 if (pending.threadId !== input.threadId) continue;
-                idleThreadUnloads.delete(providerThreadId);
+                idleThreadUnloads.set(providerThreadId, { ...pending, fiber: null });
                 if (pending.fiber !== null) idleUnloadFibers.push(pending.fiber);
               }
               const updatedEntry = {
@@ -3643,12 +3668,13 @@ export const layerWithOptions = (
             if (input.revokeMcpCredential === true) {
               yield* clearMcpSession(input.threadId);
             }
-            if (Option.isNone(detached)) {
-              return;
-            }
+            // An unload failure leaves the runtime alive. A retried detach must
+            // finish that barrier even though its binding was already removed.
+            const detachedEntry = Option.getOrElse(detached, () => currentEntry);
+            if (detachedEntry === undefined) return;
             if (
-              detached.value.attachedThreadIds.size === 0 &&
-              !detached.value.supportsMultipleProviderThreads
+              detachedEntry.attachedThreadIds.size === 0 &&
+              !detachedEntry.supportsMultipleProviderThreads
             ) {
               yield* releaseEntry({
                 providerSessionId: input.providerSessionId,
@@ -3658,8 +3684,8 @@ export const layerWithOptions = (
               });
               return;
             }
-            const unloadThread = detached.value.exposedRuntime.unloadThread;
-            if (detached.value.supportsMultipleProviderThreads && unloadThread !== undefined) {
+            const unloadThread = detachedEntry.exposedRuntime.unloadThread;
+            if (detachedEntry.supportsMultipleProviderThreads && unloadThread !== undefined) {
               // The projection includes native children owned by other app threads;
               // lock each owner so an attached child stays loaded and later attaches wait.
               for (const providerThread of detachedProviderThreads) {
@@ -3673,22 +3699,31 @@ export const layerWithOptions = (
                   Effect.gen(function* () {
                     const entry = (yield* Ref.get(sessions)).get(key);
                     if (
-                      entry?.runtime !== detached.value.runtime ||
+                      entry?.runtime !== detachedEntry.runtime ||
                       entry.attachedThreadIds.has(ownerThreadId)
                     ) {
                       return;
                     }
-                    yield* unloadThread({ providerThread }).pipe(
+                    // A detached thread may resume next on another account's process.
+                    yield* unloadThread({ providerThread, awaitWriterRelease: true }).pipe(
                       Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                       Effect.catchCause((cause) =>
-                        Effect.logWarning("orchestration-v2.driver-session.detach-unload-failed", {
-                          providerSessionId: input.providerSessionId,
-                          threadId: ownerThreadId,
-                          providerThreadId: providerThread.id,
-                          cause,
-                        }),
+                        Effect.fail(
+                          new ProviderSessionReleaseError({
+                            providerSessionId: input.providerSessionId,
+                            reason: "runtime_error",
+                            cause,
+                          }),
+                        ),
                       ),
                     );
+                    if (retainedProviderThreadIds.has(providerThread.id)) {
+                      yield* updateIdleThreadUnload(
+                        input.providerSessionId,
+                        providerThread.id,
+                        () => undefined,
+                      );
+                    }
                   }),
                 );
               }

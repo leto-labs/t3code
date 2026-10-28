@@ -763,6 +763,8 @@ export type ProviderAdapterV2SubagentOutcome = {
 };
 
 export interface ProviderAdapterV2SessionRuntime {
+  /** False after an internal process replacement failed; reopen rather than reuse that runtime. */
+  readonly isReusable?: Effect.Effect<boolean>;
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
   readonly providerSessionId: ProviderSessionId;
@@ -856,6 +858,8 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     /** Also hide it from the provider's own clients where it can; resuming it must restore it. */
     readonly archive?: boolean;
+    /** Return only once the provider released the thread, so another process can resume it. */
+    readonly awaitWriterRelease?: boolean;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly respondToRuntimeRequest: (
     input: ProviderAdapterV2RuntimeRequestResponseInput,
