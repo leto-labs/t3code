@@ -532,6 +532,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "background-pull-request-refresh",
+    title: msg("Background pull request refresh"),
+    to: "/settings/general",
+    searchTerms: [msg("PR discovery polling disable lookup performance network")],
+  },
+  {
     id: "guest-links",
     title: msg("Guest links"),
     to: "/settings/labs",
