@@ -94,3 +94,7 @@ Ask a quick side question about a thread without polluting its history. A side c
 - **Find later**: Listed under **Side chats** in thread details (web/desktop) or above the composer (mobile); hidden from the main sidebar.
 - **Bring results back**: Click **Add to chat** in the side chat, or `@`-mention its title in the parent composer (not readable by external OpenCode servers).
 - **Lifecycle**: Closing an unused side chat deletes it. Deleting or archiving the parent thread deletes or archives its side chats.
+
+## Background PR checks
+
+In **Settings → General**, turn off **Background pull request refresh** to stop automatic PR discovery, status refreshes, watches, and PR-based cleanup lookups on the selected environments. Threads keep showing the last PR state they saw. Manual PR commands, including refreshing a PR, still work, and inactivity settlement continues without PR lookups. Turn it back on to resume background checks.

@@ -1685,6 +1685,23 @@ export const make = Effect.gen(function* () {
   ) {
     // Upstream changes must not orphan the same branch's fallback value.
     const branchKey = `${cwd}\u0000${details.branch}`;
+    const lastKnown = Effect.suspend(() =>
+      lastKnownPrByBranchKey.get(branchKey)?.pr
+        ? resolveLookupHeadContext(cwd, details).pipe(
+            Effect.map(({ headContext }) =>
+              resolveLastKnownPr(branchKey, {
+                upstreamRef: details.upstreamRef,
+                headBranch: headContext.headBranch,
+                remoteName: headContext.remoteName,
+                headRemoteUrlKey: headContext.headRemoteUrlKey,
+              }),
+            ),
+          )
+        : Effect.succeed(null),
+    ).pipe(Effect.map((known) => ({ pr: known?.pr ?? null, headSha: known?.headSha ?? null })));
+    if (!(yield* ServerSettings.backgroundPullRequestRefreshEnabled(serverSettingsService))) {
+      return yield* lastKnown;
+    }
     const cacheKey = prLookupCacheKey(cwd, details);
     if (refreshMissingPullRequest) {
       const cached = yield* Cache.getOption(prLookupCache, cacheKey).pipe(
@@ -1716,20 +1733,8 @@ export const make = Effect.gen(function* () {
         ),
       ),
       Effect.map(({ pr, headSha }) => ({ pr, headSha })),
-      Effect.catch((error) => {
-        const fallback = lastKnownPrByBranchKey.get(branchKey)?.pr
-          ? resolveLookupHeadContext(cwd, details).pipe(
-              Effect.map(({ headContext }) =>
-                resolveLastKnownPr(branchKey, {
-                  upstreamRef: details.upstreamRef,
-                  headBranch: headContext.headBranch,
-                  remoteName: headContext.remoteName,
-                  headRemoteUrlKey: headContext.headRemoteUrlKey,
-                }),
-              ),
-            )
-          : Effect.succeed(null);
-        return Effect.logWarning("PR lookup failed.").pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("PR lookup failed.").pipe(
           Effect.annotateLogs({
             operation: "lookupStatusPr",
             branch: details.branch,
@@ -1746,13 +1751,9 @@ export const make = Effect.gen(function* () {
                 }
               : {}),
           }),
-          Effect.andThen(fallback),
-          Effect.map((lastKnown) => ({
-            pr: lastKnown?.pr ?? null,
-            headSha: lastKnown?.headSha ?? null,
-          })),
-        );
-      }),
+          Effect.andThen(lastKnown),
+        ),
+      ),
     );
   });
   const readRemoteStatus = Effect.fn("readRemoteStatus")(function* (
