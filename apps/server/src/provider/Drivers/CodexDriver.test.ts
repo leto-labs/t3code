@@ -39,6 +39,7 @@ import {
   resolveLatestProviderVersion,
 } from "@t3tools/provider-core/server/maintenanceResolver";
 import { codexAppServerArgs } from "../codexLaunchArgs.ts";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { CodexDriver } from "./CodexDriver.ts";
 import * as CodexAdapterV2 from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -340,6 +341,51 @@ it.layer(layerTest)("CodexDriver", (it) => {
   it.effect.each(["unchanged", "during-probe"] as const)(
     "managed catalog keeps its account label and token together: %s",
     checkManagedAccount,
+  );
+
+  it.effect("reserves Codex Auto pool members for Auto routing", () =>
+    Effect.gen(function* () {
+      const host = yield* ProviderHost.ProviderHost;
+      const memberId = ProviderInstanceId.make("codex-pool-member");
+      const settings = {
+        ...(yield* host.settings.get),
+        providerInstances: {
+          [ProviderInstanceId.make("codex_auto")]: {
+            driver: CodexDriver.driverKind,
+            config: { autoPoolMemberIds: [memberId] },
+          },
+        },
+      };
+      const instance = yield* CodexDriver.create({
+        instanceId: memberId,
+        displayName: "Pool member",
+        enabled: false,
+        environment: [],
+        config: CodexDriver.defaultConfig(),
+      }).pipe(
+        Effect.provideService(ProviderHost.ProviderHost, {
+          ...host,
+          settings: { ...host.settings, get: Effect.succeed(settings) },
+        }),
+      );
+      const selection = { instanceId: memberId, model: "gpt-test" };
+      const validation = yield* instance.orchestrationAdapter.validateModelSelection!(
+        selection,
+      ).pipe(Effect.flip);
+      const reserved = {
+        detail: expect.stringContaining("reserved for the codex_auto Auto pool. Select codex_auto"),
+      };
+      expect(validation).toMatchObject(reserved);
+      const opened = yield* instance.orchestrationAdapter
+        .openSession({
+          threadId: ThreadId.make("pool-member-thread"),
+          providerSessionId: ProviderSessionId.make("pool-member-session"),
+          modelSelection: selection,
+          runtimePolicy: { cwd: null, runtimeMode: "full-access", interactionMode: "default" },
+        })
+        .pipe(Effect.flip);
+      expect(opened).toMatchObject({ cause: reserved });
+    }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn), Effect.scoped),
   );
 
   it.effect.skipIf(windowsHost)(

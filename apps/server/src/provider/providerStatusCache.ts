@@ -65,6 +65,7 @@ export const hydrateCachedProvider = (input: {
   readonly cachedProvider: ServerProvider;
   readonly fallbackProvider: ServerProvider;
 }): ServerProvider => {
+  if (input.fallbackProvider.authoritativeModels) return input.fallbackProvider;
   if (!isCachedProviderCorrelated(input)) {
     return input.fallbackProvider;
   }

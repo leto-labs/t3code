@@ -379,7 +379,7 @@ export function ProviderModelsSection({
               : ""}
           </span>
         </div>
-        {driverKind !== "antigravity" && !isAdding ? (
+        {driverKind !== "antigravity" && canManageCustomModels && !isAdding ? (
           <Button
             type="button"
             size="xs"

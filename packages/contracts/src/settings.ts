@@ -704,8 +704,36 @@ export function makeProviderSettingsSchema<const Fields extends Schema.Struct.Fi
   );
 }
 
+export const AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS = 3;
+
+/** The keys that make an instance an Auto pool. Every driver with Auto names them the same. */
+const autoPoolSettingsFields = (label: string, membersDescription: string) => ({
+  autoPoolMemberIds: Schema.optionalKey(
+    Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(32)),
+  ).pipe(
+    Schema.annotateKey({
+      title: `${label} accounts`,
+      description: membersDescription,
+      providerSettingsForm: { hidden: true },
+    }),
+  ),
+  autoPoolMaxRunningTurns: Schema.optionalKey(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 32 })),
+  ).pipe(
+    Schema.annotateKey({
+      title: `${label} turns per account`,
+      description: `Running turns per account before new threads go to the next account. Default ${AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS}.`,
+      providerSettingsForm: { hidden: true },
+    }),
+  ),
+});
+
 export const CodexSettings = makeProviderSettingsSchema(
   {
+    ...autoPoolSettingsFields(
+      "Codex Auto",
+      "Explicit Codex subscription instance IDs. All accounts must share the default Codex session home.",
+    ),
     setupMode: Schema.optionalKey(Schema.Literals(["managed", "existing"])).pipe(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
@@ -760,6 +788,58 @@ export const CodexSettings = makeProviderSettingsSchema(
   },
 );
 export type CodexSettings = typeof CodexSettings.Type;
+
+/** Reads Auto pool membership without making every client surface decode the whole provider config. */
+export function readAutoPoolMemberIds(config: unknown): readonly string[] {
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return [];
+  const members = (config as { readonly autoPoolMemberIds?: unknown }).autoPoolMemberIds;
+  return Array.isArray(members) ? members.filter((id): id is string => typeof id === "string") : [];
+}
+
+export interface AutoPoolConfig {
+  readonly instanceId: ProviderInstanceId;
+  readonly memberIds: readonly ProviderInstanceId[];
+  readonly maxRunningTurns: number;
+}
+
+/** Every configured Auto pool, whatever its driver, read without decoding whole provider configs. */
+export function readAutoPools(
+  providerInstances: Readonly<Record<string, { readonly config?: unknown }>>,
+): readonly AutoPoolConfig[] {
+  return Object.entries(providerInstances).flatMap(([instanceId, entry]) => {
+    if (
+      entry.config === null ||
+      typeof entry.config !== "object" ||
+      !("autoPoolMemberIds" in entry.config)
+    )
+      return [];
+    const cap = (entry.config as { readonly autoPoolMaxRunningTurns?: unknown })
+      .autoPoolMaxRunningTurns;
+    return [
+      {
+        instanceId: ProviderInstanceId.make(instanceId),
+        memberIds: readAutoPoolMemberIds(entry.config).map((id) => ProviderInstanceId.make(id)),
+        maxRunningTurns:
+          typeof cap === "number" && Number.isInteger(cap) && cap >= 1
+            ? cap
+            : AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS,
+      },
+    ];
+  });
+}
+
+export const autoPoolMemberRejection = (memberId: string, ownerId: string) =>
+  `Provider instance ${memberId} is reserved for the ${ownerId} Auto pool. Select ${ownerId} instead; it picks an account for each turn.`;
+
+/** The Auto instance that owns `instanceId`; agents reach a pool member only through it. */
+export function autoPoolOwnerId(
+  providerInstances: Readonly<Record<string, { readonly config?: unknown }>>,
+  instanceId: string,
+): ProviderInstanceId | undefined {
+  return readAutoPools(providerInstances).find((pool) =>
+    pool.memberIds.some((member) => member === instanceId),
+  )?.instanceId;
+}
 
 const CLAUDE_AUTO_COMPACT_WINDOW_PATTERN = /^(?:|[1-9]\d{5}|1000000)$/;
 
