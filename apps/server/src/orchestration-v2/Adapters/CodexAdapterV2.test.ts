@@ -1,3 +1,5 @@
+import * as NodeOS from "node:os";
+
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
@@ -34,8 +36,8 @@ import {
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as CodexClient from "effect-codex-app-server/client";
-import * as CodexReplay from "effect-codex-app-server/replay";
 import * as CodexError from "effect-codex-app-server/errors";
+import * as CodexReplay from "effect-codex-app-server/replay";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -60,8 +62,12 @@ import * as Cause from "effect/Cause";
 import * as PlatformError from "effect/PlatformError";
 import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
+import * as Path from "effect/Path";
 
 import packageJson from "../../../package.json" with { type: "json" };
+import * as ServerConfig from "../../config.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -254,6 +260,555 @@ describe("CodexAdapterV2 runtime policy", () => {
       });
       assert.isDefined(withT3.additionalContext?.["t3_code_runtime"]);
     }),
+  );
+
+  it.effect("keeps Codex in plan mode without referencing unavailable T3 MCP tools", () =>
+    Effect.gen(function* () {
+      const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-plan-without-t3-mcp",
+        codexInput: [{ type: "text", text: "plan this task" }],
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "plan",
+          cwd: null,
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.4",
+        },
+        hasT3Mcp: false,
+      });
+
+      assert.equal(params.collaborationMode?.mode, "plan");
+      assert.notProperty(params.collaborationMode?.settings, "developer_instructions");
+    }),
+  );
+
+  it.effect("compiles per-turn Codex model options and cwd from their owning inputs", () =>
+    Effect.gen(function* () {
+      const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-model-options",
+        codexInput: [{ type: "text", text: "test" }],
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "plan",
+          cwd: "/workspace/model-options",
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.4",
+          options: [
+            { id: "reasoningEffort", value: "xhigh" },
+            { id: "serviceTier", value: "priority" },
+          ],
+        },
+      });
+
+      assert.equal(params.model, "gpt-5.4");
+      assert.equal(params.effort, "xhigh");
+      assert.equal(params.serviceTier, "priority");
+      assert.equal(params.cwd, "/workspace/model-options");
+      assert.equal(params.collaborationMode?.settings.model, "gpt-5.4");
+      assert.equal(params.collaborationMode?.settings.reasoning_effort, "xhigh");
+
+      const managed = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-model-options",
+        codexInput: [{ type: "text", text: "test" }],
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: "/workspace/model-options",
+        },
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.4",
+          options: [{ id: "serviceTier", value: "priority" }],
+        },
+        omitServiceTier: true,
+      });
+      assert.equal(managed.serviceTier, undefined);
+    }),
+  );
+});
+
+describe("CodexAdapterV2 process spawning", () => {
+  it("injects cwd, model, and MCP authorization into thread-scoped params", () => {
+    const threadId = ThreadId.make("thread-codex-mcp");
+    const mcpSession = {
+      environmentId: EnvironmentId.make("environment-codex-mcp"),
+      threadId,
+      providerSessionId: "mcp-session-codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer secret-codex-token",
+      browserToolsAvailable: true,
+    };
+
+    assert.deepEqual(
+      CodexAdapterV2.codexThreadRuntimeParams({
+        threadId: null,
+        mcpSession,
+        modelSelection: { model: "gpt-5.4" },
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: "/workspace/thread-codex-mcp",
+        },
+      }),
+      {
+        cwd: "/workspace/thread-codex-mcp",
+        model: "gpt-5.4",
+        config: {
+          "tools.update_plan.enabled": true,
+          // Codex waits up to 10 s, not 1 s, for MCP servers before the first request.
+          mcp_optional_startup_grace_ms: 10_000,
+          "features.concurrent_reasoning_summaries": true,
+          "mcp_servers.t3-code": {
+            url: "http://127.0.0.1:43123/mcp",
+            tool_timeout_sec: 3_900,
+            http_headers: {
+              Authorization: "Bearer secret-codex-token",
+            },
+            disabled_tools: ["t3_thread_wait"],
+          },
+          "mcp_servers.t3-code-direct": {
+            url: "http://127.0.0.1:43123/mcp",
+            tool_timeout_sec: 3_900,
+            http_headers: {
+              Authorization: "Bearer secret-codex-token",
+            },
+            enabled_tools: ["t3_thread_wait"],
+            omit_tools_from: ["code_mode", "deferred"],
+          },
+        },
+      },
+    );
+  });
+
+  it("overrides inherited native reasoning and service tier on thread resume", () => {
+    const params = CodexAdapterV2.codexThreadRuntimeParams({
+      threadId: null,
+      mcpSession: undefined,
+      modelSelection: {
+        model: "gpt-test",
+        options: [
+          { id: "serviceTier", value: "default" },
+          { id: "reasoningEffort", value: "low" },
+        ],
+      },
+    });
+    assert.equal(params.config.service_tier, "default");
+    assert.equal(params.config.model_reasoning_effort, "low");
+  });
+
+  it.effect("resolves Windows command shims through the shared spawn policy", () =>
+    Effect.gen(function* () {
+      const command = yield* CodexAdapterV2.makeCodexAppServerSpawnCommand({
+        command: "codex",
+        args: ["app-server", "argument with spaces"],
+        cwd: "C:\\workspace",
+        env: { CUSTOM: "1" },
+        extendEnv: true,
+      });
+
+      assert.isTrue(ChildProcess.isStandardCommand(command));
+      if (!ChildProcess.isStandardCommand(command)) {
+        return;
+      }
+      assert.equal(
+        command.command,
+        '^"C:\\npm\\codex.cmd^" ^"app-server^" ^"argument^ with^ spaces^"',
+      );
+      assert.deepEqual(command.args, []);
+      assert.equal(command.options.shell, true);
+      assert.equal(command.options.cwd, "C:\\workspace");
+      assert.deepEqual(command.options.env, { CUSTOM: "1" });
+      assert.equal(command.options.extendEnv, true);
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, "win32"),
+      Effect.provideService(HostProcess.Environment, {
+        PATH: "C:\\Windows\\System32",
+        HOST_ONLY: "1",
+      }),
+      Effect.provideService(SpawnExecutableResolution, (_command, _platform, environment) => {
+        assert.equal(environment.HOST_ONLY, "1");
+        assert.equal(environment.CUSTOM, "1");
+        return "C:\\npm\\codex.cmd";
+      }),
+    ),
+  );
+
+  it.effect("uses direct execution for native executables", () =>
+    Effect.gen(function* () {
+      const command = yield* CodexAdapterV2.makeCodexAppServerSpawnCommand({
+        command: "codex.exe",
+        args: ["app-server"],
+      });
+
+      assert.isTrue(ChildProcess.isStandardCommand(command));
+      if (!ChildProcess.isStandardCommand(command)) {
+        return;
+      }
+      assert.equal(command.command, "C:\\bin\\codex.exe");
+      assert.deepEqual(command.args, ["app-server"]);
+      assert.equal(command.options.shell, false);
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, "win32"),
+      Effect.provideService(SpawnExecutableResolution, () => "C:\\bin\\codex.exe"),
+    ),
+  );
+
+  it.effect("launches the app-server with the configured launch arguments", () =>
+    Effect.gen(function* () {
+      const spawnedArgs: Array<ReadonlyArray<string>> = [];
+      const spawner = ChildProcessSpawner.make((command) => {
+        if (ChildProcess.isStandardCommand(command)) spawnedArgs.push(command.args.map(String));
+        return Effect.fail(
+          PlatformError.systemError({ _tag: "NotFound", module: "ChildProcess", method: "spawn" }),
+        );
+      });
+      const factory = yield* CodexAdapterV2.CodexAppServerClientFactory.pipe(
+        Effect.provide(CodexAdapterV2.layerAppServerClientFactory),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      );
+      const open = (environment: NodeJS.ProcessEnv) =>
+        factory
+          .open({
+            instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+            threadId: ThreadId.make("thread-launch-args"),
+            providerSessionId: ProviderSessionId.make("provider-session-launch-args"),
+            runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              cwd: "/workspace",
+            }),
+            settings: {
+              ...DEFAULT_CODEX_SETTINGS,
+              launchArgs: " --strict-config -c model_reasoning_summary=detailed ",
+            },
+            environment,
+          })
+          .pipe(Effect.scoped, Effect.exit);
+
+      yield* open({});
+      yield* open({ T3CODE_CODEX_LAUNCH_ARGS: " --enable env-feature " });
+
+      assert.deepEqual(spawnedArgs, [
+        [
+          "app-server",
+          "--strict-config",
+          "-c",
+          "model_reasoning_summary=detailed",
+          "-c",
+          "thread_unload_delay_secs=0",
+        ],
+        ["app-server", "--enable", "env-feature", "-c", "thread_unload_delay_secs=0"],
+      ]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NodeCrypto.layer,
+          Layer.mock(PortScanner.PortDiscovery)({ trackAgent: () => () => undefined }),
+        ),
+      ),
+      Effect.provideService(HostProcess.Platform, "linux"),
+    ),
+  );
+
+  it.effect("expands ~ in the configured binary path before spawning", () =>
+    Effect.gen(function* () {
+      const spawnedCommands: Array<string> = [];
+      const spawner = ChildProcessSpawner.make((command) => {
+        if (ChildProcess.isStandardCommand(command)) spawnedCommands.push(command.command);
+        return Effect.fail(
+          PlatformError.systemError({ _tag: "NotFound", module: "ChildProcess", method: "spawn" }),
+        );
+      });
+      const path = yield* Path.Path;
+      const adapter = yield* CodexAdapterV2.createCodexAdapterV2({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        displayName: undefined,
+        environment: [],
+        enabled: true,
+        config: { ...DEFAULT_CODEX_SETTINGS, binaryPath: "~/bin/codex" },
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            CodexAdapterV2.layerAppServerClientFactory,
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-codex-binary-home-" }),
+          ),
+        ),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      );
+
+      yield* adapter
+        .openSession({
+          threadId: ThreadId.make("thread-binary-home"),
+          providerSessionId: ProviderSessionId.make("provider-session-binary-home"),
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        })
+        .pipe(Effect.scoped, Effect.exit);
+
+      assert.deepEqual(spawnedCommands, [path.join(NodeOS.homedir(), "bin", "codex")]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.mock(PortScanner.PortDiscovery)({ trackAgent: () => () => undefined }),
+        ),
+      ),
+      Effect.provideService(HostProcess.Platform, "linux"),
+    ),
+  );
+});
+
+describe("CodexAdapterV2 dynamic tool projection", () => {
+  it.effect("keeps a failed Sky MCP call in Computer Use when its error has no metadata", () =>
+    Effect.gen(function* () {
+      const projection = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+        type: "mcpToolCall",
+        id: "failed-sky-js",
+        server: "node_repl",
+        tool: "js",
+        status: "failed",
+        arguments: {
+          title: "Restrict the breakpoint to Git actions",
+          code: "await sky.type_text({app:'T3 Code (Nightly)',text:'debug(ga.run)'});",
+        },
+        result: { content: [{ type: "text", text: "Illegal Unicode escape sequence" }] },
+      });
+      assert.equal(projection.title, "Restrict the breakpoint to Git actions");
+      assert.equal(projection.toolSurface, "computer");
+      assert.deepEqual(projection.toolSource, {
+        key: "computer-use",
+        name: "Computer Use",
+        kind: "computer",
+      });
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect.each(["inProgress", "completed", "failed"] as const)(
+    "preserves a bare js action's title and computer surface when %s without result metadata",
+    (status) =>
+      Effect.gen(function* () {
+        const projection = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+          type: "dynamicToolCall",
+          id: "bare-js",
+          tool: "js",
+          status,
+          arguments: { code: "await sky.get_app_state(app);", title: "Read the desktop window" },
+          contentItems: [],
+          success: status !== "failed",
+        });
+        assert.equal(projection.title, "Read the desktop window");
+        assert.equal(projection.toolSurface, "computer");
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect.each(["cua_repl", "node_repl"])(
+    "uses the %s call title while leaving other MCP titles as tool arguments",
+    (server) =>
+      Effect.gen(function* () {
+        const call = {
+          type: "mcpToolCall" as const,
+          id: "inspect",
+          server,
+          tool: "js",
+          status: "completed" as const,
+          arguments: {
+            code: "await game.getAXStateAndScreenshot();",
+            title: "Inspect Saga music screen",
+          },
+          result: { content: [] },
+        };
+        assert.equal(
+          (yield* CodexAdapterV2.projectCodexDynamicToolItem(call)).title,
+          "Inspect Saga music screen",
+        );
+        assert.equal(
+          (yield* CodexAdapterV2.projectCodexDynamicToolItem({
+            ...call,
+            arguments: { title: "  " },
+          })).title,
+          server === "cua_repl" ? "Computer use" : "Run JavaScript",
+        );
+        assert.equal(
+          (yield* CodexAdapterV2.projectCodexDynamicToolItem({ ...call, server: "github" })).title,
+          "js",
+        );
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect.each(["inProgress", "completed", "failed"] as const)(
+    "presents ordinary MCP calls when %s",
+    (status) =>
+      Effect.gen(function* () {
+        const projection = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+          type: "mcpToolCall",
+          id: "weather-call",
+          server: "weather",
+          tool: "get_weather",
+          status,
+          arguments: { city: "Berlin" },
+        });
+        assert.equal(projection.title, "get weather");
+        assert.deepEqual(projection.toolSource, {
+          key: "mcp:weather",
+          name: "weather",
+          kind: "integration",
+        });
+        assert.deepEqual(projection.input, { city: "Berlin" });
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("uses Codex connector names without reading a display title from arguments", () =>
+    Effect.gen(function* () {
+      const projection = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+        type: "mcpToolCall",
+        id: "connector-call",
+        server: "_apps",
+        tool: "connector_get_weather",
+        status: "completed",
+        arguments: { title: "Argument, not display metadata" },
+        appContext: {
+          connectorId: "weather-app",
+          appName: "Weather",
+          actionName: "Check weather",
+        },
+        result: {
+          content: [],
+          _meta: { source: { logoUrl: "https://example.com/weather.png" } },
+        },
+      });
+      assert.equal(projection.title, "Check weather");
+      assert.equal(projection.toolSource?.name, "Weather");
+      assert.deepEqual(projection.toolIcon, {
+        _tag: "themed-logo",
+        logoUrl: "https://example.com/weather.png",
+      });
+      assert.deepEqual(projection.toolSource?.icon, projection.toolIcon);
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("preserves native browser and app icons alongside MCP tool output", () =>
+    Effect.gen(function* () {
+      const browser = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+        type: "mcpToolCall",
+        id: "browser",
+        server: "browser",
+        tool: "open",
+        status: "completed",
+        arguments: {},
+        result: {
+          content: [],
+          _meta: {
+            "codex/toolSurface": {
+              kind: "browserUse",
+              browserFamily: "Chrome",
+              screenshot: {
+                pageUrl: "https://example.com/docs",
+                faviconUrl: "https://example.com/icon.png",
+              },
+            },
+          },
+        },
+      });
+      assert.equal(browser.toolSurface, "browser");
+      assert.deepEqual(browser.toolIcon, {
+        _tag: "website",
+        pageUrl: "https://example.com/docs",
+        faviconUrl: "https://example.com/icon.png",
+      });
+      assert.equal(browser.toolSource?.name, "Chrome");
+      const app = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+        type: "mcpToolCall",
+        id: "app",
+        server: "computer",
+        tool: "click",
+        status: "completed",
+        arguments: {},
+        result: {
+          content: [],
+          _meta: {
+            "codex/toolSurface": {
+              kind: "computerUse",
+              app: { kind: "appId", appId: "com.apple.finder" },
+            },
+          },
+        },
+      });
+      assert.deepEqual(app.toolIcon, {
+        _tag: "native-app",
+        app: { _tag: "app-id", appId: "com.apple.finder" },
+      });
+      assert.equal(app.toolSource?.name, "Finder");
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("preserves MCP arguments and prefers structured output", () =>
+    Effect.gen(function* () {
+      const projection = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+        type: "mcpToolCall",
+        id: "call-create-threads",
+        server: "t3-code",
+        tool: "create_threads",
+        status: "completed",
+        arguments: {
+          threads: [{ title: "Fixture child", prompt: "fixture child prompt" }],
+        },
+        result: {
+          content: [{ type: "text", text: '{"threads":[{"threadId":"thread:mcp:fixture:0"}]}' }],
+          structuredContent: {
+            threads: [{ threadId: "thread:mcp:fixture:0" }],
+          },
+        },
+      });
+
+      assert.deepEqual(projection, {
+        toolName: "t3-code.create_threads",
+        input: {
+          threads: [{ title: "Fixture child", prompt: "fixture child prompt" }],
+        },
+        output: {
+          threads: [{ threadId: "thread:mcp:fixture:0" }],
+        },
+        status: "completed",
+      });
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("preserves namespaced dynamic tool output", () =>
+    Effect.gen(function* () {
+      const projection = yield* CodexAdapterV2.projectCodexDynamicToolItem({
+        type: "dynamicToolCall",
+        id: "call-dynamic",
+        namespace: "workspace",
+        tool: "inspect",
+        status: "failed",
+        arguments: { path: "package.json" },
+        contentItems: [{ type: "inputText", text: "inspection failed" }],
+        success: false,
+      });
+
+      assert.deepEqual(projection, {
+        toolName: "workspace.inspect",
+        input: { path: "package.json" },
+        output: [{ type: "inputText", text: "inspection failed" }],
+        status: "failed",
+      });
+    }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 });
 
@@ -956,6 +1511,7 @@ describe("CodexAdapterV2 session initialize", () => {
     transcript: CodexReplay.CodexAppServerReplayTranscript,
     beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"],
     compatibility?: CodexAdapterV2.CodexAdapterV2Options["compatibility"],
+    validateSubscription?: CodexAdapterV2.CodexAdapterV2Options["validateSubscription"],
   ) =>
     Effect.gen(function* () {
       const driver = yield* CodexReplay.makeReplayDriver(
@@ -968,6 +1524,7 @@ describe("CodexAdapterV2 session initialize", () => {
         settings: DEFAULT_CODEX_SETTINGS,
         environment: {},
         ...(compatibility === undefined ? {} : { compatibility }),
+        ...(validateSubscription === undefined ? {} : { validateSubscription }),
         clientFactory: {
           open: (openInput) =>
             Layer.build(CodexReplay.layerReplayWithDriver(driver)).pipe(
@@ -1008,6 +1565,7 @@ describe("CodexAdapterV2 session initialize", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       return {
+        runtime,
         ensureThread: (threadId: string) =>
           runtime.ensureThread({
             threadId: ThreadId.make(threadId),
@@ -1020,6 +1578,143 @@ describe("CodexAdapterV2 session initialize", () => {
 
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
+
+  it.effect(
+    "fails the session event stream and prevents reuse when the process exits cleanly",
+    () =>
+      Effect.gen(function* () {
+        const releaseExit = yield* Deferred.make<void>();
+        const session = yield* openReplaySession(
+          makeCodexReplayTranscript({
+            scenario: "idle-process-exit",
+            entries: [
+              ...replayPreamble("idle-process-exit").slice(0, 5),
+              {
+                type: "emit_inbound",
+                label: "process-exit-ready",
+                frame: {
+                  method: "thread/status/changed",
+                  params: { threadId: "idle-process-exit", status: { type: "idle" } },
+                },
+              },
+              { type: "runtime_exit", status: "success" },
+            ],
+          }),
+          (entry) =>
+            entry.label === "process-exit-ready" ? Deferred.await(releaseExit) : Effect.void,
+        );
+        const failure = yield* session.runtime.events.pipe(
+          Stream.runDrain,
+          Effect.flip,
+          Effect.forkScoped,
+        );
+        const thread = yield* session.ensureThread("thread-idle-process-exit");
+        assert.equal(thread.nativeThreadRef?.nativeId, "idle-process-exit");
+        assert.isTrue(yield* session.runtime.isReusable!);
+        yield* Deferred.succeed(releaseExit, undefined);
+        const error = yield* Fiber.join(failure);
+        assert.equal(error._tag, "ProviderAdapterEventStreamError");
+        assert.instanceOf(error.cause, CodexError.CodexAppServerProcessExitedError);
+        assert.isFalse(yield* session.runtime.isReusable!);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each([true, false])(
+    "validates actual native account and allowance before thread creation (%s)",
+    (allowed) =>
+      Effect.gen(function* () {
+        const preamble = replayPreamble("subscription-preflight");
+        const entries: Array<CodexReplay.CodexAppServerReplayEntry> = [
+          ...preamble.slice(0, 3),
+          { type: "expect_outbound", frame: { id: 2, method: "account/read", params: {} } },
+          {
+            type: "emit_inbound",
+            frame: {
+              id: 2,
+              result: {
+                account: { type: "chatgpt", email: "alice@example.test", planType: "pro" },
+                requiresOpenaiAuth: true,
+              },
+            },
+          },
+          {
+            type: "expect_outbound",
+            frame: { id: 3, method: "account/rateLimits/read", params: null },
+          },
+          {
+            type: "emit_inbound",
+            frame: {
+              id: 3,
+              result: {
+                accountId: "workspace-a",
+                rateLimits: { credits: { hasCredits: false, unlimited: false } },
+              },
+            },
+          },
+          ...(allowed
+            ? [
+                {
+                  type: "expect_outbound" as const,
+                  frame: {
+                    id: 4,
+                    method: "thread/start",
+                    params: { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+                  },
+                },
+                ...preamble.slice(4, 5).map((entry) => withReplayRequestId(entry, 4)),
+              ]
+            : []),
+        ];
+        let verified = false;
+        const session = yield* openReplaySession(
+          makeCodexReplayTranscript({ scenario: `subscription-preflight-${allowed}`, entries }),
+          undefined,
+          undefined,
+          (input) => {
+            assert.equal(input.account.account?.type, "chatgpt");
+            assert.equal(input.rateLimits.accountId, "workspace-a");
+            assert.equal(input.rateLimits.rateLimits.credits?.hasCredits, false);
+            verified = true;
+            return allowed
+              ? Effect.void
+              : Effect.fail(
+                  new ProviderSetupError({
+                    instanceId: CODEX_TEST_MODEL_SELECTION.instanceId,
+                    operation: "session",
+                    detail: "Unsafe subscription",
+                  }),
+                );
+          },
+        );
+        const result = yield* session.ensureThread("subscription-thread").pipe(Effect.result);
+        assert.equal(verified, true);
+        assert.equal(
+          result._tag,
+          allowed ? "Success" : "Failure",
+          result._tag === "Failure" ? JSON.stringify(result.failure) : undefined,
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
 
   it.effect("sends one initialize when two threads start on a fresh session at once", () =>
     Effect.gen(function* () {

@@ -5,6 +5,8 @@ import {
   type ProviderInstanceId,
   type ServerProvider,
   type ServerProviderUpdateState,
+  type ProviderUsageReportInput,
+  type ProviderUsageReport,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -47,6 +49,7 @@ import {
   latestProviderVersionCacheKeys,
 } from "@t3tools/provider-core/server/maintenanceResolver";
 import type { ProviderSnapshotSource } from "./builtInProviderCatalog.ts";
+import { providerUsageReport } from "./providerUsageReport.ts";
 
 export type ProviderMaintenanceActionKind = "update";
 
@@ -54,6 +57,7 @@ export class ProviderRegistry extends Context.Service<
   ProviderRegistry,
   {
     readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
+    readonly usageReport: (input: ProviderUsageReportInput) => Effect.Effect<ProviderUsageReport>;
 
     readonly refresh: (
       provider?: ProviderDriverKind,
@@ -232,6 +236,7 @@ const mergeProviderModels = (
   previousModels: ReadonlyArray<ServerProvider["models"][number]>,
   nextModels: ReadonlyArray<ServerProvider["models"][number]>,
 ): ReadonlyArray<ServerProvider["models"][number]> => {
+  if (provider.authoritativeModels) return nextModels;
   const shouldRetainMissingModels = shouldRetainMissingProviderModels(provider);
   const updateRequiredSlugs = new Set(provider.updateRequiredModels?.map((model) => model.slug));
   const retainablePreviousModels = previousModels.filter(
@@ -1096,6 +1101,27 @@ export const layer = Layer.effect(
 
     return {
       getProviders: Ref.get(providersRef),
+      usageReport: Effect.fn("ProviderRegistry.usageReport")(function* (input) {
+        let providers = yield* Ref.get(providersRef);
+        const selected = (provider: ServerProvider) =>
+          input.instanceIds === undefined || input.instanceIds.includes(provider.instanceId);
+        if (input.refresh) {
+          yield* Effect.forEach(
+            providers.filter(selected),
+            (provider) =>
+              refreshInstance(provider.instanceId).pipe(
+                Effect.timeoutOption("20 seconds"),
+                Effect.catchCause(recoverRefreshFailure),
+              ),
+            { concurrency: 4 },
+          );
+          providers = yield* Ref.get(providersRef);
+        }
+        return providerUsageReport(
+          providers.filter(selected),
+          DateTime.formatIso(yield* DateTime.now),
+        );
+      }),
       refresh: (provider?: ProviderDriverKind) =>
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>

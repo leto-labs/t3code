@@ -758,9 +758,47 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const assertModelSelection = Effect.fn("orchestrationV2.threadManagement.assertModelSelection")(
+    function* (command: OrchestrationV2ServerCommand) {
+      if (yield* hasReceipt(command.commandId)) return;
+      switch (command.type) {
+        case "thread.create":
+          yield* sessions.validateModelSelection(command.modelSelection, command.projectId);
+          break;
+        case "provider.switch":
+        case "thread.model-selection.set":
+        case "message.dispatch": {
+          const projection = yield* orchestrator.getThreadRecords(command.threadId, []);
+          yield* sessions.validateModelSelection(
+            command.modelSelection ?? projection.thread.modelSelection,
+            projection.thread.projectId,
+          );
+          break;
+        }
+        case "delegated_task.request": {
+          const parent = yield* orchestrator.getThreadRecords(command.parentThreadId, []);
+          yield* sessions.validateModelSelection(command.modelSelection, parent.thread.projectId);
+          break;
+        }
+      }
+    },
+  );
+
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
+      Effect.andThen(
+        assertModelSelection(command).pipe(
+          Effect.mapError(
+            (cause) =>
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause,
+              }),
+          ),
+        ),
+      ),
       Effect.andThen(orchestrator.dispatch(command)),
     );
 

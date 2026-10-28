@@ -259,6 +259,7 @@ export const layer: Layer.Layer<
       const existingSession = context.providerSession;
       const session = yield* sessions.open({
         threadId: input.threadId,
+        projectId: context.thread.projectId,
         providerSessionId: providerThread.providerSessionId,
         modelSelection,
         runtimePolicy: resolvedRuntimePolicy,

@@ -6,6 +6,8 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
+import { getAppModelOptionsForInstance } from "./modelSelection";
 import {
   applyProviderInstanceSettings,
   brandProviderInstanceEntries,
@@ -13,6 +15,7 @@ import {
   deriveProviderInstanceEntries,
   getDefaultProviderInstanceModel,
   isProviderInstancePickerReady,
+  isProviderInstancePickerVisible,
   resolveDefaultProviderModelSelection,
   resolveSelectableProviderInstance,
   shouldShowInstanceBadge,
@@ -70,6 +73,64 @@ describe("isProviderInstancePickerReady", () => {
 
     expect(entry?.status).toBe("ready");
     expect(entry && isProviderInstancePickerReady(entry)).toBe(false);
+  });
+});
+
+describe("isProviderInstancePickerVisible", () => {
+  it("hides accounts with all models hidden without disabling them or hiding Auto", () => {
+    const entries = deriveProviderInstanceEntries(
+      ["codex_personal", "codex_work", "codex_auto"].map((instanceId) =>
+        provider({
+          provider: ProviderDriverKind.make("codex"),
+          instanceId,
+          models: [model("sol"), model("astra")],
+        }),
+      ),
+    );
+    const settings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerModelPreferences: {
+        codex_personal: { hiddenModels: ["sol", "astra"], modelOrder: [] },
+        codex_work: { hiddenModels: ["sol", "astra"], modelOrder: [] },
+      },
+    };
+    const visible = entries.filter((entry) =>
+      isProviderInstancePickerVisible(entry, getAppModelOptionsForInstance(settings, entry)),
+    );
+    expect(visible.map((entry) => entry.instanceId)).toEqual(["codex_auto"]);
+    expect(entries.every((entry) => entry.enabled && entry.models.length === 2)).toBe(true);
+    const personal = entries[0]!;
+    expect(
+      isProviderInstancePickerVisible(
+        personal,
+        getAppModelOptionsForInstance(DEFAULT_UNIFIED_SETTINGS, personal),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a provider visible when a custom or remaining model is available", () => {
+    const entry = deriveProviderInstanceEntries([
+      provider({
+        provider: ProviderDriverKind.make("codex"),
+        instanceId: "codex",
+        models: [model("sol")],
+      }),
+    ])[0]!;
+    expect(isProviderInstancePickerVisible(entry, [model("custom", true)])).toBe(true);
+  });
+
+  it("keeps enabled instances in the rail and removes disabled instances", () => {
+    const [enabledEntry, disabledEntry] = deriveProviderInstanceEntries([
+      provider({ provider: ProviderDriverKind.make("codex"), instanceId: "codex" }),
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claudeAgent",
+        enabled: false,
+      }),
+    ]);
+
+    expect(enabledEntry && isProviderInstancePickerVisible(enabledEntry)).toBe(true);
+    expect(disabledEntry && isProviderInstancePickerVisible(disabledEntry)).toBe(false);
   });
 });
 

@@ -23,6 +23,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   PositiveInt,
+  ProjectId,
   ProviderUserInputAnswers,
   ProviderSessionId,
   ProviderThreadId,
@@ -465,6 +466,7 @@ export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
 export interface ProviderAdapterV2OpenSessionInput {
   readonly threadId: ThreadId;
+  readonly projectId?: ProjectId;
   readonly providerSessionId: ProviderSessionId;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
@@ -717,6 +719,10 @@ export class ProviderAdapterV2 extends Context.Service<
       OrchestrationV2ProviderCapabilities,
       ProviderAdapterV2Error
     >;
+    readonly validateModelSelection?: (
+      selection: ModelSelection,
+      projectId?: ProjectId,
+    ) => Effect.Effect<void, ProviderAdapterV2Error>;
     readonly planSelectionTransition: (
       input: ProviderSelectionTransitionInput,
     ) => Effect.Effect<ProviderSelectionTransitionPlan, ProviderAdapterV2Error>;

@@ -678,6 +678,16 @@ export function makeProviderSettingsSchema<const Fields extends Schema.Struct.Fi
 
 export const CodexSettings = makeProviderSettingsSchema(
   {
+    autoPoolMemberIds: Schema.optionalKey(
+      Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(32)),
+    ).pipe(
+      Schema.annotateKey({
+        title: "Codex Auto accounts",
+        description:
+          "Explicit Codex subscription instance IDs. All accounts must share the default Codex session home.",
+        providerSettingsForm: { hidden: true },
+      }),
+    ),
     setupMode: Schema.optionalKey(Schema.Literals(["managed", "existing"])).pipe(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
@@ -732,6 +742,13 @@ export const CodexSettings = makeProviderSettingsSchema(
   },
 );
 export type CodexSettings = typeof CodexSettings.Type;
+
+/** Reads Auto pool membership without making every client surface decode the whole provider config. */
+export function readCodexAutoPoolMemberIds(config: unknown): readonly string[] {
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return [];
+  const members = (config as { readonly autoPoolMemberIds?: unknown }).autoPoolMemberIds;
+  return Array.isArray(members) ? members.filter((id): id is string => typeof id === "string") : [];
+}
 
 const CLAUDE_AUTO_COMPACT_WINDOW_PATTERN = /^(?:|[1-9]\d{5}|1000000)$/;
 

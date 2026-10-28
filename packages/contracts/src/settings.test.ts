@@ -19,6 +19,7 @@ import {
   resolveIdleCompaction,
   resolveProjectProviderInstanceEnabled,
   resolveProviderInstanceEnabled,
+  readCodexAutoPoolMemberIds,
   ServerSettings,
   ServerSettingsPatch,
   withIdleCompaction,
@@ -473,6 +474,15 @@ describe("resolveProjectProviderInstanceEnabled", () => {
       },
     };
     expect(resolveProjectProviderInstanceEnabled(settings, projectId, instanceId)).toBe(false);
+  });
+});
+
+describe("readCodexAutoPoolMemberIds", () => {
+  it("reads only string member ids and treats malformed config as empty", () => {
+    expect(readCodexAutoPoolMemberIds({ autoPoolMemberIds: ["codex_a", 4, null] })).toEqual([
+      "codex_a",
+    ]);
+    expect(readCodexAutoPoolMemberIds(undefined)).toEqual([]);
   });
 });
 

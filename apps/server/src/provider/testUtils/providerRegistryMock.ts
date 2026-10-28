@@ -8,6 +8,7 @@ import { makeManualOnlyProviderMaintenanceCapabilities } from "@t3tools/provider
 const makeProviderRegistryMock = (
   providers: ReadonlyArray<ServerProvider> = [],
 ): ProviderRegistry.ProviderRegistry["Service"] => ({
+  usageReport: () => Effect.succeed({ observedAt: "2026-10-17T00:00:00.000Z", instances: [] }),
   getProviders: Effect.succeed(providers),
   refresh: () => Effect.succeed(providers),
   refreshInstance: () => Effect.succeed(providers),

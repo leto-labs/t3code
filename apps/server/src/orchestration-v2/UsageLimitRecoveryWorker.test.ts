@@ -1,4 +1,4 @@
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import { RunId, ThreadId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
@@ -115,4 +115,61 @@ describe("limitRecoveryCommand arming", () => {
     const thread = failedThread(30 * HOUR_MS, 24 * HOUR_MS + 1);
     assert.isNull(limitRecoveryCommand(thread, true, nowMs));
   });
+});
+
+const resetAt = "2026-10-19T12:00:00.000Z";
+const runId = RunId.make("limited-run");
+const candidate: ProjectionStore.ProjectionLimitRecoveryCandidate = {
+  id: ThreadId.make("limited-thread"),
+  status: "failed",
+  lastErrorClass: "usage_limit",
+  latestRunId: runId,
+  usageLimitResetAt: resetAt,
+  latestRunCompletedAt: DateTime.makeUnsafe("2026-10-19T11:00:00.000Z"),
+  updatedAt: DateTime.makeUnsafe("2026-10-19T11:00:00.000Z"),
+  archivedAt: null,
+  settledOverride: null,
+  pendingRuntimeRequest: null,
+  limitRecovery: { runId, resetAt, autoResume: true },
+  snoozedUntil: null,
+};
+
+it.each(["active", "usage_limited"] as const)(
+  "resumes a %s native goal at quota reset",
+  (status) => {
+    expect(limitRecoveryCommand(candidate, true, Date.parse(resetAt), false, status)).toMatchObject(
+      {
+        type: "message.dispatch",
+        text: "/goal resume",
+        usageLimitContinuationOfRunId: runId,
+      },
+    );
+  },
+);
+
+it.each([undefined, "paused", "blocked", "complete", "budget_limited"] as const)(
+  "does not activate a goal whose status is %s",
+  (status) => {
+    expect(limitRecoveryCommand(candidate, true, Date.parse(resetAt), false, status)).toMatchObject(
+      {
+        type: "message.dispatch",
+        text: "Continue where you left off.",
+      },
+    );
+  },
+);
+
+it("does not resume a goal before reset or after cancellation", () => {
+  expect(
+    limitRecoveryCommand(candidate, true, Date.parse(resetAt) - 1, false, "usage_limited"),
+  ).toBeNull();
+  expect(
+    limitRecoveryCommand(
+      { ...candidate, limitRecovery: { ...candidate.limitRecovery!, autoResume: false } },
+      true,
+      Date.parse(resetAt),
+      false,
+      "usage_limited",
+    ),
+  ).toBeNull();
 });

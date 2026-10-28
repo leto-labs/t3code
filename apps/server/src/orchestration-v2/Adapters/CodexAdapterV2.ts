@@ -532,35 +532,37 @@ export function codexDynamicToolOutput(
   return item.success === false ? { success: false } : undefined;
 }
 
-const projectCodexDynamicToolItem = Effect.fn("CodexAdapterV2.projectDynamicToolItem")(function* (
-  item: CodexDynamicToolItem,
-): Effect.fn.Return<CodexDynamicToolProjection, never, Digest.Digest> {
-  const output =
-    item.type === "mcpToolCall" ? codexMcpToolOutput(item) : codexDynamicToolOutput(item);
-  const toolName =
-    item.type === "mcpToolCall"
-      ? `${item.server}.${item.tool}`
-      : [trimText(item.namespace), item.tool].filter(Boolean).join(".");
-  const presentation: McpToolPresentation =
-    item.type === "mcpToolCall" ? yield* mcpToolPresentation(item) : {};
-  const title =
-    dynamicToolTitle(toolName, item.arguments, presentation.title) ?? presentation.title;
-  const toolSurface = presentation.toolSurface ?? dynamicToolSurface(toolName, item.arguments);
-  const toolSource =
-    toolSurface === "computer" && presentation.toolSource?.kind !== "computer"
-      ? COMPUTER_USE_TOOL_SOURCE
-      : presentation.toolSource;
-  const projection: CodexDynamicToolProjection = {
-    ...presentation,
-    ...(toolSurface ? { toolSurface } : {}),
-    ...(toolSource ? { toolSource } : {}),
-    toolName,
-    ...(title ? { title } : {}),
-    input: item.arguments,
-    status: codexItemStatus(item.status).turnItem,
-  };
-  return output === undefined ? projection : { ...projection, output };
-});
+export const projectCodexDynamicToolItem = Effect.fn("CodexAdapterV2.projectDynamicToolItem")(
+  function* (
+    item: CodexDynamicToolItem,
+  ): Effect.fn.Return<CodexDynamicToolProjection, never, Digest.Digest> {
+    const output =
+      item.type === "mcpToolCall" ? codexMcpToolOutput(item) : codexDynamicToolOutput(item);
+    const toolName =
+      item.type === "mcpToolCall"
+        ? `${item.server}.${item.tool}`
+        : [trimText(item.namespace), item.tool].filter(Boolean).join(".");
+    const presentation: McpToolPresentation =
+      item.type === "mcpToolCall" ? yield* mcpToolPresentation(item) : {};
+    const title =
+      dynamicToolTitle(toolName, item.arguments, presentation.title) ?? presentation.title;
+    const toolSurface = presentation.toolSurface ?? dynamicToolSurface(toolName, item.arguments);
+    const toolSource =
+      toolSurface === "computer" && presentation.toolSource?.kind !== "computer"
+        ? COMPUTER_USE_TOOL_SOURCE
+        : presentation.toolSource;
+    const projection: CodexDynamicToolProjection = {
+      ...presentation,
+      ...(toolSurface ? { toolSurface } : {}),
+      ...(toolSource ? { toolSource } : {}),
+      toolName,
+      ...(title ? { title } : {}),
+      input: item.arguments,
+      status: codexItemStatus(item.status).turnItem,
+    };
+    return output === undefined ? projection : { ...projection, output };
+  },
+);
 
 function codexNativeItemRef(nativeItemId: string) {
   return {
@@ -1403,16 +1405,14 @@ const CODEX_T3_MCP_TOOL_TIMEOUT_SEC = 65 * 60;
 const CODEX_T3_DIRECT_MCP_SERVER = "t3-code-direct";
 const CODEX_DIRECT_ONLY_T3_TOOL = "t3_thread_wait";
 
-function codexThreadRuntimeParams(input: {
+export function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly modelSelection?: Pick<ModelSelection, "model" | "options">;
-  readonly modelProvider?: string;
   readonly runtimePolicy?: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
 }): {
   readonly cwd?: string;
   readonly model?: string;
-  readonly modelProvider?: string;
   readonly config: Readonly<Record<string, Schema.Json>>;
 } {
   const { mcpSession } = input;
@@ -1427,7 +1427,6 @@ function codexThreadRuntimeParams(input: {
   return {
     ...(input.runtimePolicy?.cwd == null ? {} : { cwd: input.runtimePolicy.cwd }),
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
-    ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
     config: {
       ...CODEX_THREAD_CONFIG,
       // One app-server serves many threads, so the id goes in per-thread shell config, not its env.
@@ -1668,7 +1667,10 @@ export type CodexAdapterV2DriverEnv =
 
 export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapterV2")(function* (
   { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
-  hooks: Pick<CodexAdapterV2Options, "onUsageLimits" | "resolveRuntime" | "compatibility"> = {},
+  hooks: Pick<
+    CodexAdapterV2Options,
+    "onUsageLimits" | "resolveRuntime" | "compatibility" | "validateSubscription"
+  > = {},
 ) {
   const clientFactory = yield* CodexAppServerClientFactory;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
@@ -1718,6 +1720,11 @@ export interface CodexAdapterV2Options {
   readonly environment: NodeJS.ProcessEnv;
   readonly clientFactory: CodexAppServerClientFactoryShape;
   readonly onUsageLimits?: ManagedServerProvider["applyUsageLimits"];
+  readonly validateSubscription?: (input: {
+    readonly account: CodexSchema.V2GetAccountResponse;
+    readonly rateLimits: CodexSchema.V2GetAccountRateLimitsResponse;
+    readonly modelSelection: ModelSelection;
+  }) => Effect.Effect<void, ProviderSetupError>;
   readonly resolveRuntime?: Effect.Effect<CodexEffectiveRuntime, ProviderSetupError, Scope.Scope>;
   readonly compatibility?: (
     version: string,
@@ -1870,6 +1877,21 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
         // A failed open is discarded, so the next turn spawns the updated binary.
         if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
+        const validateSubscription = (modelSelection: ModelSelection) =>
+          adapterOptions.validateSubscription === undefined
+            ? Effect.void
+            : ensureInitialized.pipe(
+                Effect.andThen(
+                  Effect.gen(function* () {
+                    const account = yield* client.request("account/read", {});
+                    const rateLimits = yield* client.request("account/rateLimits/read", null);
+                    return { account, rateLimits };
+                  }),
+                ),
+                Effect.flatMap((observed) =>
+                  adapterOptions.validateSubscription!({ ...observed, modelSelection }),
+                ),
+              );
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
@@ -6950,6 +6972,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             command: OrchestrationV2GoalCommand,
           ) {
             if (command.type === "set") yield* validateCodexGoalObjective(command.objective);
+            yield* validateSubscription(turnInput.modelSelection);
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
             rootProviderThreads.set(threadId, turnInput.providerThread);
             const readGoal = client
@@ -7185,6 +7208,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }),
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
+              Effect.andThen(validateSubscription(threadInput.modelSelection)),
               Effect.andThen(mcpSessions.read(threadInput.threadId)),
               Effect.flatMap((mcpSession) =>
                 client.request(
@@ -7234,6 +7258,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }),
               });
               const response = yield* ensureInitialized.pipe(
+                Effect.andThen(
+                  threadInput.modelSelection === undefined
+                    ? Effect.void
+                    : validateSubscription(threadInput.modelSelection),
+                ),
                 Effect.andThen(resume),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
@@ -7332,7 +7361,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               turnInput.restartContinuationOfRunId === undefined
                 ? parseGoalCommand(turnInput.message)
                 : null;
-            if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
+            if (goalCommand !== null)
+              return validateSubscription(turnInput.modelSelection).pipe(
+                Effect.andThen(runGoalCommand(turnInput, goalCommand)),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterTurnStartError({
+                      driver: CODEX_PROVIDER,
+                      threadId: turnInput.threadId,
+                      providerThreadId: turnInput.providerThread.id,
+                      runId: turnInput.runId,
+                      cause,
+                    }),
+                ),
+              );
             return Effect.gen(function* () {
               yield* startNativeTurn(
                 turnInput,

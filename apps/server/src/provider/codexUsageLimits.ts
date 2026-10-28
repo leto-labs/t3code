@@ -26,6 +26,8 @@ export interface CodexRateLimitSnapshot {
     readonly remainingPercent: number;
     readonly resetsAt: number;
   } | null;
+  readonly normalModelSlug?: string | null;
+  readonly credits?: { readonly hasCredits: boolean; readonly unlimited: boolean } | null;
 }
 
 export interface CodexResetCreditsSummary {
@@ -59,9 +61,11 @@ function labelForKind(kind: ServerProviderUsageWindow["kind"]): string {
 /** primary/secondary are positions; without windowDurationMins, paid plans use 5-hour/weekly windows and Free/Go use monthly. */
 function codexRateLimitsToWindows(
   snapshot: CodexRateLimitSnapshot,
+  includeModelLimits = false,
 ): ReadonlyArray<ServerProviderUsageWindow> {
-  // Keep model-specific limits out of main allowance rows; older CLIs omit limit IDs.
-  if (snapshot.limitId && snapshot.limitId !== "codex") return [];
+  // Keep model buckets separate from the main allowance. Older CLIs omit the limit id.
+  const modelLimit = snapshot.limitId && snapshot.limitId !== "codex";
+  if (modelLimit && !includeModelLimits) return [];
   const isMonthlyPlan = snapshot.planType === "free" || snapshot.planType === "go";
   const positions = [
     ["primary", snapshot.primary, isMonthlyPlan ? MONTH_MINS : SESSION_MINS],
@@ -75,7 +79,13 @@ function codexRateLimitsToWindows(
     const kind = kindForDuration(windowDurationMins);
     const resetsAt = isoFromEpochSeconds(window.resetsAt);
     windows.push({
-      id,
+      id: modelLimit ? `${snapshot.limitId}:${id}` : id,
+      ...(modelLimit
+        ? {
+            limitId: snapshot.limitId!,
+            ...(snapshot.normalModelSlug ? { model: snapshot.normalModelSlug } : {}),
+          }
+        : {}),
       kind,
       label: labelForKind(kind),
       usedPercent: clampPercent(window.usedPercent),
@@ -83,7 +93,8 @@ function codexRateLimitsToWindows(
       ...(resetsAt ? { resetsAt } : {}),
     });
   }
-  const individualLimit = snapshot.individualLimit;
+  // The credit allowance is account-wide; model buckets repeat it.
+  const individualLimit = modelLimit ? undefined : snapshot.individualLimit;
   if (individualLimit && Number.isFinite(individualLimit.remainingPercent)) {
     const resetsAt = isoFromEpochSeconds(individualLimit.resetsAt);
     windows.push({
@@ -123,13 +134,33 @@ export function codexRateLimitsToLimits(input: {
   readonly checkedAt: string;
 }): ServerProviderUsageLimits {
   const resetCredits = codexResetCreditsToContract(input.resetCredits);
-  const windows = codexRateLimitsToWindows(input.rateLimitsByLimitId?.codex ?? input.snapshot);
+  const main = input.rateLimitsByLimitId?.codex ?? input.snapshot;
+  const credits = main.credits ?? input.snapshot.credits;
+  const snapshots =
+    input.rateLimitsByLimitId && Object.keys(input.rateLimitsByLimitId).length
+      ? Object.entries(input.rateLimitsByLimitId).map(([id, snapshot]) => ({
+          ...snapshot,
+          limitId: snapshot.limitId ?? id,
+        }))
+      : [main];
+  const windows = snapshots.flatMap((snapshot) =>
+    codexRateLimitsToWindows(snapshot, true).map((window) => ({
+      ...window,
+      observedAt: input.checkedAt,
+    })),
+  );
   return {
     ...makeUsageLimits({
       checkedAt: input.checkedAt,
       windows,
     }),
     ...(resetCredits ? { resetCredits } : {}),
+    ...(credits
+      ? {
+          paidCreditsAvailable: credits.hasCredits || credits.unlimited,
+          paidCreditsCheckedAt: input.checkedAt,
+        }
+      : {}),
   };
 }
 
@@ -137,9 +168,9 @@ export function codexRateLimitsToUpdate(
   snapshot: CodexRateLimitSnapshot,
   previous?: CodexRateLimitSnapshot,
 ): ProviderUsageLimitsUpdate | undefined {
-  const previousWindows = previous ? codexRateLimitsToWindows(previous) : [];
+  const previousWindows = previous ? codexRateLimitsToWindows(previous, true) : [];
   // Token ticks repeat session-cached limits that may predate an account probe or reset.
-  const windows = codexRateLimitsToWindows(snapshot).filter((window) => {
+  const windows = codexRateLimitsToWindows(snapshot, true).filter((window) => {
     const existing = previousWindows.find((candidate) => candidate.id === window.id);
     return (
       !existing ||
@@ -149,7 +180,16 @@ export function codexRateLimitsToUpdate(
       existing.windowDurationMins !== window.windowDurationMins
     );
   });
-  return windows.length > 0 ? { windows } : undefined;
+  const paidCreditsAvailable = snapshot.credits
+    ? snapshot.credits.hasCredits || snapshot.credits.unlimited
+    : undefined;
+  const creditsChanged =
+    paidCreditsAvailable !== undefined &&
+    (!previous?.credits ||
+      paidCreditsAvailable !== (previous.credits.hasCredits || previous.credits.unlimited));
+  return windows.length > 0 || creditsChanged
+    ? { windows, ...(paidCreditsAvailable === undefined ? {} : { paidCreditsAvailable }) }
+    : undefined;
 }
 
 export function codexRateLimitsFailureMessage(error: CodexErrors.CodexAppServerError): string {

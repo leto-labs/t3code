@@ -622,6 +622,29 @@ describe("mobile model options", () => {
       expect(buildModelOptions(configWith(settings), null, undefined, projectId)).toEqual([]);
     });
 
+    it("hides Codex Auto pool members while leaving the virtual pool selectable", () => {
+      const settings: ServerSettings = {
+        ...DEFAULT_SERVER_SETTINGS,
+        providerInstances: {
+          [instanceId]: { driver: ProviderDriverKind.make("codex"), enabled: true },
+          [ProviderInstanceId.make("codex_auto")]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: true,
+            config: { autoPoolMemberIds: [instanceId] },
+          },
+        },
+      };
+
+      expect(buildModelOptions(configWith(settings), null, undefined, projectId)).toEqual([]);
+      expect(
+        isModelSelectionUnavailable(
+          configWith(settings),
+          { instanceId, model: "model-a" },
+          projectId,
+        ),
+      ).toBe(true);
+    });
+
     it("hides a machine-disabled instance for a project with no override, even though another project's keep-alive left it running", () => {
       const otherProjectId = ProjectId.make("project-b");
       const settings: ServerSettings = {

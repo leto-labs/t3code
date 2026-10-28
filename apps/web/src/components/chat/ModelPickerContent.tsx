@@ -407,7 +407,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
       activeEntry,
       modelOptionsByInstance.get(props.activeInstanceId) ?? [],
     );
-  const [selectedInstanceId, setSelectedInstanceId] = useState<ProviderInstanceId | "favorites">(
+  const [requestedInstanceId, setSelectedInstanceId] = useState<ProviderInstanceId | "favorites">(
     () => {
       if (
         props.lockedProvider !== null ||
@@ -599,7 +599,9 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     return disabled;
   })();
   const sidebarInstanceEntries = (() => {
-    const enabledEntries = instanceEntries.filter(isProviderInstancePickerVisible);
+    const enabledEntries = instanceEntries.filter((entry) =>
+      isProviderInstancePickerVisible(entry, modelOptionsByInstance.get(entry.instanceId) ?? []),
+    );
     if (!isLocked) {
       return enabledEntries;
     }
@@ -614,6 +616,14 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     }
     return [...available, ...disabled];
   })();
+  const selectedInstanceId =
+    requestedInstanceId === "favorites" ||
+    sidebarInstanceEntries.some((entry) => entry.instanceId === requestedInstanceId)
+      ? requestedInstanceId
+      : favorites.length > 0
+        ? "favorites"
+        : (sidebarInstanceEntries.find((entry) => !lockedDisabledInstanceIds?.has(entry.instanceId))
+            ?.instanceId ?? "favorites");
   const showSidebar = !isSearching && sidebarInstanceEntries.length > 0;
   const instanceOrder = instanceEntries.map((entry) => entry.instanceId);
 
@@ -689,7 +699,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
     selectedInstanceId === "favorites" ? undefined : entryByInstanceId.get(selectedInstanceId);
   const providerSetupEntries =
     !isSearching && canOpenProviderSetup
-      ? instanceEntries.filter(
+      ? sidebarInstanceEntries.filter(
           (entry) =>
             matchesLockedProvider(entry) &&
             shouldOfferModelPickerSetup(

@@ -29,6 +29,7 @@ import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretReso
 
 import { buildUnavailableProviderSnapshot } from "./unavailableProviderSnapshot.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
+import * as ProviderInstanceLookup from "./ProviderInstanceLookup.ts";
 import type { AnyProviderDriver, ProviderInstance } from "@t3tools/provider-core/server/driver";
 
 export class ProviderInstanceRegistry extends Context.Service<
@@ -474,7 +475,7 @@ export const makeProviderInstanceRegistry = Effect.fn(
   // scopes to the *caller's* scope instead of the registry's.
   const parentScope = yield* Scope.Scope;
 
-  const driverContext = yield* Effect.context<R | SecretResolver.SecretResolver>();
+  const baseContext = yield* Effect.context<R | SecretResolver.SecretResolver>();
 
   const entries = yield* Ref.make<ReadonlyMap<ProviderInstanceId, LiveEntry>>(new Map());
   const unavailable = yield* Ref.make<ReadonlyMap<ProviderInstanceId, ServerProvider>>(new Map());
@@ -483,6 +484,13 @@ export const makeProviderInstanceRegistry = Effect.fn(
   >(new Map());
   const changes = yield* PubSub.unbounded<void>();
   yield* Effect.addFinalizer(() => PubSub.shutdown(changes));
+  const driverContext = Context.add(baseContext, ProviderInstanceLookup.ProviderInstanceLookup, {
+    get: (id) => Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.instance)),
+    environment: (id) =>
+      Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.secrets.environment)),
+    changes: Stream.fromPubSub(changes),
+    subscribe: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
+  });
 
   const state: RegistryState = { entries, unavailable, secretsUnreadable, changes };
   const reconcileWithR = makeReconcile({

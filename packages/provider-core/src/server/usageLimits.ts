@@ -53,16 +53,27 @@ export function applyUsageLimitsUpdate(input: {
   readonly checkedAt: string;
 }): ServerProviderUsageLimits | undefined {
   const { previous, update } = input;
-  if (update.windows.length === 0 || previous?.unavailable?.reason === "unsupported") {
+  if (
+    (update.windows.length === 0 && update.paidCreditsAvailable === undefined) ||
+    previous?.unavailable?.reason === "unsupported"
+  ) {
     return previous;
   }
   const merged = new Map(previous?.windows.map((window) => [window.id, window] as const));
-  // Codex repeats unchanged limits on token ticks; avoid allocating snapshots for no-ops.
-  let changed = false;
+  // Codex sends this notification beside every token-usage tick, almost
+  // always with unchanged numbers. Decide "nothing changed" per window on
+  // the way through so the no-op case never allocates a new snapshot.
+  let changed =
+    update.paidCreditsAvailable !== undefined &&
+    update.paidCreditsAvailable !== previous?.paidCreditsAvailable;
+  const refreshObservation =
+    previous !== undefined &&
+    Date.parse(input.checkedAt) - Date.parse(previous.checkedAt) >= 30_000;
   for (const window of update.windows) {
     const existing = merged.get(window.id);
     const next: ServerProviderUsageWindow = {
       ...window,
+      observedAt: input.checkedAt,
       usedPercent: clampPercent(window.usedPercent),
       ...(window.resetsAt === undefined && existing?.resetsAt !== undefined
         ? { resetsAt: existing.resetsAt }
@@ -71,17 +82,36 @@ export function applyUsageLimitsUpdate(input: {
         ? { windowDurationMins: existing.windowDurationMins }
         : {}),
     };
-    if (existing === undefined || !usageWindowEquals(existing, next)) {
+    if (existing === undefined || !usageWindowEquals(existing, next) || refreshObservation) {
       merged.set(window.id, next);
       changed = true;
     }
   }
-  if (!changed && previous !== undefined) {
+  if (
+    !changed &&
+    !refreshObservation &&
+    previous !== undefined &&
+    previous.unavailable === undefined
+  ) {
     return previous;
   }
   const unavailable =
     previous === undefined ? { reason: "probeFailed" as const } : previous.unavailable;
   return {
+    ...(previous?.lastAttemptAt
+      ? { lastAttemptAt: previous.lastAttemptAt, lastAttemptFailed: previous.lastAttemptFailed }
+      : {}),
+    ...(update.paidCreditsAvailable === undefined
+      ? previous?.paidCreditsAvailable === undefined
+        ? {}
+        : {
+            paidCreditsAvailable: previous.paidCreditsAvailable,
+            paidCreditsCheckedAt: previous.paidCreditsCheckedAt,
+          }
+      : {
+          paidCreditsAvailable: update.paidCreditsAvailable,
+          paidCreditsCheckedAt: input.checkedAt,
+        }),
     ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
     ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),
     ...(unavailable !== undefined ? { unavailable } : {}),
@@ -91,6 +121,8 @@ export function applyUsageLimitsUpdate(input: {
 function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageWindow): boolean {
   return (
     a.id === b.id &&
+    a.limitId === b.limitId &&
+    a.model === b.model &&
     a.kind === b.kind &&
     a.label === b.label &&
     a.usedPercent === b.usedPercent &&
@@ -105,7 +137,7 @@ export function resolveUsageLimitsAfterProbe(input: {
 }): ServerProviderUsageLimits | undefined {
   const { published, probed } = input;
   if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
-    return published;
+    return { ...published, lastAttemptAt: probed.checkedAt, lastAttemptFailed: true };
   }
   if (
     published &&

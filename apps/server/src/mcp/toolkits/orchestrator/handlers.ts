@@ -10,8 +10,35 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
+import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import { readCodexAutoPoolMemberIds } from "@t3tools/contracts";
 
 const handlers = {
+  provider_usage_limits: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const registry = yield* ProviderRegistry.ProviderRegistry;
+      const settings = yield* ServerSettings.ServerSettingsService;
+      const poolOnlyIds = yield* settings.getSettings.pipe(
+        Effect.map(
+          (current) =>
+            new Set(
+              Object.values(current.providerInstances).flatMap((instance) =>
+                instance.driver === "codex" ? readCodexAutoPoolMemberIds(instance.config) : [],
+              ),
+            ),
+        ),
+        Effect.orElseSucceed(() => new Set<string>()),
+      );
+      const visibleIds =
+        input.instanceIds === undefined
+          ? (yield* registry.getProviders)
+              .map((provider) => provider.instanceId)
+              .filter((instanceId) => !poolOnlyIds.has(instanceId))
+          : input.instanceIds.filter((instanceId) => !poolOnlyIds.has(instanceId));
+      return yield* registry.usageReport({ ...input, instanceIds: visibleIds });
+    }),
+  ),
   orchestrator_capabilities: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;

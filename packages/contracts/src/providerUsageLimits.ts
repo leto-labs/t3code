@@ -17,6 +17,9 @@ export const ServerProviderUsageWindow = Schema.Struct({
   usedPercent: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })),
   resetsAt: Schema.optional(IsoDateTime),
   windowDurationMins: Schema.optional(NonNegativeInt),
+  limitId: Schema.optional(TrimmedNonEmptyString),
+  model: Schema.optional(TrimmedNonEmptyString),
+  observedAt: Schema.optional(IsoDateTime),
 });
 export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 
@@ -31,6 +34,10 @@ export type ServerProviderResetCredits = typeof ServerProviderResetCredits.Type;
 /** Clear bars for unavailable accounts; retain last good bars after a failed probe. */
 export const ServerProviderUsageLimits = Schema.Struct({
   checkedAt: IsoDateTime,
+  lastAttemptAt: Schema.optional(IsoDateTime),
+  lastAttemptFailed: Schema.optional(Schema.Boolean),
+  paidCreditsAvailable: Schema.optional(Schema.Boolean),
+  paidCreditsCheckedAt: Schema.optional(IsoDateTime),
   windows: ForwardCompatibleArray(ServerProviderUsageWindow),
   credentialFingerprint: Schema.optional(TrimmedNonEmptyString),
   resetCredits: Schema.optional(ServerProviderResetCredits),
@@ -49,9 +56,42 @@ export const ServerProviderUsageLimits = Schema.Struct({
 });
 export type ServerProviderUsageLimits = typeof ServerProviderUsageLimits.Type;
 
-/** Partial updates merge windows by id; omitted windows remain unchanged. */
+export const ProviderUsageReportInput = Schema.Struct({
+  instanceIds: Schema.optional(Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(64))),
+  refresh: Schema.optional(Schema.Boolean),
+});
+export type ProviderUsageReportInput = typeof ProviderUsageReportInput.Type;
+
+export const ProviderUsageReport = Schema.Struct({
+  observedAt: IsoDateTime,
+  instances: Schema.Array(
+    Schema.Struct({
+      instanceId: ProviderInstanceId,
+      driver: ProviderDriverKind,
+      displayName: Schema.String,
+      checkedAt: Schema.NullOr(IsoDateTime),
+      lastAttemptAt: Schema.NullOr(IsoDateTime),
+      stale: Schema.Boolean,
+      status: Schema.Literals(["available", "stale", "unsupported", "probeFailed", "unavailable"]),
+      windows: Schema.Array(
+        ServerProviderUsageWindow.mapFields((fields) => ({
+          ...fields,
+          remainingPercent: Schema.Number,
+        })),
+      ),
+    }),
+  ),
+});
+export type ProviderUsageReport = typeof ProviderUsageReport.Type;
+
+/**
+ * Sparse by contract: Claude's `rate_limit_event` names one window at a time
+ * and Codex documents its notification as a partial. Windows merge by `id` onto
+ * the instance's published snapshot; omitted windows are unchanged.
+ */
 export const ProviderUsageLimitsUpdate = Schema.Struct({
   windows: Schema.Array(ServerProviderUsageWindow),
+  paidCreditsAvailable: Schema.optional(Schema.Boolean),
 });
 export type ProviderUsageLimitsUpdate = typeof ProviderUsageLimitsUpdate.Type;
 
