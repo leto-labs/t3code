@@ -33,6 +33,9 @@ const untrackedRpcAckMethods = new Set<string>([
   WS_METHODS.serverGetUsageSummary,
   WS_METHODS.serverReportClientActivity,
   WS_METHODS.sourceControlSignInWait,
+  // Branch pickers refresh these opportunistically and retain the last good
+  // page. A slow Git process must not make the chat look blocked.
+  WS_METHODS.vcsListRefs,
 ]);
 const longRunningRpcAckMethods = new Set<string>([
   WS_METHODS.serverUpdateProvider,

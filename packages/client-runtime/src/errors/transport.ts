@@ -3,6 +3,8 @@ import { NETWORK_BLOCKING_HINT, UNRESPONSIVE_HOST_HINT } from "./network.ts";
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const TRANSPORT_ERROR_PATTERNS = [
+  /\bSocketReadError\b/i,
+  /\bSocketWriteError\b/i,
   /\bSocketCloseError\b/i,
   /\bSocketOpenError\b/i,
   /\bSocket is not connected\b/i,

@@ -38,6 +38,7 @@ import type { TimestampFormat } from "@t3tools/contracts/settings";
 import { GuestMessageName } from "./guestMessageStyle";
 import { TimelineRowTimestamp } from "./TimelineRowParts";
 import { FoldedMessageHeader, useScheduledTaskTitle } from "./TimelineUserMessageRow";
+import { selectOptimisticQueuedMessages } from "./QueuedRunsControl.logic";
 
 export interface EditQueuedRunRequest {
   readonly runId: RunId;
@@ -103,8 +104,6 @@ export function QueuedRunsControl({
   const queueListId = useId();
   const [busyRunId, setBusyRunId] = useState<RunId | null>(null);
   const steerInFlightRef = useRef(false);
-  // Run-only acknowledgements can resurrect pending rows after cancellation or startup.
-  const acknowledgedMessageIds = new Set((projection?.messages ?? []).map((message) => message.id));
   const queuedImageAttachmentResources = queuedImageResources(projection);
   const queuedImageAttachmentUrls = useAssetUrls(
     props.environmentId,
@@ -118,14 +117,16 @@ export function QueuedRunsControl({
     workflow?.canSendNow === true ||
     (workflow?.canPromoteToSteer === true &&
       (!freshContext || workflow.promoteSkipsCompaction === true));
+  const projectedQueuedMessageIds = new Set(queued.map(({ run }) => run.userMessageId));
   const queuedImageUrlById = new Map(
     queuedImageAttachmentUrls.flatMap((url, index) => {
       const resource = queuedImageAttachmentResources[index];
       return url && resource ? [[resource.attachmentId, url] as const] : [];
     }),
   );
-  const optimisticQueued = props.optimisticMessages.filter(
-    (message) => message.inputIntent === "queued_turn" && !acknowledgedMessageIds.has(message.id),
+  const optimisticQueued = selectOptimisticQueuedMessages(
+    props.optimisticMessages,
+    projectedQueuedMessageIds,
   );
   const items = [
     ...queued.map(({ run, text, attachments, context, message }, serverIndex) => ({
