@@ -1,5 +1,7 @@
 import * as NodeV8 from "node:v8";
 
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import * as ServerSettings from "../serverSettings.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 import * as Stream from "effect/Stream";
 import {
@@ -218,6 +220,9 @@ const makeHarness = Effect.fn("makePullRequestSyncHarness")(function* (options: 
   };
 
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(ServerSettings.ServerSettingsService)({
+      getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+    }),
     Layer.mock(PullRequestService.PullRequestService)({
       withSharedProjectReads: (effect) => effect,
       summary,

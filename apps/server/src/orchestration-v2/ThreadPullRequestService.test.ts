@@ -28,6 +28,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as ServerActivation from "../serverActivation.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -107,6 +108,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const turnLookup = yield* Deferred.make<void>();
         const lookups: Array<{ readonly refresh: boolean }> = [];
         const dependencies = Layer.mergeAll(
+          ServerSettings.ServerSettingsService.layerTest(),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.fromQueue(domainEvents),
             getPullRequestSnapshot: () =>
@@ -232,6 +234,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const sweepStarted = yield* Deferred.make<void>();
           const lookupCwds: Array<string> = [];
           const dependencies = Layer.mergeAll(
+            ServerSettings.ServerSettingsService.layerTest(),
             Layer.mock(Orchestrator.OrchestratorV2)({
               streamDomainEvents: Stream.never,
               getPullRequestSnapshot: () =>
@@ -337,6 +340,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
         const childLookup = yield* Deferred.make<void>();
         const lookups: Array<{ readonly branch: string; readonly refresh: boolean }> = [];
         const dependencies = Layer.mergeAll(
+          ServerSettings.ServerSettingsService.layerTest(),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.fromQueue(domainEvents),
             getPullRequestSnapshot: ({ threadId }) =>
@@ -458,6 +462,7 @@ describe("ThreadPullRequestServiceV2 reads", () => {
           const sweepStarted = yield* Deferred.make<void>();
           const commands: Array<OrchestrationV2ServerCommand> = [];
           const dependencies = Layer.mergeAll(
+            ServerSettings.ServerSettingsService.layerTest(),
             Layer.mock(Orchestrator.OrchestratorV2)({
               streamDomainEvents: Stream.never,
               getPullRequestSnapshot: (options) =>

@@ -337,3 +337,12 @@ A snoozed thread keeps working and stays hidden until its wake time, even while
 its agent wakes itself for background work. It comes back early for an approval,
 a new question, a failed run, or a message or answer you send. You can snooze an existing
 question and answer when the thread wakes; the question stays unanswered.
+
+## Background PR checks
+
+In **Settings → General**, turn off **Background pull request refresh** to stop
+automatic PR discovery, status refreshes, watches, and PR-based cleanup lookups
+on the selected environments. Threads keep showing the last PR state they saw.
+Manual PR commands, including refreshing a PR, still work, and inactivity
+settlement continues without PR lookups. Turn it back on to resume background
+checks.

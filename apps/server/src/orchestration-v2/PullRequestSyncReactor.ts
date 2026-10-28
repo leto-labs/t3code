@@ -30,6 +30,7 @@ import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import * as ServerSettings from "../serverSettings.ts";
 import * as GitManager from "../git/GitManager.ts";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
@@ -337,6 +338,7 @@ export const make = Effect.gen(function* () {
   const pullRequests = yield* PullRequestService.PullRequestService;
   const git = yield* GitManager.GitManager;
   const random = yield* SecureRandom.SecureRandom;
+  const settingsService = yield* ServerSettings.ServerSettingsService;
 
   const lastSyncedAt = new Map<string, number>();
   const requested = new Set<string>();
@@ -379,6 +381,13 @@ export const make = Effect.gen(function* () {
       Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.logWarning(message, fields);
 
   const sweep = Effect.fn("PullRequestSyncReactor.sweep")(function* (scope: "all" | "requested") {
+    // Requested reads follow a user or agent action, so they run even when polling is off.
+    if (
+      scope === "all" &&
+      !(yield* ServerSettings.backgroundPullRequestRefreshEnabled(settingsService))
+    ) {
+      return;
+    }
     const threads = yield* projections.getThreadsWithPullRequests();
     const now = yield* DateTime.now;
     const nowMs = DateTime.toEpochMillis(now);

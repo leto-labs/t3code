@@ -877,6 +877,22 @@ export function GeneralSettingsPanel() {
             />
           }
         />
+        <SettingsRow
+          serverScoped
+          settingKeys={["backgroundPullRequestRefreshEnabled"]}
+          {...searchableSetting("background-pull-request-refresh")}
+          description="Discover and refresh pull requests in the background. Turn off to reduce server and network activity. Manual PR commands remain available."
+          control={
+            <ScopedSwitch
+              settingKeys={["backgroundPullRequestRefreshEnabled"]}
+              checked={settings.backgroundPullRequestRefreshEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ backgroundPullRequestRefreshEnabled: Boolean(checked) })
+              }
+              aria-label="Background pull request refresh"
+            />
+          }
+        />
       </SettingsSection>
 
       <SettingsSection id="confirmations" title="Confirmations">
