@@ -2518,6 +2518,11 @@ const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
   }
   yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings
     (provider_session_id, thread_id) VALUES (${sharedSessionId}, ${threadId})`;
+  const snapshot = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 1 });
+  assert.deepEqual(
+    snapshot.projection.providerThreads.map((thread) => thread.id),
+    [ProviderThreadId.make("provider-thread:settled-subagents:running")],
+  );
   // A command drops the node and the provider thread of each task it drops. The provider thread
   // in the shared session stays: detaching that session probes it for background work.
   const kept = ["active-run-delivered", "claimed", "no-delivery", "pending-delivery", "running"];
@@ -4403,6 +4408,61 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         },
       });
 
+      const referencedScopeId = CheckpointScopeId.make("scope:bounded-sql-history:older");
+      const referencedCheckpointId = CheckpointId.make("checkpoint:bounded-sql-history:older");
+      const unrelatedScopeId = CheckpointScopeId.make("scope:bounded-sql-history:unrelated");
+      for (const [id, ordinal] of [
+        [referencedScopeId, 1],
+        [unrelatedScopeId, 999],
+      ] as const) {
+        yield* projectionStore.apply({
+          id: EventId.make(`event:${id}`),
+          type: "checkpoint-scope.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id,
+            threadId,
+            runId: RunId.make(`run:bounded-sql-history:${ordinal}`),
+            nodeId: NodeId.make("node:bounded-sql-history:old-checkpoint-owner"),
+            parentScopeId: scopeId,
+            providerThreadId: null,
+            kind: "tool",
+            ordinalWithinParent: ordinal,
+            advancesAppRunCount: false,
+            cwd: "/repo/worktree",
+            createdAt: now,
+          },
+        });
+      }
+      yield* projectionStore.apply({
+        id: EventId.make("event:bounded-sql-history:older-checkpoint"),
+        type: "checkpoint.captured",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: referencedCheckpointId,
+          threadId,
+          scopeId: referencedScopeId,
+          runId: RunId.make("run:bounded-sql-history:1"),
+          nodeId: NodeId.make("node:bounded-sql-history:old-checkpoint-owner"),
+          parentCheckpointId: baselineId,
+          ordinalWithinScope: 1,
+          appRunOrdinal: null,
+          ref: CheckpointRef.make("refs/t3/bounded-sql-history/older"),
+          status: "ready",
+          files: [],
+          capturedAt: now,
+        },
+      });
+      yield* sql`
+        UPDATE orchestration_v2_projection_turn_items
+        SET type = 'checkpoint', payload_json = json_set(payload_json,
+          '$.type', 'checkpoint', '$.checkpointId', ${referencedCheckpointId},
+          '$.scopeId', ${referencedScopeId}, '$.files', json('[]'))
+        WHERE thread_id = ${threadId} AND ordinal = 999
+      `;
+
       const snapshots = yield* Effect.all(
         Array.from({ length: 4 }, () =>
           projectionStore.getThreadSnapshotWindow(threadId, { rowLimit: 76 }),
@@ -4421,14 +4481,21 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         );
         assert.deepEqual(
           snapshot.projection.checkpointScopes.map((scope) => scope.id),
-          [scopeId, repositoryScope.id],
+          [scopeId, referencedScopeId, repositoryScope.id],
         );
-        assert.deepEqual(snapshot.projection.checkpointScopes[1], repositoryScope);
+        assert.deepEqual(snapshot.projection.checkpointScopes[2], repositoryScope);
         assert.deepEqual(
           snapshot.projection.checkpoints.map((checkpoint) => checkpoint.id),
-          [repositoryCheckpointId, baselineId],
+          [referencedCheckpointId, repositoryCheckpointId, baselineId],
         );
       }
+      yield* sql`
+        UPDATE orchestration_v2_projection_turn_items
+        SET type = 'command_execution', payload_json = json_set(
+          json_remove(payload_json, '$.checkpointId', '$.scopeId', '$.files'),
+          '$.type', 'command_execution')
+        WHERE thread_id = ${threadId} AND ordinal = 999
+      `;
       const humanWindow = () =>
         projectionStore.getThreadSnapshotWindow(threadId, {
           rowLimit: 77,
