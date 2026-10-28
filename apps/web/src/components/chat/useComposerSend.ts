@@ -22,6 +22,7 @@ import {
 import { isUsageLimitsCommand } from "@t3tools/shared/usageLimits";
 import {
   AuthOrchestrationOperateScope,
+  CommandId,
   DEFAULT_MODEL,
   type EnvironmentId,
   type ModelSelection,
@@ -34,7 +35,10 @@ import {
   RuntimeMode,
 } from "@t3tools/contracts";
 import { deriveThreadTitleSeed } from "@t3tools/client-runtime/operations";
-import { wasBootstrapThreadDeleted } from "@t3tools/client-runtime/errors";
+import {
+  isTransportConnectionErrorMessage,
+  wasBootstrapThreadDeleted,
+} from "@t3tools/client-runtime/errors";
 import {
   declinePendingApprovals,
   sendApprovalFeedback,
@@ -101,6 +105,8 @@ import { runMobileComposerTransition } from "./draftHeroTransition";
 import { useClientSettingsHydrated } from "../../hooks/useSettings";
 import { useStableCallback } from "../../hooks/useStableCallback";
 import { environmentPresentations } from "../../state/presentation";
+import { orchestrationEnvironment } from "../../state/orchestration";
+import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import {
   approvalRedirectNotice,
   composerDraftContentChanged,
@@ -266,12 +272,8 @@ interface ComposerSendInput {
   readonly captureDraftHeroComposerRect: () => void;
   readonly setDockedDraftHeroThreadKey: Dispatch<SetStateAction<string | null>>;
   readonly setSetupQueueSendThreadKey: Dispatch<SetStateAction<string | null>>;
+  /** Pending sends own their blob previews and release a removed message's previews. */
   readonly setOptimisticUserMessages: Dispatch<SetStateAction<ChatMessage[]>>;
-  /** Takes ownership of, and later releases, an optimistic message's blob previews. */
-  readonly optimisticBlobPreviews: {
-    readonly track: (message: ChatMessage) => void;
-    readonly release: (message: ChatMessage) => void;
-  };
   readonly setFeedbackSubmissionsByThreadKey: Dispatch<
     SetStateAction<Record<string, ReadonlyArray<CodexFeedbackSubmission>>>
   >;
@@ -365,7 +367,6 @@ export function useComposerSend(input: ComposerSendInput) {
     setDockedDraftHeroThreadKey,
     setSetupQueueSendThreadKey,
     setOptimisticUserMessages,
-    optimisticBlobPreviews,
     setFeedbackSubmissionsByThreadKey,
     setThreadError,
     setKeepFullHistory,
@@ -380,6 +381,10 @@ export function useComposerSend(input: ComposerSendInput) {
   const linkedEnvironments = useLinkedEnvironments(environmentId);
   const handleNewThread = useNewThreadHandler();
   const navigate = useNavigate();
+  const verifyTurnDelivery = useAtomQueryRunner(orchestrationEnvironment.v2.threadProjection, {
+    refresh: true,
+    reportFailure: false,
+  });
   const clientSettingsHydrated = useClientSettingsHydrated();
   const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
@@ -1430,13 +1435,6 @@ export function useComposerSend(input: ComposerSendInput) {
           ? { inputIntent: "steer" as const }
           : {}),
     };
-    // After leaving the thread during an upload, its previews were already released and the
-    // message is never shown, so tracking them would keep them alive past the thread.
-    if (currentRouteThreadKeyRef.current === routeThreadKey) {
-      optimisticBlobPreviews.track(optimisticMessage);
-    } else {
-      optimisticBlobPreviews.release(optimisticMessage);
-    }
     setOptimisticUserMessages((existing) => [...existing, optimisticMessage]);
     setThreadError(threadIdForSend, null);
     if (expiredTerminalContextCount > 0) {
@@ -1574,9 +1572,10 @@ export function useComposerSend(input: ComposerSendInput) {
           )
         : null;
       if (backgroundThreadRef) beginBackgroundDraftSubmissionByRef(backgroundThreadRef);
-      const startPromise = startThreadTurn({
+      const startInput = {
         environmentId,
         input: {
+          commandId: CommandId.make(`web-turn:${messageIdForSend}`),
           threadId: threadIdForSend,
           message: {
             messageId: messageIdForSend,
@@ -1598,7 +1597,8 @@ export function useComposerSend(input: ComposerSendInput) {
           ...(bootstrap ? { bootstrap } : {}),
           createdAt: messageCreatedAt,
         },
-      });
+      } as const;
+      const startPromise = startThreadTurn(startInput);
       if (backgroundThreadRef) {
         try {
           backgroundDraftOpened = Boolean(
@@ -1622,8 +1622,63 @@ export function useComposerSend(input: ComposerSendInput) {
           );
         }
       }
-      const startResult = await startPromise;
-      if (startResult._tag === "Failure") {
+      let startResult = await startPromise;
+      let deliveryConfirmedAfterResponseLoss = false;
+      // The server commits commands before the socket acknowledgement reaches
+      // the browser. Re-send one transport failure with the same command id;
+      // server receipts make this safe whether the first attempt was accepted
+      // or lost before dispatch.
+      if (
+        startResult._tag === "Failure" &&
+        isTransportConnectionErrorMessage(
+          (() => {
+            const error = squashAtomCommandFailure(startResult);
+            return error instanceof Error ? error.message : String(error);
+          })(),
+        )
+      ) {
+        startResult = await startThreadTurn(startInput);
+        if (startResult._tag === "Failure") {
+          const deliveryCheckingToast = toastManager.add(
+            stackedThreadToast({
+              type: "info",
+              title: m(msg("Checking message delivery")),
+              description: m(
+                msg(
+                  "The connection dropped while sending. Waiting for the server state before retrying.",
+                ),
+              ),
+              timeout: 0,
+            }),
+          );
+          let verification: Awaited<ReturnType<typeof verifyTurnDelivery>> | null = null;
+          try {
+            verification = await verifyTurnDelivery({
+              environmentId,
+              input: { threadId: threadIdForSend },
+            });
+          } catch {
+            // Keep the original transport failure as the fallback when the
+            // verification request is interrupted by the same outage.
+          }
+          toastManager.close(deliveryCheckingToast);
+          deliveryConfirmedAfterResponseLoss =
+            verification?._tag === "Success" &&
+            verification.value.messages.some(
+              (message) => String(message.id) === String(messageIdForSend),
+            );
+          if (deliveryConfirmedAfterResponseLoss) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "info",
+                title: m(msg("Message delivered")),
+                description: m(msg("The connection dropped after the server accepted it.")),
+              }),
+            );
+          }
+        }
+      }
+      if (startResult._tag === "Failure" && !deliveryConfirmedAfterResponseLoss) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
@@ -1686,13 +1741,11 @@ export function useComposerSend(input: ComposerSendInput) {
         );
         clearBackgroundDraftSubmissionByRef(scopeThreadRef(environmentId, threadIdForSend));
       }
-      // Only an acknowledged send replaces its optimistic row, so a failed one leaves here.
+      // A failed send retires its row; a restored draft clones the images it revokes.
       setOptimisticUserMessages((existing) => {
         const next = existing.filter((message) => message.id !== messageIdForSend);
         return next.length === existing.length ? existing : next;
       });
-      // A restored draft clones its images, so the sent copies are no longer used.
-      optimisticBlobPreviews.release(optimisticMessage);
       if (
         composerDraftHasUserContent(
           useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
