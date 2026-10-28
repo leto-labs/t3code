@@ -13,9 +13,11 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2StoredEvent,
 } from "@t3tools/contracts";
+import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -31,6 +33,8 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+
+import { buildBoundedThreadStreamSnapshot } from "./ThreadStream.ts";
 
 const threadId = ThreadId.make("thread:control-reads");
 const providerThreadId = ProviderThreadId.make("provider-thread:control-reads");
@@ -198,6 +202,138 @@ const storageCases = [
     storeLayer: ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
   },
 ];
+
+it.effect.each(storageCases)(
+  "$storage: retains a pending secret form and live background work beyond the history window",
+  ({ storeLayer }) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const events = fixtureEvents(now);
+      yield* Effect.forEach(events, (event) => store.apply(event), { discard: true });
+      const base = {
+        threadId,
+        runId,
+        nodeId,
+        providerThreadId,
+        providerTurnId,
+        nativeItemRef: null,
+        parentItemId: null,
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+      };
+      const secret = {
+        ...base,
+        id: TurnItemId.make("control:secret"),
+        ordinal: 0,
+        type: "secret_request" as const,
+        status: "waiting" as const,
+        label: "Signing key",
+        reason: "Authenticate webhook events",
+        secretStatus: "pending" as const,
+      };
+      const work = {
+        ...base,
+        id: TurnItemId.make("control:background"),
+        ordinal: 1,
+        type: "command_execution" as const,
+        status: "running" as const,
+        input: "npm test",
+      };
+      const dynamicTool = {
+        ...base,
+        id: TurnItemId.make("control:dynamic-tool"),
+        ordinal: 2,
+        type: "dynamic_tool" as const,
+        status: "waiting" as const,
+        toolName: "wait",
+        input: {},
+      };
+      const subagent = {
+        ...base,
+        id: TurnItemId.make("control:subagent"),
+        ordinal: 3,
+        type: "subagent" as const,
+        status: "pending" as const,
+        subagentId: nodeId,
+        origin: "app_owned" as const,
+        driver,
+        providerInstanceId,
+        childThreadId: null,
+        prompt: "Review the result",
+        result: null,
+      };
+      const background = [work, dynamicTool, subagent];
+      for (const item of [secret, ...background]) {
+        yield* store.apply({
+          id: EventId.make(`event:${item.id}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: item,
+        });
+      }
+      for (let ordinal = 4; ordinal < 84; ordinal++) {
+        yield* store.apply({
+          id: EventId.make(`event:recent:${ordinal}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            ...work,
+            id: TurnItemId.make(`control:recent:${ordinal}`),
+            ordinal,
+            status: "completed",
+            completedAt: now,
+          },
+        });
+      }
+      for (const compactTurnItems of [false, true]) {
+        const snapshot = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 });
+        const frame = buildBoundedThreadStreamSnapshot({ ...snapshot, compactTurnItems });
+        const projection = boundedSnapshotProjection(frame);
+        assert.isTrue(frame.hasMoreHistory);
+        assert.deepEqual(
+          {
+            secretVisible: projection.visibleTurnItems.some(
+              (row) => row.sourceItemId === secret.id,
+            ),
+            background: projection.turnItems
+              .filter((item) => background.some(({ id }) => id === item.id))
+              .map((item) => item.id),
+          },
+          { secretVisible: true, background: background.map(({ id }) => id) },
+        );
+      }
+      for (const item of [
+        {
+          ...secret,
+          secretStatus: "declined" as const,
+          status: "completed" as const,
+          completedAt: now,
+        },
+        ...background.map((item) => ({ ...item, status: "completed" as const, completedAt: now })),
+      ]) {
+        yield* store.apply({
+          id: EventId.make(`event:resolved:${item.id}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: item,
+        });
+      }
+      const resolved = buildBoundedThreadStreamSnapshot(
+        yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 }),
+      );
+      assert.isFalse(
+        resolved.projection.turnItems.some(
+          (item) => item.id === secret.id || background.some(({ id }) => id === item.id),
+        ),
+      );
+    }).pipe(Effect.provide(storeLayer)),
+);
 
 it.effect.each(storageCases)(
   "$storage: finds the active root turn without an attempt reverse link",
