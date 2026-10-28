@@ -1,7 +1,12 @@
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
 import { pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
-import { projectTurnItemForWire } from "./WireProjection.ts";
+import {
+  projectTurnItemForWire,
+  MAX_MESSAGE_TEXT_BYTES,
+  TURN_ITEM_PREVIEW_BASE_KEYS,
+  GENERIC_ITEM_PREVIEW_TYPES,
+} from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -1978,6 +1983,68 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    // Character-based, so JavaScript still trims multi-byte text to the byte cap.
+    const boundedMessageText = sql`CASE
+      WHEN length(json_extract(item.payload_json, '$.text')) > ${MAX_MESSAGE_TEXT_BYTES}
+      THEN substr(json_extract(item.payload_json, '$.text'), 1, ${MAX_MESSAGE_TEXT_BYTES})
+        || char(10) || '… output truncated for transport'
+      ELSE json_extract(item.payload_json, '$.text') END`;
+    // Only display reads use previews. Durable/native provider context and the
+    // on-demand item endpoint continue to read the original payload.
+    const boundedItemCandidate = sql`CASE
+      WHEN length(item.payload_json) <= 32768 THEN item.payload_json
+      WHEN item.type = 'command_execution' THEN json_patch(
+        json_remove(item.payload_json, '$.output'),
+        json_object('input', substr(json_extract(item.payload_json, '$.input'), 1, 8192),
+          'outputOmitted', json('true'), 'detailOmitted', json('true')))
+      WHEN item.type = 'dynamic_tool' THEN (
+        SELECT CASE WHEN length(json_extract(tool.payload, '$.input')) > 16384
+          THEN json_set(tool.payload,
+            '$.input', json_object('summary', 'Large tool input', 'truncated', json('true')),
+            '$.detailOmitted', json('true'))
+          ELSE tool.payload END
+        FROM (SELECT CASE WHEN length(json_extract(item.payload_json, '$.output')) > 16384
+          THEN json_set(json_remove(item.payload_json, '$.output'), '$.outputOmitted', json('true'))
+          ELSE item.payload_json END AS payload) AS tool)
+      WHEN item.type = 'file_change' THEN json_patch(
+        json_remove(item.payload_json, '$.oldStr', '$.newStr', '$.diffStr'),
+        json_object('detailOmitted', json('true')))
+      WHEN item.type = 'user_message' AND (
+        length(json_extract(item.payload_json, '$.context')) > 16384 OR
+        length(json_extract(item.payload_json, '$.attachments')) > 16384
+      ) THEN json_patch(json_remove(item.payload_json, '$.context'), json_object(
+        'text', ${boundedMessageText}, 'attachments', json('[]'), 'detailOmitted', json('true')))
+      WHEN item.type IN ('user_message', 'assistant_message', 'reasoning')
+        AND length(json_extract(item.payload_json, '$.text')) > ${MAX_MESSAGE_TEXT_BYTES}
+      THEN json_patch(item.payload_json, json_object(
+        'text', ${boundedMessageText}, 'detailOmitted', json('true')))
+      WHEN item.type IN ('run_interrupt_request', 'run_interrupt_result') THEN json_patch(
+        item.payload_json, json_object('message', substr(json_extract(item.payload_json, '$.message'), 1, 8192),
+          'detailOmitted', json('true')))
+      WHEN item.type = 'subagent' THEN json_patch(json_set(item.payload_json,
+        '$.prompt', substr(json_extract(item.payload_json, '$.prompt'), 1, 8192),
+        '$.result', substr(json_extract(item.payload_json, '$.result'), 1, 8192),
+        '$.detailOmitted', json('true')), json_object(
+        'progress', substr(json_extract(item.payload_json, '$.progress'), 1, 8192)))
+      WHEN item.type = 'proposed_plan' THEN json_patch(item.payload_json, json_object(
+        'markdown', substr(json_extract(item.payload_json, '$.markdown'), 1, 8192)
+          || char(10) || '… content truncated for transport', 'detailOmitted', json('true')))
+      ELSE item.payload_json END`;
+    const boundedItemPayload = sql`CASE WHEN length(item.payload_json) <= 32768
+      THEN item.payload_json ELSE (
+        SELECT CASE WHEN length(preview.payload) <= 65536
+          OR item.type NOT IN (SELECT value FROM json_each(${encodeIdList(GENERIC_ITEM_PREVIEW_TYPES)}))
+          THEN preview.payload ELSE (
+          SELECT json_set(json_group_object(field.key,
+            CASE WHEN field.type IN ('object','array') THEN json(field.value)
+              WHEN field.key = 'title' THEN substr(field.value, 1, 8192)
+              ELSE field.value END),
+            '$.type', 'system_notice', '$.previewOf', item.type, '$.detailOmitted', json('true'),
+            '$.message', 'Large ' || replace(item.type, '_', ' ') || ' item. Content truncated for transport.')
+          FROM json_each(item.payload_json) AS field
+          WHERE field.key IN (SELECT value FROM json_each(${encodeIdList(TURN_ITEM_PREVIEW_BASE_KEYS)}))
+        ) END FROM (SELECT ${boundedItemCandidate} AS payload) AS preview
+      ) END`;
 
     const inlineWorkOutput = sql`item.type = 'dynamic_tool' AND (
       item.payload_json LIKE '%htmlRender%' OR item.payload_json LIKE ${`%${MCP_APP_OUTPUT_KEY}%`}
@@ -3100,6 +3167,27 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ), retained AS MATERIALIZED (
                   SELECT item_rowid, ordinal, turn_item_id FROM selected
                   UNION
+                  SELECT item.rowid AS item_rowid, item.ordinal, item.turn_item_id
+                  FROM orchestration_v2_projection_turn_items AS item
+                    INDEXED BY orchestration_v2_projection_turn_items_recovery_idx
+                  WHERE item.thread_id = ${threadId}
+                    AND ${window.anchorItemId ?? null} IS NULL
+                    AND ${window.requiredRunId ?? null} IS NULL
+                    AND item.type IN ('command_execution', 'dynamic_tool', 'subagent')
+                    AND item.status IN ('pending', 'running', 'waiting')
+                  UNION
+                  SELECT item.rowid AS item_rowid, item.ordinal, item.turn_item_id
+                  FROM orchestration_v2_projection_runs AS run
+                  CROSS JOIN orchestration_v2_projection_turn_items AS item
+                    INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx
+                    ON item.thread_id = run.thread_id AND item.run_id = run.run_id
+                  WHERE run.thread_id = ${threadId}
+                    AND run.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                    AND item.type = 'secret_request' AND item.status = 'waiting'
+                    AND json_extract(item.payload_json, '$.secretStatus') = 'pending'
+                    AND ${window.anchorItemId ?? null} IS NULL
+                    AND ${window.requiredRunId ?? null} IS NULL
+                  UNION
                   SELECT request.rowid AS item_rowid, request.ordinal, request.turn_item_id
                   FROM orchestration_v2_projection_turn_items AS request
                   WHERE request.run_id IN (
@@ -3175,7 +3263,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 -- CROSS JOIN keeps the sorted IDs as the outer loop, so SQLite
                 -- skips sorting again once the payloads are attached. Carry the
                 -- rowid through selection to avoid a second string-key index lookup.
-                SELECT item.payload_json, tail.turn_item_id AS work_last_id,
+                SELECT ${boundedItemPayload} AS payload_json, tail.turn_item_id AS work_last_id,
                   deferred.last_ordinal AS work_last_ordinal, deferred.item_count AS work_item_count
                 FROM retained
                 CROSS JOIN orchestration_v2_projection_turn_items AS item
@@ -3292,7 +3380,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 readonly plan_id: string;
                 readonly run_id: string;
                 readonly provider_thread_id: string | null;
-                readonly last_plan_id: string;
               }>`
                 WITH latest_owner AS MATERIALIZED (
                   SELECT plan.plan_id, owner.run_id, owner.provider_thread_id
@@ -3321,13 +3408,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     AND plan.kind = 'todo_list' AND plan.status <> 'superseded'
                   ORDER BY item.ordinal DESC
                   LIMIT 1
-                ) END, owner.plan_id) AS plan_id, owner.run_id, owner.provider_thread_id,
-                (
-                  SELECT MAX(plan_id) FROM orchestration_v2_projection_plans
-                  WHERE thread_id = ${threadId} AND run_id = owner.run_id
-                ) AS last_plan_id
+                ) END, owner.plan_id) AS plan_id, owner.run_id, owner.provider_thread_id
                 FROM latest_owner AS owner
               `;
+        const cohortSubagentIds = cohortJson("subagentId");
+        const cohortRequestIds = cohortJson("requestId");
 
         const [
           thread,
@@ -3477,11 +3562,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `
               : sql<PayloadRow>`
-            SELECT payload_json FROM orchestration_v2_projection_subagents
+            SELECT json_patch(json_set(payload_json,
+              '$.prompt', substr(json_extract(payload_json, '$.prompt'), 1, 1024),
+              '$.result', substr(json_extract(payload_json, '$.result'), 1, 1024)), json_object(
+              'progress', substr(json_extract(payload_json, '$.progress'), 1, 1024))) AS payload_json
+            FROM orchestration_v2_projection_subagents
             WHERE thread_id = ${threadId}
               AND (status IN ('pending','starting','running','waiting')
-                OR run_id IN (SELECT value FROM json_each(${cohortRunIds}))
-                OR parent_node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
+                OR subagent_id IN (SELECT value FROM json_each(${cohortSubagentIds})))
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `,
           fields !== undefined && !fields.includes("providerSessions")
@@ -3532,6 +3620,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               OR owner_node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
               OR (thread_id = ${threadId}
                 AND provider_thread_id = ${latestTodoList?.provider_thread_id ?? null})
+              OR provider_thread_id IN (
+                SELECT provider_thread_id FROM orchestration_v2_projection_subagents
+                WHERE thread_id = ${threadId} AND status IN ('pending','running','waiting')
+              )
             ORDER BY COALESCE(first_run_ordinal, 0), provider_thread_id ASC
           `,
           (fields !== undefined && !fields.includes("providerTurns")) ||
@@ -3558,8 +3650,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json FROM orchestration_v2_projection_provider_turns
             WHERE thread_id = ${threadId}
               AND (status IN ('starting','running','waiting')
-                OR provider_turn_id IN (SELECT value FROM json_each(${cohortProviderTurnIds}))
-                OR node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
+                OR provider_turn_id IN (SELECT value FROM json_each(${cohortProviderTurnIds})))
             ORDER BY provider_thread_id ASC, ordinal ASC
           `,
           (fields !== undefined && !fields.includes("runtimeRequests")) ||
@@ -3577,8 +3668,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json FROM orchestration_v2_projection_runtime_requests
             WHERE thread_id = ${threadId}
               AND (status IN ('pending','waiting')
-                OR node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
-                OR provider_turn_id IN (SELECT value FROM json_each(${cohortProviderTurnIds})))
+                OR runtime_request_id IN (SELECT value FROM json_each(${cohortRequestIds})))
             ORDER BY created_at ASC, runtime_request_id ASC
           `,
           (fields !== undefined && !fields.includes("messages")) ||
@@ -3596,16 +3686,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ORDER BY created_at ASC, message_id ASC
               `
               : sql<PayloadRow>`
-                SELECT payload_json FROM orchestration_v2_projection_messages AS message
+                SELECT CASE WHEN message.message_id IN (
+                  SELECT json_extract(payload_json, '$.userMessageId') FROM orchestration_v2_projection_runs
+                  WHERE thread_id = ${threadId} AND status IN ('queued','preparing','starting','running','waiting')
+                ) THEN payload_json ELSE
+                  json_set(
+                    CASE WHEN length(json_extract(payload_json, '$.context')) > 16384
+                      THEN json_remove(payload_json, '$.context') ELSE payload_json END,
+                    '$.text', substr(json_extract(payload_json, '$.text'), 1, ${MAX_MESSAGE_TEXT_BYTES}),
+                    '$.attachments', json(CASE WHEN length(json_extract(payload_json, '$.attachments')) > 16384
+                      THEN '[]' ELSE COALESCE(json_extract(payload_json, '$.attachments'), '[]') END)
+                  ) END AS payload_json
+                FROM orchestration_v2_projection_messages AS message
                 WHERE message.thread_id = ${threadId}
                   AND (
                     message.message_id IN (
                       SELECT value FROM json_each(${cohortMessageIds})
                     )
-                    OR message.run_id IN (
-                      SELECT run_id FROM orchestration_v2_projection_runs
-                      WHERE thread_id = ${threadId}
-                        AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                    OR message.message_id IN (
+                      SELECT json_extract(payload_json, '$.userMessageId') FROM orchestration_v2_projection_runs
+                      WHERE thread_id = ${threadId} AND status IN ('queued','preparing','starting','running','waiting')
                     )
                   )
                 ORDER BY created_at ASC, message_id ASC
@@ -3618,19 +3718,36 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE thread_id = ${threadId} ORDER BY plan_id ASC
               `
               : sql<PayloadRow>`
-                SELECT payload_json FROM orchestration_v2_projection_plans AS plan
+                SELECT CASE WHEN length(payload_json) > 32768 THEN
+                  CASE WHEN kind = 'proposed_plan' THEN
+                    json_set(payload_json, '$.markdown', substr(json_extract(payload_json, '$.markdown'), 1, 8192)
+                      || char(10) || '… plan preview; open to load complete text', '$.detailOmitted', json('true'))
+                  ELSE json_set(payload_json, '$.steps', json('[]'), '$.explanation',
+                    'Task details are available on demand.', '$.detailOmitted', json('true')) END
+                  ELSE payload_json END AS payload_json
+                FROM orchestration_v2_projection_plans AS plan
                 WHERE plan.thread_id = ${threadId}
                   AND (
-                    plan.status = 'active'
-                    OR plan.plan_id = ${latestTodoList?.plan_id ?? null}
+                    plan.plan_id = ${latestTodoList?.plan_id ?? null}
+                    OR plan.rowid IN (
+                      SELECT MAX(rowid) FROM orchestration_v2_projection_plans
+                      WHERE thread_id = ${threadId} AND status = 'active'
+                      GROUP BY kind
+                    )
+                    OR plan.rowid IN (
+                      SELECT MAX(rowid) FROM orchestration_v2_projection_plans
+                      WHERE thread_id = ${threadId} AND status = 'active'
+                        AND run_id IN (SELECT run_id FROM orchestration_v2_projection_runs
+                          WHERE thread_id = ${threadId} AND status IN ('queued','preparing','starting','running','waiting'))
+                      GROUP BY kind, run_id
+                    )
                     OR plan.plan_id IN (
                       SELECT value FROM json_each(${cohortPlanIds})
                     )
                   )
-                -- Keep the selected artifact last within its run for equal-run consumers.
-                ORDER BY CASE WHEN plan_id = ${latestTodoList?.plan_id ?? null}
-                  THEN ${latestTodoList?.last_plan_id ?? null} ELSE plan_id END ASC,
-                  plan_id = ${latestTodoList?.plan_id ?? null} ASC
+                -- Creation order lets consumers take the latest plan per kind; the
+                -- selected task list goes last so equal-run consumers pick it.
+                ORDER BY plan_id = ${latestTodoList?.plan_id ?? null} ASC, plan.rowid ASC
               `,
           fields !== undefined && !fields.includes("checkpointScopes")
             ? Effect.succeed([])
@@ -3644,8 +3761,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               : sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_checkpoint_scopes
             WHERE thread_id = ${threadId}
-              AND (run_id IN (SELECT value FROM json_each(${cohortRunIds}))
-                OR node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
+              AND (scope_id IN (
+                SELECT scope_id FROM orchestration_v2_projection_checkpoints
+                WHERE thread_id = ${threadId} AND checkpoint_id IN (SELECT value FROM json_each(${cohortCheckpointIds}))
+              ) OR node_id IN (SELECT value FROM json_each(${cohortNodeIds})))
             ORDER BY ordinal_within_parent ASC, scope_id ASC
           `,
           fields !== undefined && !fields.includes("checkpoints")
@@ -3675,7 +3794,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE thread_id = ${threadId} ORDER BY rowid ASC
               `
               : sql<PayloadRow>`
-                SELECT payload_json FROM orchestration_v2_projection_context_handoffs AS handoff
+                SELECT json_set(json_remove(payload_json, '$.history', '$.delivery'), '$.summaryText', '') AS payload_json
+                FROM orchestration_v2_projection_context_handoffs AS handoff
                 WHERE handoff.thread_id = ${threadId}
                   AND (
                     handoff.status IN ('pending', 'ready')
@@ -3700,7 +3820,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             SELECT payload_json FROM orchestration_v2_projection_context_transfers
             WHERE (source_thread_id = ${threadId} OR target_thread_id = ${threadId})
               AND (status IN ('pending','running','waiting')
-                OR target_run_id IN (SELECT value FROM json_each(${cohortRunIds}))
                 OR json_extract(payload_json, '$.contextHandoffId') IN
                   (SELECT value FROM json_each(${cohortHandoffIds})))
             ORDER BY rowid ASC
@@ -5924,7 +6043,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 turn_item_id: string;
                 payload_json: string;
               }>`
-          SELECT item.thread_id, item.turn_item_id, item.payload_json
+          SELECT item.thread_id, item.turn_item_id, ${boundedItemPayload} AS payload_json
           FROM orchestration_v2_projection_turn_items item JOIN json_each(${sources}) wanted
           ON item.thread_id = json_extract(wanted.value, '$.threadId')
             AND item.turn_item_id = json_extract(wanted.value, '$.id')`;
@@ -5977,7 +6096,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             };
           }),
         )
-        .pipe(Effect.mapError(controlReadError(threadId)));
+        .pipe(
+          Effect.withSpan("ProjectionStore.getThreadHistoryPage"),
+          Effect.mapError(controlReadError(threadId)),
+        );
 
     const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = (threadId, options) =>
       sql
@@ -6149,6 +6271,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           }),
         )
         .pipe(
+          Effect.withSpan("ProjectionStore.getThreadSnapshotWindow"),
           Effect.mapError((cause) =>
             isProjectionStoreThreadNotFoundError(cause) || isProjectionStoreReadError(cause)
               ? cause

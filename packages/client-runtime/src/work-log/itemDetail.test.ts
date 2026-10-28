@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ThreadId, TurnItemId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
+import {
+  NodeId,
+  PlanId,
+  ThreadId,
+  TurnItemId,
+  type OrchestrationV2TurnItem,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
-import { isJsonToolText, turnItemOutputImages, turnItemOutputText } from "./itemDetail.ts";
+import {
+  isJsonToolText,
+  restorePlanItemDetail,
+  turnItemNeedsDetailFetch,
+  turnItemOutputImages,
+  turnItemOutputText,
+} from "./itemDetail.ts";
 
 describe("isJsonToolText", () => {
   it.each([
@@ -112,4 +124,45 @@ describe("tool image output parsing", () => {
       );
     },
   );
+});
+
+describe("plan item detail", () => {
+  it("restores a complete plan only when its identity matches the preview", () => {
+    const item: Extract<OrchestrationV2TurnItem, { readonly type: "proposed_plan" }> = {
+      id: TurnItemId.make("plan-item"),
+      threadId: ThreadId.make("thread"),
+      runId: null,
+      nodeId: null,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: 1,
+      status: "completed",
+      title: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: DateTime.makeUnsafe("2026-10-01T00:00:00Z"),
+      type: "proposed_plan",
+      planId: PlanId.make("plan"),
+      markdown: "Preview",
+      streaming: false,
+      detailOmitted: true,
+    };
+    const plan = {
+      id: item.planId,
+      threadId: item.threadId,
+      runId: null,
+      nodeId: NodeId.make("plan-node"),
+      kind: "proposed_plan" as const,
+      status: "active" as const,
+      markdown: "Full plan.\n".repeat(50_000),
+    };
+    expect(turnItemNeedsDetailFetch(item)).toBe(true);
+    const restored = restorePlanItemDetail(item, plan);
+    expect(restored).toMatchObject({ markdown: plan.markdown, detailOmitted: false });
+    expect(turnItemNeedsDetailFetch(restored)).toBe(false);
+    expect(restorePlanItemDetail(item, { ...plan, id: PlanId.make("different") })).toBe(item);
+    expect(item.markdown).toBe("Preview");
+  });
 });

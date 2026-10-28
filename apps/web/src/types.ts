@@ -96,6 +96,9 @@ export interface ProposedPlan {
   readonly status: OrchestrationV2PlanArtifact["status"];
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly detailOmitted?: true;
+  readonly sourceThreadId?: ThreadId;
+  readonly streaming?: boolean;
 }
 export type TurnDiffFileChange = ThreadCheckpointSummary["files"][number];
 export type TurnDiffSummary = ThreadCheckpointSummary;

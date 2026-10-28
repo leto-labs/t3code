@@ -191,6 +191,12 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       staleTimeMs: 60_000,
       idleTtlMs: 60_000,
     }),
+    plan: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:plan",
+      tag: ORCHESTRATION_V2_WS_METHODS.getPlan,
+      staleTimeMs: 60_000,
+      idleTtlMs: 60_000,
+    }),
     fullThreadDiff: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:full-thread-diff",
       tag: ORCHESTRATION_V2_WS_METHODS.getFullThreadDiff,

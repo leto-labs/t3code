@@ -7,8 +7,10 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   NodeId,
+  RunId,
   EventId,
   ProjectId,
+  PlanId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -20,6 +22,7 @@ import {
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemJson,
 } from "@t3tools/contracts";
+import { isOrchestrationV2TurnItemVisible } from "@t3tools/shared/orchestrationV2Timeline";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -60,6 +63,171 @@ const base = {
 };
 
 describe("orchestration V2 wire projection", () => {
+  it("preserves the plan identity needed to expand oversized task lists", () => {
+    const item = {
+      ...base,
+      type: "todo_list" as const,
+      planId: PlanId.make("large-tasks"),
+      steps: Array.from({ length: 1000 }, (_, index) => ({
+        id: String(index),
+        text: "A large task description ".repeat(10),
+        status: "pending" as const,
+      })),
+    };
+    const projected = projectTurnItemForWire(item);
+    expect(projected).toMatchObject({
+      type: "todo_list",
+      planId: item.planId,
+      steps: [],
+      detailOmitted: true,
+    });
+    expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(2048);
+    expect(item.steps).toHaveLength(1000);
+  });
+
+  it("bounds live plan updates without truncating the stored plan", () => {
+    const event = {
+      id: EventId.make("large-plan-update"),
+      type: "plan.updated" as const,
+      threadId: base.threadId,
+      occurredAt: base.updatedAt,
+      payload: {
+        id: PlanId.make("large-plan"),
+        threadId: base.threadId,
+        runId: null,
+        nodeId: NodeId.make("plan-node"),
+        kind: "proposed_plan" as const,
+        status: "active" as const,
+        markdown: "Plan detail\n".repeat(100_000),
+      },
+    };
+    const projected = projectDomainEventForWire(event);
+    expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(16_384);
+    expect(projected.payload).toMatchObject({ id: event.payload.id, detailOmitted: true });
+    expect(event.payload.markdown).toHaveLength(1_200_000);
+    expect(projectDomainEventForWire(projected)).toEqual(projected);
+  });
+
+  it("preserves visibility semantics for oversized interrupt results and queued input", () => {
+    const runId = RunId.make("run-preview");
+    const nodeId = NodeId.make("node-preview");
+    const interrupt = projectTurnItemForWire({
+      ...base,
+      type: "run_interrupt_result",
+      runId,
+      nodeId,
+      message: "x".repeat(200_000),
+    });
+    expect(interrupt.type).toBe("run_interrupt_result");
+    expect(
+      isOrchestrationV2TurnItemVisible({
+        item: interrupt,
+        runs: [],
+        attempts: [{ runId, rootNodeId: nodeId, status: "superseded" }],
+        items: [interrupt],
+      }),
+    ).toBe(false);
+    const queued = projectTurnItemForWire({
+      ...base,
+      type: "user_message",
+      runId,
+      nodeId,
+      inputIntent: "queued_turn",
+      createdBy: "user",
+      creationSource: "web",
+      messageId: MessageId.make("queued-preview"),
+      text: "x".repeat(200_000),
+      attachments: [],
+    });
+    expect(queued.type).toBe("user_message");
+    expect(
+      isOrchestrationV2TurnItemVisible({
+        item: queued,
+        runs: [{ id: runId, status: "cancelled" }],
+        attempts: [],
+        items: [queued],
+      }),
+    ).toBe(false);
+  });
+
+  it("bounds a single large structured item without changing its source identity or stored data", () => {
+    const item = {
+      ...base,
+      type: "file_search" as const,
+      pattern: "needle",
+      results: Array.from({ length: 10_000 }, (_, i) => ({
+        fileName: `file-${i}`,
+        preview: "x".repeat(200),
+      })),
+    };
+    const preview = projectTurnItemForWire(item);
+    expect(decodeTurnItem(preview)).toMatchObject({
+      id: item.id,
+      type: "system_notice",
+      previewOf: "file_search",
+      detailOmitted: true,
+    });
+    expect(Buffer.byteLength(JSON.stringify(preview))).toBeLessThan(128 * 1024);
+    const detail = projectTurnItemForDetail(item);
+    expect(decodeTurnItem(detail)).toMatchObject({
+      id: item.id,
+      type: "system_notice",
+      previewOf: "file_search",
+    });
+    expect(detail.type === "system_notice" && detail.message).toContain("file-0");
+    expect(Buffer.byteLength(JSON.stringify(detail))).toBeLessThan(256 * 1024);
+    expect(item.results).toHaveLength(10_000);
+  });
+  it("keeps long messages whole up to the on-demand cap", () => {
+    const longText = "界".repeat(60_000);
+    const message = {
+      ...base,
+      type: "assistant_message" as const,
+      messageId: MessageId.make("large-answer"),
+      text: longText,
+      streaming: false,
+    };
+    expect(projectTurnItemForWire(message)).toBe(message);
+    const pasted = {
+      ...base,
+      type: "user_message" as const,
+      messageId: MessageId.make("pasted-log"),
+      inputIntent: "turn_start" as const,
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      text: "log line\n".repeat(20_000),
+      attachments: [
+        {
+          type: "image" as const,
+          id: "image-1",
+          name: "screen.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+        },
+      ],
+    };
+    expect(projectTurnItemForWire(pasted)).toBe(pasted);
+    const huge = { ...message, text: "界".repeat(100_000) };
+    const projected = projectTurnItemForWire(huge);
+    expect(projected.detailOmitted).toBe(true);
+    expect(
+      projected.type === "assistant_message" && Buffer.byteLength(projected.text),
+    ).toBeLessThan(263_000);
+  });
+
+  it("previews oversized Unicode command input with recoverable details", () => {
+    const text = "界".repeat(20_000);
+    const command = {
+      ...base,
+      type: "command_execution" as const,
+      input: text,
+      output: "",
+      exitCode: 0,
+    };
+    expect(projectTurnItemForWire(command).detailOmitted).toBe(true);
+    expect(projectTurnItemForDetail(command)).toMatchObject({ input: text });
+    expect(command.input).toBe(text);
+  });
   it("keeps copied handoff transcripts out of activity items and live events", () => {
     const item = {
       ...base,

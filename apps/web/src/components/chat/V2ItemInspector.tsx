@@ -5,6 +5,7 @@ import {
   toolCallLines,
   turnItemDetailRevision,
   turnItemNeedsDetailFetch,
+  restorePlanItemDetail,
   turnItemOutputImages,
   turnItemOutputText,
 } from "@t3tools/client-runtime/work-log/item-detail";
@@ -17,7 +18,7 @@ import { useRenderedAppearance } from "../../hooks/useTheme";
 import { cn } from "../../lib/utils";
 import { resolveDiffThemeName } from "../../lib/diffRendering";
 import { getSyntaxHighlighterPromise } from "../../lib/syntaxHighlighting";
-import { useTurnItemDetail } from "../../state/queries";
+import { usePlanDetail, useTurnItemDetail } from "../../state/queries";
 import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 import { Button } from "../ui/button";
 import ChatMarkdown from "../ChatMarkdown";
@@ -100,8 +101,22 @@ function useFetchedTurnItem(
 ) {
   const wireItem = projectedItem.item;
   const fetches = !skip && turnItemNeedsDetailFetch(wireItem);
+  const planId =
+    fetches && (wireItem.type === "proposed_plan" || wireItem.type === "todo_list")
+      ? wireItem.planId
+      : null;
+  const plan = usePlanDetail(
+    planId === null
+      ? null
+      : {
+          environmentId,
+          threadId: projectedItem.sourceThreadId,
+          planId,
+          revision: turnItemDetailRevision(wireItem),
+        },
+  );
   const detail = useTurnItemDetail(
-    fetches
+    fetches && planId === null
       ? {
           environmentId,
           threadId: projectedItem.sourceThreadId,
@@ -111,7 +126,9 @@ function useFetchedTurnItem(
       : null,
     source?.detail,
   );
-  const fetchedItem = detail.data?.item;
+  const fetchedItem = plan.data?.plan
+    ? restorePlanItemDetail(wireItem, plan.data.plan)
+    : detail.data?.item;
   const item = fetchedItem?.type === wireItem.type ? fetchedItem : wireItem;
   return {
     item,
@@ -119,13 +136,13 @@ function useFetchedTurnItem(
       output: turnItemOutputText(item),
       images: turnItemOutputImages(item),
       environmentId,
-      pending: item === wireItem && detail.isPending,
+      pending: item === wireItem && (detail.isPending || plan.isPending),
       error:
         item !== wireItem
           ? null
           : detail.data?.item === null
             ? "Output is no longer available."
-            : detail.error,
+            : (detail.error ?? plan.error),
       empty: fetches && item !== wireItem,
     },
   };

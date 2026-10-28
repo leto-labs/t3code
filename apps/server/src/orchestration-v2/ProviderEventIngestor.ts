@@ -609,7 +609,7 @@ export const layer: Layer.Layer<
                 yield* makeDomainEvent(input, {
                   type: "plan.updated",
                   threadId: plan.threadId,
-                  payload,
+                  payload: { ...payload, revision: DateTime.formatIso(occurredAt) },
                   runId: plan.runId,
                   nodeId: plan.nodeId,
                   occurredAt,

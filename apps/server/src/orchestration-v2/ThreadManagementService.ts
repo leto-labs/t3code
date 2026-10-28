@@ -22,6 +22,8 @@ import {
   type OrchestrationV2Actor,
   type OrchestrationV2Command,
   type OrchestrationV2GetTurnItemResult,
+  type OrchestrationV2GetPlanResult,
+  type PlanId,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2CreationSource,
@@ -382,6 +384,10 @@ export interface ThreadManagementServiceShape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
+  readonly getPlan: (input: {
+    readonly threadId: ThreadId;
+    readonly planId: PlanId;
+  }) => Effect.Effect<OrchestrationV2GetPlanResult, Orchestrator.OrchestratorV2Error>;
   readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
   readonly getThreadProjection: (
     threadId: ThreadId,
@@ -1579,6 +1585,12 @@ const make = Effect.gen(function* () {
       return ensureProjectionTranscript(input.threadId).pipe(
         Effect.andThen(orchestrator.getTurnItem(input)),
         Effect.map((item) => ({ item: item === null ? null : projectTurnItemForDetail(item) })),
+      );
+    }),
+    getPlan: Effect.fn("ThreadManagementService.getPlan")(function (input) {
+      return ensureProjectionTranscript(input.threadId).pipe(
+        Effect.andThen(orchestrator.getPlan(input.threadId, input.planId)),
+        Effect.map((plan) => ({ plan: plan ?? null })),
       );
     }),
     getThreadRecords: Effect.fn("ThreadManagementService.getThreadRecords")(

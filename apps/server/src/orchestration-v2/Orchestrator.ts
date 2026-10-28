@@ -38,6 +38,8 @@ import {
   type ThreadPullRequestWatch,
   type OrchestrationV2AppThread,
   type OrchestrationV2ContextHandoff,
+  type OrchestrationV2PlanArtifact,
+  type PlanId,
   type OrchestrationV2ContextSourcePoint,
   type OrchestrationV2ContextTransfer,
   type OrchestrationV2ContextTransferResolution,
@@ -407,6 +409,10 @@ export interface OrchestratorV2Shape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2TurnItem | null, OrchestratorV2Error>;
+  readonly getPlan: (
+    threadId: ThreadId,
+    planId: PlanId,
+  ) => Effect.Effect<OrchestrationV2PlanArtifact | undefined, OrchestratorV2Error>;
   readonly getThreadRecords: <K extends ProjectionRecordField>(
     threadId: ThreadId,
     fields: ReadonlyArray<K>,
@@ -14515,6 +14521,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
           ),
         );
+    }),
+    getPlan: Effect.fn("OrchestratorV2.getPlan")(function (threadId, planId) {
+      return projectionStore
+        .getPlan(threadId, planId)
+        .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
     }),
     getThreadRecords: Effect.fn("OrchestratorV2.getThreadRecords")(
       function (threadId, fields, filter) {

@@ -21,6 +21,7 @@ import type {
   ProjectContentMatch,
   ProjectEntry,
   ProjectEntryKind,
+  PlanId,
   ThreadId,
   TurnItemId,
   VcsListRefsResult,
@@ -472,5 +473,23 @@ export function useTurnItemDetail(
       : source
         ? source(input)
         : orchestrationEnvironment.turnItem({ environmentId: target.environmentId, input }),
+  );
+}
+
+export function usePlanDetail(
+  target: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly planId: PlanId;
+    readonly revision: string;
+  } | null,
+) {
+  return useEnvironmentQuery(
+    target === null
+      ? null
+      : orchestrationEnvironment.plan({
+          environmentId: target.environmentId,
+          input: { threadId: target.threadId, planId: target.planId, revision: target.revision },
+        }),
   );
 }

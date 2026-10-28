@@ -5,6 +5,8 @@ import type {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
+import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { projectPlanForWire } from "./WireProjection.ts";
 import * as Schema from "effect/Schema";
 
 /**
@@ -503,53 +505,49 @@ function isLocalProjectedRow(
   return row.visibility === "local" || String(row.sourceThreadId) === String(projection.thread.id);
 }
 
-function pendingRequestIdsOf(
-  projection: Pick<OrchestrationV2ThreadProjection, "runtimeRequests">,
-): ReadonlySet<string> {
-  return new Set(
+const LIVE_RUN_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
+
+/**
+ * Pending prompts and live background work must stay answerable without loading their history page.
+ * Interrupt requests also stay available for reducers when their results arrive.
+ */
+function controlTurnItems(projection: OrchestrationV2ThreadProjection): OrchestrationV2TurnItem[] {
+  const pendingRequestIds = new Set(
     projection.runtimeRequests
       .filter((request) => request.status === "pending")
       .map((request) => String(request.id)),
   );
-}
-
-// Clients build the answer panel of an open question or approval from its row,
-// and a run that kept working pushes that row out of the newest turns.
-function isRetainedDependency(
-  item: OrchestrationV2TurnItem,
-  pendingRequestIds: ReadonlySet<string>,
-): boolean {
-  return (
-    item.type === "run_interrupt_request" ||
-    ((item.type === "user_input_request" || item.type === "approval_request") &&
-      pendingRequestIds.has(String(item.requestId)))
+  const backgroundIds = new Set(pendingBackgroundTurnItems(projection).map((item) => item.id));
+  const liveRunIds = new Set(
+    projection.runs.filter((run) => LIVE_RUN_STATUSES.has(run.status)).map((run) => run.id),
+  );
+  return projection.turnItems.filter(
+    (item) =>
+      item.type === "run_interrupt_request" ||
+      backgroundIds.has(item.id) ||
+      (item.type === "secret_request" &&
+        item.secretStatus === "pending" &&
+        item.runId !== null &&
+        liveRunIds.has(item.runId)) ||
+      ((item.type === "user_input_request" || item.type === "approval_request") &&
+        pendingRequestIds.has(String(item.requestId))),
   );
 }
 
-/** Retain small requests outside the visible window; later result pages still need them for attempt/run reducers. */
-function retainedInterruptRequestTurnItems(
-  projection: OrchestrationV2ThreadProjection,
-  visible: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
-): OrchestrationV2TurnItem[] {
-  const visibleLocalIds = new Set<string>();
-  for (const row of visible) {
-    if (isLocalProjectedRow(projection, row)) {
-      visibleLocalIds.add(String(row.sourceItemId));
+/** Latest active plan per kind, plus per live run; projection order is creation order. */
+function activeSnapshotPlanIds(projection: OrchestrationV2ThreadProjection): Set<string> {
+  const liveRunIds = new Set(
+    projection.runs.filter((run) => LIVE_RUN_STATUSES.has(run.status)).map((run) => run.id),
+  );
+  const latest = new Map<string, string>();
+  for (const plan of projection.plans) {
+    if (plan.status !== "active") continue;
+    latest.set(plan.kind, String(plan.id));
+    if (plan.runId !== null && liveRunIds.has(plan.runId)) {
+      latest.set(`${plan.kind}:${plan.runId}`, String(plan.id));
     }
   }
-
-  const pendingRequestIds = pendingRequestIdsOf(projection);
-  const retained: OrchestrationV2TurnItem[] = [];
-  for (const item of projection.turnItems) {
-    if (!isRetainedDependency(item, pendingRequestIds)) {
-      continue;
-    }
-    if (visibleLocalIds.has(String(item.id))) {
-      continue;
-    }
-    retained.push(item);
-  }
-  return retained;
+  return new Set(latest.values());
 }
 
 function localTurnItemsForVisibleWindow(
@@ -648,27 +646,22 @@ export function buildBoundedThreadProjection(input: {
       latestTodoListOrdinal = ordinal;
     }
   }
+  const controlPlanIds = activeSnapshotPlanIds(input.projection);
+  if (latestTodoList !== undefined) controlPlanIds.add(String(latestTodoList.id));
   const controlProjection = {
     ...input.projection,
-    plans: input.projection.plans.filter(
-      (plan) => plan.status === "active" || plan.id === latestTodoList?.id,
-    ),
+    plans: input.projection.plans
+      .filter((plan) => controlPlanIds.has(String(plan.id)))
+      .map(projectPlanForWire),
     contextHandoffs: input.projection.contextHandoffs.filter(
       (handoff) => handoff.status === "pending" || handoff.status === "ready",
     ),
   };
   const latestLocalTurnOrdinal = computeLatestLocalTurnOrdinal(input.projection.turnItems);
 
-  const dependencyReserve = (() => {
-    let reserve = 0;
-    const pendingRequestIds = pendingRequestIdsOf(controlProjection);
-    for (const item of controlProjection.turnItems) {
-      if (isRetainedDependency(item, pendingRequestIds)) {
-        reserve += bytesOfJson(item);
-      }
-    }
-    return reserve;
-  })();
+  const dependencyTurnItems = controlTurnItems(controlProjection);
+  let dependencyReserve = 0;
+  for (const item of dependencyTurnItems) dependencyReserve += bytesOfJson(item);
   const controlBytes = bytesOfJson({
     ...controlProjection,
     messages: [],
@@ -681,19 +674,39 @@ export function buildBoundedThreadProjection(input: {
     policy.maxEncodedBytes - dependencyReserve - controlBytes - 1_024,
   );
   const windowPolicy: ThreadHistoryPagePolicy = { ...policy, maxEncodedBytes: windowBudget };
+  const messageById = new Map(
+    controlProjection.messages.map((message) => [String(message.id), message]),
+  );
 
   const window = selectRecentTimelineWindow({
     items: controlProjection.visibleTurnItems,
     snapshotSequence: input.snapshotSequence,
     policy: windowPolicy,
-    rowEncodedBytes: (row) => projectedRowBoundedSnapshotEncodedBytes(row, threadId),
+    rowEncodedBytes: (row) => {
+      const message =
+        "messageId" in row.item ? messageById.get(String(row.item.messageId)) : undefined;
+      return (
+        projectedRowBoundedSnapshotEncodedBytes(row, threadId) +
+        (message === undefined ? 0 : bytesOfJson(message))
+      );
+    },
   });
-  const visibleTurnItems = renumberPositions(window.items);
+  // Secret forms render in the timeline, so keep a pending one visible next to the composer. The
+  // history cursor still points into the unmodified chronological window.
+  const windowIds = new Set(window.items.map((row) => String(row.sourceItemId)));
+  const visibleTurnItems = renumberPositions([
+    ...window.items,
+    ...dependencyTurnItems
+      .filter((item) => item.type === "secret_request" && !windowIds.has(String(item.id)))
+      .map((item) => ({
+        position: 0,
+        visibility: "local" as const,
+        sourceThreadId: threadId,
+        sourceItemId: item.id,
+        item,
+      })),
+  ]);
   const windowTurnItems = localTurnItemsForVisibleWindow(controlProjection, visibleTurnItems);
-  const dependencyTurnItems = retainedInterruptRequestTurnItems(
-    controlProjection,
-    visibleTurnItems,
-  );
   const turnItemById = new Map<string, OrchestrationV2TurnItem>();
   for (const item of windowTurnItems) {
     turnItemById.set(String(item.id), item);
@@ -712,19 +725,15 @@ export function buildBoundedThreadProjection(input: {
     turnItems.flatMap((item) => (item.type === "handoff" ? [String(item.contextHandoffId)] : [])),
   );
   const plans = input.projection.plans
-    .filter(
-      (plan) =>
-        plan.status === "active" ||
-        plan.id === latestTodoList?.id ||
-        visiblePlanIds.has(String(plan.id)),
-    )
-    .map((plan) =>
-      plan.status === "active" || plan.id === latestTodoList?.id
-        ? plan
-        : plan.kind === "proposed_plan"
-          ? { ...plan, markdown: "", detailInTurnItem: true as const }
-          : { ...plan, explanation: undefined, detailInTurnItem: true as const },
-    );
+    .filter((plan) => controlPlanIds.has(String(plan.id)) || visiblePlanIds.has(String(plan.id)))
+    .map((plan) => {
+      if (plan.status === "active" || controlPlanIds.has(String(plan.id))) {
+        return projectPlanForWire(plan);
+      }
+      return plan.kind === "proposed_plan"
+        ? { ...plan, markdown: "", detailInTurnItem: true as const }
+        : { ...plan, steps: [], explanation: undefined, detailInTurnItem: true as const };
+    });
   const contextHandoffs = input.projection.contextHandoffs
     .filter(
       (handoff) =>
@@ -738,16 +747,15 @@ export function buildBoundedThreadProjection(input: {
         : { ...handoff, summaryText: "", detailInTurnItem: true as const },
     );
 
-  const projection = {
-    ...controlProjection,
-    plans,
-    contextHandoffs,
-    messages: messagesForBoundedProjection(controlProjection, turnItems),
-    turnItems,
-    visibleTurnItems,
-  };
   return {
-    projection,
+    projection: {
+      ...controlProjection,
+      plans,
+      contextHandoffs,
+      messages: messagesForBoundedProjection(controlProjection, turnItems),
+      turnItems,
+      visibleTurnItems,
+    },
     historyCursor: window.nextCursor,
     hasMoreHistory: window.hasMoreHistory,
     latestLocalTurnOrdinal,

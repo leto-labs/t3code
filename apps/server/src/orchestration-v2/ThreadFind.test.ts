@@ -788,7 +788,7 @@ describe("V2 history materialization", () => {
       const projection = yield* setup;
       yield* putItems(
         Array.from({ length: 80 }, (_, ordinal) =>
-          item(`row:${ordinal}`, ordinal, ordinal < 78 ? "small" : "large ".repeat(200_000)),
+          item(`row:${ordinal}`, ordinal, ordinal < 76 ? "small" : "large ".repeat(200_000)),
         ),
       );
       const snapshot = yield* projection.getThreadSnapshot(threadId);
@@ -819,7 +819,8 @@ describe("V2 history materialization", () => {
         sizes.push(page.items.length);
         cursor = page.nextCursor;
       }
-      assert.deepEqual(sizes, [1, 1, 75, 3]);
+      // Wire previews cap each large row, so the byte budget stops the first page after three.
+      assert.deepEqual(sizes, [3, 75, 2]);
     }).pipe(Effect.provide(layerTest)),
   );
 });
