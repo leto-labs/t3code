@@ -13031,5 +13031,9 @@
   "d9db3b15d9f9a050": "Auto offers only models, reasoning options, and service tiers supported by every selected account. Manage model visibility and favorites in Models below.",
   "c0021c5cd80c3c09": "Background pull request refresh",
   "c6437499a4369737": "Discover and refresh pull requests in the background. Turn off to reduce server and network activity. Manual PR commands remain available.",
-  "4416a616b35a8a38": "PR discovery polling disable lookup performance network"
+  "4416a616b35a8a38": "PR discovery polling disable lookup performance network",
+  "45a9c97bfaa12d35": "Checking message delivery",
+  "3ff1ccb6afbe7478": "The connection dropped while sending. Waiting for the server state before retrying.",
+  "9d963ab2dc03c3a6": "Message delivered",
+  "a4b498ce3af70d20": "The connection dropped after the server accepted it."
 }

@@ -12,6 +12,13 @@ describe("isTransportConnectionErrorMessage", () => {
     ).toBe(true);
   });
 
+  it("recognizes read and write failures from an established socket", () => {
+    expect(
+      isTransportConnectionErrorMessage("SocketReadError: An error occurred during Read"),
+    ).toBe(true);
+    expect(isTransportConnectionErrorMessage("SocketWriteError: connection lost")).toBe(true);
+  });
+
   it("recognizes relay connection errors that carry the network hint", () => {
     for (const sentence of [
       "Relay environment disconnected.",

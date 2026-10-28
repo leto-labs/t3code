@@ -443,3 +443,26 @@ it("tells the user why Send now was rejected", async () => {
   await page.getByRole("button", { name: "Send now" }).click();
   await vi.waitFor(() => expect(page.getByText(reason).element()).toBeVisible());
 });
+
+it("keeps the optimistic queued row while the server message precedes its queue run", async () => {
+  setup();
+  const messageId = MessageId.make("message:queued-race");
+  state.workflow = {
+    activeRun: { id: "run:active" },
+    canPromoteToSteer: false,
+    canReorder: false,
+    queuedRuns: [],
+  };
+
+  await using _screen = await renderQueue({
+    optimisticMessages: [
+      {
+        id: messageId,
+        inputIntent: "queued_turn",
+        text: "Keep this queued message visible",
+      },
+    ],
+  });
+
+  await expect.element(page.getByText("Keep this queued message visible")).toBeVisible();
+});
