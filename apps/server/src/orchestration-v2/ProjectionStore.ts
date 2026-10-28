@@ -3795,6 +3795,27 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 ), retained AS MATERIALIZED (
                   SELECT item_rowid, ordinal, turn_item_id FROM selected
                   UNION
+                  SELECT item.rowid AS item_rowid, item.ordinal, item.turn_item_id
+                  FROM orchestration_v2_projection_turn_items AS item
+                    INDEXED BY orchestration_v2_projection_turn_items_recovery_idx
+                  WHERE item.thread_id = ${threadId}
+                    AND ${window.anchorItemId ?? null} IS NULL
+                    AND ${window.requiredRunId ?? null} IS NULL
+                    AND item.type IN ('command_execution', 'dynamic_tool', 'subagent')
+                    AND item.status IN ('pending', 'running', 'waiting')
+                  UNION
+                  SELECT item.rowid AS item_rowid, item.ordinal, item.turn_item_id
+                  FROM orchestration_v2_projection_runs AS run
+                  CROSS JOIN orchestration_v2_projection_turn_items AS item
+                    INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx
+                    ON item.thread_id = run.thread_id AND item.run_id = run.run_id
+                  WHERE run.thread_id = ${threadId}
+                    AND run.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                    AND item.type = 'secret_request' AND item.status = 'waiting'
+                    AND json_extract(item.payload_json, '$.secretStatus') = 'pending'
+                    AND ${window.anchorItemId ?? null} IS NULL
+                    AND ${window.requiredRunId ?? null} IS NULL
+                  UNION
                   SELECT request.rowid AS item_rowid, request.ordinal, request.turn_item_id
                   FROM orchestration_v2_projection_turn_items AS request
                   WHERE request.run_id IN (
@@ -4485,6 +4506,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               OR owner_node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
               OR (thread_id = ${threadId}
                 AND provider_thread_id = ${latestTodoList?.provider_thread_id ?? null})
+              OR provider_thread_id IN (
+                SELECT provider_thread_id FROM orchestration_v2_projection_subagents
+                WHERE thread_id = ${threadId} AND status IN ('pending','starting','running','waiting')
+              )
             ORDER BY COALESCE(first_run_ordinal, 0), provider_thread_id ASC
           `,
           (fields !== undefined && !fields.includes("providerTurns")) ||
@@ -4617,8 +4642,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               : sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_checkpoint_scopes
             WHERE thread_id = ${threadId}
-              AND (run_id IN (SELECT value FROM json_each(${cohortRunIds}))
-                OR node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
+              AND (scope_id IN (
+                SELECT scope_id FROM orchestration_v2_projection_checkpoints
+                WHERE thread_id = ${threadId} AND checkpoint_id IN (SELECT value FROM json_each(${cohortCheckpointIds}))
+              ) OR node_id IN (SELECT value FROM json_each(${cohortNodeIds}))
                 -- A repository scope names the run that first used it; every later run's
                 -- checkpoints still need its label.
                 OR kind = 'manual')

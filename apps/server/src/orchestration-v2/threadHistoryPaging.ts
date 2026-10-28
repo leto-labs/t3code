@@ -5,6 +5,7 @@ import type {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
+import { pendingBackgroundTurnItems } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as Schema from "effect/Schema";
 
 /**
@@ -535,53 +536,33 @@ function isLocalProjectedRow(
   return row.visibility === "local" || String(row.sourceThreadId) === String(projection.thread.id);
 }
 
-function pendingRequestIdsOf(
-  projection: Pick<OrchestrationV2ThreadProjection, "runtimeRequests">,
-): ReadonlySet<string> {
-  return new Set(
+const LIVE_RUN_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
+
+/**
+ * Pending prompts and live background work must stay answerable without loading their history page.
+ * Interrupt requests also stay available for reducers when their results arrive.
+ */
+function controlTurnItems(projection: OrchestrationV2ThreadProjection): OrchestrationV2TurnItem[] {
+  const pendingRequestIds = new Set(
     projection.runtimeRequests
       .filter((request) => request.status === "pending")
       .map((request) => String(request.id)),
   );
-}
-
-// Clients build the answer panel of an open question or approval from its row,
-// and a run that kept working pushes that row out of the newest turns.
-function isRetainedDependency(
-  item: OrchestrationV2TurnItem,
-  pendingRequestIds: ReadonlySet<string>,
-): boolean {
-  return (
-    item.type === "run_interrupt_request" ||
-    ((item.type === "user_input_request" || item.type === "approval_request") &&
-      pendingRequestIds.has(String(item.requestId)))
+  const backgroundIds = new Set(pendingBackgroundTurnItems(projection).map((item) => item.id));
+  const liveRunIds = new Set(
+    projection.runs.filter((run) => LIVE_RUN_STATUSES.has(run.status)).map((run) => run.id),
   );
-}
-
-/** Retain small requests outside the visible window; later result pages still need them for attempt/run reducers. */
-function retainedInterruptRequestTurnItems(
-  projection: OrchestrationV2ThreadProjection,
-  visible: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
-): OrchestrationV2TurnItem[] {
-  const visibleLocalIds = new Set<string>();
-  for (const row of visible) {
-    if (isLocalProjectedRow(projection, row)) {
-      visibleLocalIds.add(String(row.sourceItemId));
-    }
-  }
-
-  const pendingRequestIds = pendingRequestIdsOf(projection);
-  const retained: OrchestrationV2TurnItem[] = [];
-  for (const item of projection.turnItems) {
-    if (!isRetainedDependency(item, pendingRequestIds)) {
-      continue;
-    }
-    if (visibleLocalIds.has(String(item.id))) {
-      continue;
-    }
-    retained.push(item);
-  }
-  return retained;
+  return projection.turnItems.filter(
+    (item) =>
+      item.type === "run_interrupt_request" ||
+      backgroundIds.has(item.id) ||
+      (item.type === "secret_request" &&
+        item.secretStatus === "pending" &&
+        item.runId !== null &&
+        liveRunIds.has(item.runId)) ||
+      ((item.type === "user_input_request" || item.type === "approval_request") &&
+        pendingRequestIds.has(String(item.requestId))),
+  );
 }
 
 function localTurnItemsForVisibleWindow(
@@ -691,16 +672,11 @@ export function buildBoundedThreadProjection(input: {
   };
   const latestLocalTurnOrdinal = computeLatestLocalTurnOrdinal(input.projection.turnItems);
 
-  const dependencyReserve = (() => {
-    let reserve = 0;
-    const pendingRequestIds = pendingRequestIdsOf(controlProjection);
-    for (const item of controlProjection.turnItems) {
-      if (isRetainedDependency(item, pendingRequestIds)) {
-        reserve += bytesOfJson(item);
-      }
-    }
-    return reserve;
-  })();
+  const dependencyTurnItems = controlTurnItems(controlProjection);
+  const dependencyReserve = dependencyTurnItems.reduce(
+    (total, item) => total + bytesOfJson(item),
+    0,
+  );
   const controlBytes = bytesOfJson({
     ...controlProjection,
     messages: [],
@@ -720,18 +696,28 @@ export function buildBoundedThreadProjection(input: {
     policy: windowPolicy,
     rowEncodedBytes: (row) => projectedRowBoundedSnapshotEncodedBytes(row, threadId),
   });
-  const visibleTurnItems = renumberPositions(window.items);
+  // Secret forms render in the timeline, so keep a pending one visible next to the composer. The
+  // history cursor still points into the unmodified chronological window.
+  const windowIds = new Set(window.items.map((row) => String(row.sourceItemId)));
+  const visibleTurnItems = renumberPositions([
+    ...window.items,
+    ...dependencyTurnItems
+      .filter((item) => item.type === "secret_request" && !windowIds.has(String(item.id)))
+      .map((item) => ({
+        position: 0,
+        visibility: "local" as const,
+        sourceThreadId: threadId,
+        sourceItemId: item.id,
+        item,
+      })),
+  ]);
   const windowTurnItems = localTurnItemsForVisibleWindow(controlProjection, visibleTurnItems);
-  const dependencyTurnItems = retainedInterruptRequestTurnItems(
-    controlProjection,
-    visibleTurnItems,
-  );
   const turnItemById = new Map<string, OrchestrationV2TurnItem>();
   for (const item of windowTurnItems) {
     turnItemById.set(String(item.id), item);
   }
   for (const item of dependencyTurnItems) {
-    turnItemById.set(String(item.id), item);
+    if (!turnItemById.has(String(item.id))) turnItemById.set(String(item.id), item);
   }
   const turnItems = [...turnItemById.values()];
 
