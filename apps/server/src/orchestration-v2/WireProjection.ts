@@ -7,6 +7,7 @@ import type {
   OrchestrationV2ContextHandoff,
   OrchestrationV2StoredEvent,
   OrchestrationV2Subagent,
+  OrchestrationV2PlanArtifact,
   OrchestrationV2ThreadProjection,
   OrchestrationV2ThreadStreamItem,
   OrchestrationV2TurnItem,
@@ -29,6 +30,70 @@ const MAX_DYNAMIC_VALUE_BYTES = 16_384;
 const MAX_ON_DEMAND_BYTES = 256 * 1024;
 const TRUNCATION_MARKER = "\n… output truncated for transport";
 const TRUNCATION_MARKER_BYTES = Buffer.byteLength(TRUNCATION_MARKER, "utf8");
+const MAX_ON_DEMAND_ITEM_BYTES = 1024 * 1024;
+const MAX_WIRE_ITEM_BYTES = 128 * 1024;
+/** Equal to the on-demand cap, so fetching a message's detail could never return more text. */
+export const MAX_MESSAGE_TEXT_BYTES = MAX_ON_DEMAND_BYTES;
+
+// Domain events and turn items are immutable after they leave the projection.
+// A live event can be projected once per connected subscriber, so memoize the
+// bounded form without keeping old event histories alive.
+const wireItemProjections = new WeakMap<object, OrchestrationV2TurnItem>();
+const wireEventProjections = new WeakMap<object, OrchestrationV2DomainEvent>();
+
+export const GENERIC_ITEM_PREVIEW_TYPES = [
+  "file_change",
+  "file_search",
+  "web_search",
+  "checkpoint",
+  "todo_list",
+  "dynamic_tool",
+] as const satisfies ReadonlyArray<OrchestrationV2TurnItem["type"]>;
+
+export const TURN_ITEM_PREVIEW_BASE_KEYS = [
+  "id",
+  "threadId",
+  "runId",
+  "nodeId",
+  "providerThreadId",
+  "providerTurnId",
+  "nativeItemRef",
+  "parentItemId",
+  "ordinal",
+  "status",
+  "title",
+  "startedAt",
+  "completedAt",
+  "updatedAt",
+  "toolNonExecutionKind",
+  "toolSurface",
+  "toolIcon",
+  "toolSource",
+] as const satisfies ReadonlyArray<keyof OrchestrationV2TurnItem>;
+
+function largeItemPreview(item: OrchestrationV2TurnItem, message: string): OrchestrationV2TurnItem {
+  // Input and interrupt types participate in visibility and turn boundaries.
+  if (item.type === "user_message") {
+    const { context: _context, ...preview } = item;
+    return {
+      ...preview,
+      attachments: [],
+      text: truncateDetail(item.text, MAX_MESSAGE_TEXT_BYTES) ?? "",
+      detailOmitted: true,
+    };
+  }
+  if (item.type === "run_interrupt_request" || item.type === "run_interrupt_result")
+    return { ...item, message: truncateDetail(item.message) ?? "", detailOmitted: true };
+  if (!GENERIC_ITEM_PREVIEW_TYPES.some((type) => type === item.type)) return item;
+  return {
+    ...Object.fromEntries(TURN_ITEM_PREVIEW_BASE_KEYS.map((key) => [key, item[key]])),
+    title: truncateDetail(item.title ?? undefined) ?? null,
+    type: "system_notice",
+    message,
+    previewOf: item.type,
+    detailOmitted: true,
+  } as OrchestrationV2TurnItem;
+}
 
 function truncateDetail(
   value: string | undefined,
@@ -152,7 +217,7 @@ function capCheckpointItemFiles(item: OrchestrationV2TurnItem): OrchestrationV2T
   return item.type === "checkpoint" ? capCheckpointFiles(item) : item;
 }
 
-export function projectTurnItemForWire(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+function compactTurnItem(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
   switch (item.type) {
     case "checkpoint":
       return capCheckpointFiles(item);
@@ -162,6 +227,7 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
     }
     case "command_execution": {
       const { output, ...projected } = item;
+      const input = truncateDetail(item.input) ?? "";
       // A successful search can print "ENOENT" or "exit code 2", so output text
       // decides only when the provider reported no exit code.
       const failed =
@@ -172,6 +238,8 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
           : item.exitCode !== 0;
       return {
         ...projected,
+        input,
+        ...(input !== item.input ? { detailOmitted: true } : {}),
         ...(failed ? { outputIndicatesFailure: true } : {}),
         ...(output?.trim() ? { outputOmitted: true } : {}),
       };
@@ -199,9 +267,56 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
         ...(hasDynamicValue(rawOutput) ? { outputOmitted: true } : {}),
       };
     }
+    case "user_message":
+    case "assistant_message":
+    case "reasoning": {
+      const text = truncateDetail(item.text, MAX_MESSAGE_TEXT_BYTES) ?? "";
+      return text === item.text ? item : { ...item, text, detailOmitted: true };
+    }
+    case "run_interrupt_request":
+    case "run_interrupt_result":
+    case "system_notice": {
+      const message = truncateDetail(item.message) ?? "";
+      return message === item.message ? item : { ...item, message, detailOmitted: true };
+    }
+    case "proposed_plan": {
+      const markdown = truncateDetail(item.markdown) ?? "";
+      return markdown === item.markdown ? item : { ...item, markdown, detailOmitted: true };
+    }
+    case "todo_list":
+      return Buffer.byteLength(JSON.stringify(item), "utf8") <= MAX_DETAIL_STRING_BYTES
+        ? item
+        : {
+            ...item,
+            steps: [],
+            explanation: "Task details are available on demand.",
+            detailOmitted: true,
+          };
     default:
       return item;
   }
+}
+
+export function projectTurnItemForWire(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+  const cached = wireItemProjections.get(item);
+  if (cached !== undefined) return cached;
+  const projected = compactTurnItem(item);
+  // Message text has its own cap; the item cap bounds everything around it.
+  const measured =
+    projected.type === "user_message" ||
+    projected.type === "assistant_message" ||
+    projected.type === "reasoning"
+      ? { ...projected, text: "" }
+      : projected;
+  const bounded =
+    Buffer.byteLength(JSON.stringify(measured), "utf8") <= MAX_WIRE_ITEM_BYTES
+      ? projected
+      : largeItemPreview(
+          projected,
+          `Large ${item.type.replaceAll("_", " ")} item. Content truncated for transport.`,
+        );
+  wireItemProjections.set(item, bounded);
+  return bounded;
 }
 
 function hasDynamicValue(value: unknown): boolean {
@@ -239,8 +354,14 @@ function boundToolOutput(output: unknown): unknown {
       ];
 }
 
-export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+function compactTurnItemDetail(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
   switch (item.type) {
+    case "user_message":
+    case "assistant_message":
+    case "reasoning":
+      return { ...item, text: truncateDetail(item.text, MAX_ON_DEMAND_BYTES) ?? "" };
+    case "proposed_plan":
+      return { ...item, markdown: truncateDetail(item.markdown, MAX_ON_DEMAND_BYTES) ?? "" };
     case "command_execution":
       return {
         ...item,
@@ -281,11 +402,34 @@ export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): Orchest
   }
 }
 
+export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+  const projected = compactTurnItemDetail(item);
+  const json = JSON.stringify(projected);
+  return Buffer.byteLength(json, "utf8") <= MAX_ON_DEMAND_ITEM_BYTES
+    ? projected
+    : largeItemPreview(
+        item,
+        `Large ${item.type.replaceAll("_", " ")} item details:\n${truncateDetail(json, MAX_ON_DEMAND_BYTES / 2 - 8192)}`,
+      );
+}
+
 export function projectContextHandoffForWire(
   handoff: OrchestrationV2ContextHandoff,
 ): OrchestrationV2ContextHandoff {
   const { history: _history, delivery: _delivery, ...projected } = handoff;
   return { ...projected, summaryText: "" };
+}
+
+export function projectPlanForWire(plan: OrchestrationV2PlanArtifact): OrchestrationV2PlanArtifact {
+  if (Buffer.byteLength(JSON.stringify(plan), "utf8") <= MAX_DETAIL_STRING_BYTES) return plan;
+  return plan.kind === "proposed_plan"
+    ? { ...plan, markdown: truncateDetail(plan.markdown, 8_192) ?? "", detailOmitted: true }
+    : {
+        ...plan,
+        steps: [],
+        explanation: "Task details are available on demand.",
+        detailOmitted: true,
+      };
 }
 
 export function projectThreadProjectionForWire(
@@ -303,6 +447,7 @@ export function projectThreadProjectionForWire(
   return {
     ...projection,
     checkpoints: projection.checkpoints.map(capCheckpointFiles),
+    plans: projection.plans.map(projectPlanForWire),
     contextHandoffs: projection.contextHandoffs.map(projectContextHandoffForWire),
     turnItems: projection.turnItems.map(project),
     visibleTurnItems: projection.visibleTurnItems.map((row) => ({
@@ -315,13 +460,20 @@ export function projectThreadProjectionForWire(
 export function projectDomainEventForWire(
   event: OrchestrationV2DomainEvent,
 ): OrchestrationV2DomainEvent {
-  return event.type === "turn-item.updated"
-    ? { ...event, payload: projectTurnItemForWire(event.payload) }
-    : event.type === "context-handoff.updated"
-      ? { ...event, payload: projectContextHandoffForWire(event.payload) }
-      : event.type === "checkpoint.captured"
-        ? { ...event, payload: capCheckpointFiles(event.payload) }
-        : event;
+  const cached = wireEventProjections.get(event);
+  if (cached !== undefined) return cached;
+  const projected =
+    event.type === "turn-item.updated"
+      ? { ...event, payload: projectTurnItemForWire(event.payload) }
+      : event.type === "plan.updated"
+        ? { ...event, payload: projectPlanForWire(event.payload) }
+        : event.type === "context-handoff.updated"
+          ? { ...event, payload: projectContextHandoffForWire(event.payload) }
+          : event.type === "checkpoint.captured"
+            ? { ...event, payload: capCheckpointFiles(event.payload) }
+            : event;
+  wireEventProjections.set(event, projected);
+  return projected;
 }
 
 // Keyed on the stored event PubSub hands every subscriber, so all of them share one projection

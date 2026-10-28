@@ -1,4 +1,8 @@
-import type { AssetResource, OrchestrationV2TurnItem } from "@t3tools/contracts";
+import type {
+  AssetResource,
+  OrchestrationV2PlanArtifact,
+  OrchestrationV2TurnItem,
+} from "@t3tools/contracts";
 import { toolOutputImageBlocks, toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
 
@@ -152,6 +156,9 @@ export function turnItemDetailRevision(item: OrchestrationV2TurnItem): string {
 
 export function turnItemNeedsDetailFetch(item: OrchestrationV2TurnItem): boolean {
   switch (item.type) {
+    case "proposed_plan":
+    case "todo_list":
+      return item.detailOmitted === true;
     case "command_execution":
       return item.outputOmitted === true;
     case "dynamic_tool":
@@ -159,6 +166,25 @@ export function turnItemNeedsDetailFetch(item: OrchestrationV2TurnItem): boolean
     default:
       return false;
   }
+}
+
+export function restorePlanItemDetail(
+  item: OrchestrationV2TurnItem,
+  plan: OrchestrationV2PlanArtifact | null | undefined,
+): OrchestrationV2TurnItem {
+  if (item.type === "proposed_plan" && plan?.kind === "proposed_plan" && item.planId === plan.id) {
+    return { ...item, markdown: plan.markdown, detailOmitted: false };
+  }
+  if (item.type === "todo_list" && plan?.kind === "todo_list" && item.planId === plan.id) {
+    const { explanation: _previewExplanation, ...base } = item;
+    return {
+      ...base,
+      steps: plan.steps,
+      ...(plan.explanation === undefined ? {} : { explanation: plan.explanation }),
+      detailOmitted: false,
+    };
+  }
+  return item;
 }
 
 function commandOutputText(output: string): string {

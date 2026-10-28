@@ -13,8 +13,13 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
   type OrchestrationV2DomainEvent,
+  PlanId,
 } from "@t3tools/contracts";
+import { derivePendingThreadRequests } from "../../../../packages/client-runtime/src/state/threadRequests.ts";
+import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -24,6 +29,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
+import { buildBoundedThreadStreamSnapshot } from "./ThreadStream.ts";
 
 const threadId = ThreadId.make("thread:control-reads");
 const providerThreadId = ProviderThreadId.make("provider-thread:control-reads");
@@ -191,6 +197,261 @@ const storageCases = [
     storeLayer: ProjectionStore.layer.pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
   },
 ];
+
+it.effect.each(storageCases)(
+  "$storage: bounds accumulated active plans and preserves the full plan for explicit reads",
+  ({ storeLayer }) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      yield* Effect.forEach(fixtureEvents(now), (event) => store.apply(event), { discard: true });
+      const text = "Complete plan contents.\n".repeat(100_000);
+      for (let index = 0; index < 40; index++) {
+        yield* store.apply({
+          id: EventId.make(`control:plan:${index}`),
+          type: "plan.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            id: PlanId.make(`plan:${index}`),
+            threadId,
+            runId,
+            nodeId,
+            kind: "proposed_plan",
+            status: "active",
+            markdown: index === 39 ? text : `Plan ${index}`,
+          },
+        });
+      }
+      const snapshot = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 });
+      const bounded = buildBoundedThreadStreamSnapshot(snapshot);
+      assert.lengthOf(bounded.projection.plans, 1);
+      assert.equal(bounded.projection.plans[0]?.id, PlanId.make("plan:39"));
+      assert.isTrue(bounded.projection.plans[0]?.detailOmitted);
+      assert.isBelow(Buffer.byteLength(JSON.stringify(bounded)), 1_048_576);
+      const complete = yield* store.getPlan(threadId, PlanId.make("plan:39"));
+      assert.equal(complete?.kind === "proposed_plan" && complete.markdown, text);
+      assert.lengthOf((yield* store.getThreadRecords(threadId, ["plans"])).plans, 40);
+      assert.isUndefined(yield* store.getPlan(threadId, PlanId.make("missing")));
+    }).pipe(Effect.provide(storeLayer)),
+);
+
+it.effect.each(storageCases)(
+  "$storage: retains a pending secret form and live background work beyond the history window",
+  ({ storeLayer }) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const events = fixtureEvents(now);
+      yield* Effect.forEach(events, (event) => store.apply(event), { discard: true });
+      const base = {
+        threadId,
+        runId,
+        nodeId,
+        providerThreadId,
+        providerTurnId,
+        nativeItemRef: null,
+        parentItemId: null,
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+      };
+      const secret = {
+        ...base,
+        id: TurnItemId.make("control:secret"),
+        ordinal: 0,
+        type: "secret_request" as const,
+        status: "waiting" as const,
+        label: "Signing key",
+        reason: "Authenticate webhook events",
+        secretStatus: "pending" as const,
+      };
+      const work = {
+        ...base,
+        id: TurnItemId.make("control:background"),
+        ordinal: 1,
+        type: "command_execution" as const,
+        status: "running" as const,
+        input: "npm test",
+      };
+      for (const item of [secret, work]) {
+        yield* store.apply({
+          id: EventId.make(`event:${item.id}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: item,
+        });
+      }
+      for (let ordinal = 2; ordinal < 102; ordinal++) {
+        yield* store.apply({
+          id: EventId.make(`event:recent:${ordinal}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            ...work,
+            id: TurnItemId.make(`control:recent:${ordinal}`),
+            ordinal,
+            status: "completed",
+            completedAt: now,
+          },
+        });
+      }
+      for (const compactTurnItems of [false, true]) {
+        const snapshot = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 });
+        const frame = buildBoundedThreadStreamSnapshot({ ...snapshot, compactTurnItems });
+        const projection = boundedSnapshotProjection(frame);
+        assert.isTrue(frame.hasMoreHistory);
+        assert.isTrue(projection.visibleTurnItems.some((row) => row.sourceItemId === secret.id));
+        assert.isTrue(projection.turnItems.some((item) => item.id === work.id));
+        assert.deepEqual(
+          derivePendingBackgroundWork({
+            latestRun: { id: runId, ordinal: 1, status: "completed" },
+            providerThreads: [],
+            turnItems: projection.turnItems,
+          }).map((task) => task.taskId),
+          [work.id],
+        );
+      }
+      for (const item of [
+        {
+          ...secret,
+          secretStatus: "declined" as const,
+          status: "completed" as const,
+          completedAt: now,
+        },
+        { ...work, status: "completed" as const, completedAt: now },
+      ]) {
+        yield* store.apply({
+          id: EventId.make(`event:resolved:${item.id}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: item,
+        });
+      }
+      const resolved = buildBoundedThreadStreamSnapshot(
+        yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 }),
+      );
+      assert.isFalse(
+        resolved.projection.turnItems.some((item) => item.id === secret.id || item.id === work.id),
+      );
+    }).pipe(Effect.provide(storeLayer)),
+);
+
+it.effect.each(
+  storageCases.flatMap((storage) =>
+    (["message", "live"] as const).map((responseMode) => ({ ...storage, responseMode })),
+  ),
+)(
+  "$storage: keeps older $responseMode questions answerable outside the recent history window",
+  ({ storeLayer, responseMode }) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      yield* Effect.forEach(fixtureEvents(now), (event) => store.apply(event), { discard: true });
+      const request = {
+        id: requestId,
+        nodeId,
+        providerTurnId,
+        nativeRequestRef: null,
+        kind: "user_input" as const,
+        status: "pending" as const,
+        responseCapability:
+          responseMode === "message"
+            ? { type: "message" as const }
+            : { type: "live" as const, providerSessionId },
+        createdAt: now,
+        resolvedAt: null,
+      };
+      yield* store.apply({
+        id: EventId.make("control:pending-question"),
+        type: "runtime-request.updated",
+        threadId,
+        occurredAt: now,
+        payload: request,
+      });
+      const question = {
+        id: TurnItemId.make("item:control-question"),
+        threadId,
+        runId,
+        nodeId,
+        providerThreadId,
+        providerTurnId,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "waiting" as const,
+        title: null,
+        startedAt: now,
+        completedAt: null,
+        updatedAt: now,
+        type: "user_input_request" as const,
+        requestId,
+        ...(responseMode === "message" ? { responseMode } : {}),
+        questions: [{ id: "question", header: "Choice", question: "Which approach?", options: [] }],
+      };
+      yield* store.apply({
+        id: EventId.make("control:question-item"),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: now,
+        payload: question,
+      });
+      for (let ordinal = 1; ordinal <= 100; ordinal++) {
+        yield* store.apply({
+          id: EventId.make(`control:later-item:${ordinal}`),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: now,
+          payload: {
+            ...question,
+            id: TurnItemId.make(`item:later:${ordinal}`),
+            ordinal,
+            type: "command_execution",
+            status: "completed",
+            completedAt: now,
+            input: "echo later activity",
+            output: "done",
+          },
+        });
+      }
+
+      for (const compactTurnItems of [false, true]) {
+        const snapshot = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 });
+        const bounded = buildBoundedThreadStreamSnapshot({ ...snapshot, compactTurnItems });
+        assert.isTrue(bounded.hasMoreHistory);
+        assert.lengthOf(bounded.projection.visibleTurnItems, 75);
+        assert.isFalse(
+          bounded.projection.visibleTurnItems.some((row) => row.sourceItemId === question.id),
+        );
+        assert.deepEqual(derivePendingThreadRequests(bounded.projection).userInputs, [
+          {
+            requestId,
+            createdAt: DateTime.formatIso(now),
+            questions: question.questions.map((question) => ({ ...question, multiSelect: false })),
+            responseCapability: responseMode,
+            ...(responseMode === "message" ? { responseMode } : {}),
+            dismissible: responseMode === "message",
+          },
+        ]);
+      }
+
+      yield* store.apply({
+        id: EventId.make("control:question-resolved"),
+        type: "runtime-request.updated",
+        threadId,
+        occurredAt: now,
+        payload: { ...request, status: "resolved", resolvedAt: now },
+      });
+      const snapshot = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 77 });
+      const bounded = buildBoundedThreadStreamSnapshot(snapshot);
+      assert.isEmpty(derivePendingThreadRequests(bounded.projection).userInputs);
+      assert.isFalse(bounded.projection.turnItems.some((item) => item.id === question.id));
+    }).pipe(Effect.provide(storeLayer)),
+);
 
 it.effect.each(storageCases)(
   "$storage: finds the active root turn without an attempt reverse link",

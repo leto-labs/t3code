@@ -619,6 +619,9 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
         status: plan?.kind === "proposed_plan" ? plan.status : ("active" as const),
         createdAt,
         updatedAt: DateTime.formatIso(item.updatedAt),
+        sourceThreadId: row.sourceThreadId,
+        ...(item.detailOmitted ? { detailOmitted: true as const } : {}),
+        streaming: item.streaming,
       };
       entries.push({
         id: item.id,

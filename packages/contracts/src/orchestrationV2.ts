@@ -1378,6 +1378,8 @@ const OrchestrationV2PlanArtifactBaseFields = {
   nodeId: NodeId,
   status: Schema.Literals(["draft", "active", "completed", "superseded"]),
   detailInTurnItem: Schema.optional(Schema.Literal(true)),
+  detailOmitted: Schema.optional(Schema.Literal(true)),
+  revision: Schema.optional(Schema.String),
 } as const;
 
 export const OrchestrationV2PlanArtifact = Schema.Union([
@@ -1527,6 +1529,8 @@ const OrchestrationV2TurnItemBaseFields = {
       lastOrdinal: NonNegativeInt,
     }),
   ),
+  detailOmitted: Schema.optional(Schema.Boolean),
+  previewOf: Schema.optional(Schema.String),
   toolNonExecutionKind: Schema.optional(Schema.String),
   toolSurface: Schema.optional(ToolActivitySurface),
   toolIcon: Schema.optional(ToolActivityIcon),
@@ -3633,6 +3637,7 @@ export const ORCHESTRATION_V2_WS_METHODS = {
   stopWorkflow: "orchestration.stopWorkflow",
   forceStopThread: "orchestration.forceStopThread",
   getTurnItem: "orchestration.getTurnItem",
+  getPlan: "orchestration.getPlan",
   launchThread: "orchestration.launchThread",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
@@ -4190,6 +4195,17 @@ export const OrchestrationV2GetTurnItemResult = Schema.Struct({
 });
 export type OrchestrationV2GetTurnItemResult = typeof OrchestrationV2GetTurnItemResult.Type;
 
+export const OrchestrationV2GetPlanInput = Schema.Struct({
+  threadId: ThreadId,
+  planId: PlanId,
+  revision: Schema.optional(Schema.String),
+});
+
+export const OrchestrationV2GetPlanResult = Schema.Struct({
+  plan: Schema.NullOr(OrchestrationV2PlanArtifact),
+});
+export type OrchestrationV2GetPlanResult = typeof OrchestrationV2GetPlanResult.Type;
+
 const WORKFLOW_SCRIPT_ERROR_MESSAGES = {
   "invalid-path": "Workflow scripts must be absolute .js paths.",
   "root-unavailable": "Script root unavailable.",
@@ -4339,6 +4355,10 @@ export const OrchestrationV2RpcSchemas = {
   getTurnItem: {
     input: OrchestrationV2GetTurnItemInput,
     output: OrchestrationV2GetTurnItemResult,
+  },
+  getPlan: {
+    input: OrchestrationV2GetPlanInput,
+    output: OrchestrationV2GetPlanResult,
   },
   launchThread: {
     input: OrchestrationV2ThreadLaunchInput,

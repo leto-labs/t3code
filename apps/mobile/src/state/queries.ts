@@ -28,7 +28,10 @@ import { THREAD_SEARCH_QUERY_MAX_LENGTH } from "@t3tools/contracts";
 import { messageSearchTokens } from "@t3tools/shared/paletteSearch";
 import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
-import { turnItemDetailRevision } from "@t3tools/client-runtime/work-log/item-detail";
+import {
+  restorePlanItemDetail,
+  turnItemDetailRevision,
+} from "@t3tools/client-runtime/work-log/item-detail";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { useEffect, useMemo, useState } from "react";
@@ -461,8 +464,25 @@ export function useTurnItemDetail(
     readonly row: OrchestrationV2ProjectedTurnItem;
   } | null,
 ) {
-  return useEnvironmentQuery(
-    target === null
+  const item = target?.row.item;
+  const planId =
+    item?.detailOmitted && (item.type === "proposed_plan" || item.type === "todo_list")
+      ? item.planId
+      : null;
+  const plan = useEnvironmentQuery(
+    target === null || planId === null
+      ? null
+      : orchestrationEnvironment.plan({
+          environmentId: target.environmentId,
+          input: {
+            threadId: target.row.sourceThreadId,
+            planId,
+            revision: turnItemDetailRevision(target.row.item),
+          },
+        }),
+  );
+  const detail = useEnvironmentQuery(
+    target === null || planId !== null
       ? null
       : orchestrationEnvironment.turnItem({
           environmentId: target.environmentId,
@@ -473,4 +493,10 @@ export function useTurnItemDetail(
           },
         }),
   );
+  return planId === null
+    ? detail
+    : {
+        ...plan,
+        data: plan.data && item ? { item: restorePlanItemDetail(item, plan.data.plan) } : null,
+      };
 }

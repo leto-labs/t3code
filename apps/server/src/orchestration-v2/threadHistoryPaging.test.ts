@@ -25,6 +25,7 @@ import {
   selectRecentTimelineWindow,
   THREAD_HISTORY_PAGE_POLICY,
 } from "./threadHistoryPaging.ts";
+import { buildBoundedThreadStreamSnapshot } from "./ThreadStream.ts";
 import { projectThreadProjectionForWire } from "./WireProjection.ts";
 
 const NOW = DateTime.makeUnsafe("2026-06-20T00:00:00.000Z");
@@ -247,6 +248,21 @@ describe("threadHistoryPaging", () => {
       },
     };
     expect(deferWorkHistoryRows([...work, failed])).toHaveLength(152);
+  });
+
+  it("builds a resumable bounded socket snapshot frame", () => {
+    const projection = makeProjection(Array.from({ length: 90 }, (_, index) => makeRow(index)));
+    const item = buildBoundedThreadStreamSnapshot({
+      snapshotSequence: 23,
+      projection,
+    });
+
+    expect(item.kind).toBe("snapshot");
+    expect(item.snapshotSequence).toBe(23);
+    expect(item.projection.visibleTurnItems).toHaveLength(THREAD_HISTORY_PAGE_POLICY.maxItems);
+    expect(item.historyCursor).not.toBeNull();
+    expect(item.hasMoreHistory).toBe(true);
+    expect(item.latestLocalTurnOrdinal).toBe(90);
   });
 
   it("keeps a human turn whole up to the turn row budget and pages a longer one from inside", () => {
@@ -881,7 +897,7 @@ describe("threadHistoryPaging", () => {
     },
   );
 
-  it("preserves oversized actionable state", () => {
+  it("previews oversized actionable plans within the snapshot budget", () => {
     const projection = makeProjection([makeRow(0)]);
     const actionable = {
       ...projection,
@@ -899,8 +915,17 @@ describe("threadHistoryPaging", () => {
     } as unknown as typeof projection;
 
     const bounded = buildBoundedThreadProjection({ projection: actionable, snapshotSequence: 9 });
-
-    expect(bounded.projection.plans[0]).toEqual(actionable.plans[0]);
+    expect(bounded.projection.plans[0]).toMatchObject({
+      id: "plan-actionable",
+      status: "active",
+      detailOmitted: true,
+    });
+    expect(Buffer.byteLength(JSON.stringify(bounded.projection))).toBeLessThan(
+      THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+    );
+    expect(
+      actionable.plans[0]?.kind === "proposed_plan" && actionable.plans[0].markdown.length,
+    ).toBe(2_097_152);
     expect(bounded.projection.visibleTurnItems).toEqual(actionable.visibleTurnItems);
   });
 
@@ -944,6 +969,58 @@ describe("threadHistoryPaging", () => {
       expect(bounded.hasMoreHistory).toBe(false);
     },
   );
+
+  it("keeps current plans while leaving superseded active plans in stored history", () => {
+    const projection = makeProjection([makeRow(0)]);
+    const plans = Array.from({ length: 200 }, (_, index) => ({
+      id: `plan-${index}`,
+      threadId: THREAD,
+      runId: null,
+      nodeId: `node-${index}`,
+      status: "active",
+      kind: "proposed_plan",
+      markdown: `Plan ${index}`,
+    }));
+    const full = { ...projection, runs: [], plans } as unknown as typeof projection;
+    const bounded = buildBoundedThreadProjection({ projection: full, snapshotSequence: 9 });
+    expect(bounded.projection.plans.map((plan) => plan.id)).toEqual(["plan-199"]);
+    expect(full.plans).toHaveLength(200);
+    expect(full.plans.every((plan) => plan.status === "active")).toBe(true);
+  });
+
+  it("does not duplicate oversized historical task details beside their preview item", () => {
+    const item = {
+      ...makeRow(0).item,
+      type: "todo_list",
+      planId: "historical-tasks",
+      steps: [],
+      detailOmitted: true,
+    } as unknown as OrchestrationV2TurnItem;
+    const base = makeProjection([{ ...makeRow(0), item }]);
+    const projection = {
+      ...base,
+      plans: [
+        {
+          id: "historical-tasks",
+          threadId: THREAD,
+          runId: null,
+          nodeId: "historical-tasks-node",
+          status: "completed",
+          kind: "todo_list",
+          steps: [{ id: "task", text: "t".repeat(2_097_152), status: "completed" }],
+        },
+      ],
+    } as unknown as typeof base;
+    const bounded = buildBoundedThreadProjection({ projection, snapshotSequence: 9 });
+    expect(bounded.projection.plans[0]).toMatchObject({
+      steps: [],
+      detailInTurnItem: true,
+      status: "completed",
+    });
+    expect(Buffer.byteLength(JSON.stringify(bounded.projection))).toBeLessThan(
+      THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes,
+    );
+  });
 
   it("keeps paged historical plan detail in the turn item and only status in its artifact", () => {
     const detail = "Implement the historical plan exactly.\n".repeat(1_000);

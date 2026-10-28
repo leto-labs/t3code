@@ -9,6 +9,8 @@ import {
   AuthFilesystemWriteScope,
   type EnvironmentId,
   type ScopedThreadRef,
+  type PlanId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import {
   buildCollapsedProposedPlanPreviewMarkdown,
@@ -37,14 +39,20 @@ import { projectEnvironment } from "~/state/projects";
 import { useCopyToClipboard } from "~/hooks/useCopyToClipboard";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
+import { usePlanDetail } from "~/state/queries";
 
 export const ProposedPlanCard = memo(function ProposedPlanCard({
-  planMarkdown,
+  planMarkdown: previewMarkdown,
   environmentId,
   threadRef,
   cwd,
   workspaceRoot,
   findActive = false,
+  planId,
+  sourceThreadId,
+  detailOmitted = false,
+  streaming = false,
+  revision = "",
 }: {
   planMarkdown: string;
   environmentId: EnvironmentId;
@@ -52,8 +60,21 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   cwd: string | undefined;
   workspaceRoot: string | undefined;
   findActive?: boolean;
+  planId?: PlanId | undefined;
+  sourceThreadId?: ThreadId | undefined;
+  detailOmitted?: boolean | undefined;
+  streaming?: boolean | undefined;
+  revision?: string | undefined;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const detail = usePlanDetail(
+    detailOmitted && !streaming && (expanded || findActive) && planId && sourceThreadId
+      ? { environmentId, threadId: sourceThreadId, planId, revision }
+      : null,
+  );
+  const loaded = detail.data?.plan?.kind === "proposed_plan" ? detail.data.plan.markdown : null;
+  const planMarkdown = loaded ?? previewMarkdown;
+  const needsDetail = detailOmitted && loaded === null;
   const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
   const [lastSavePath, setLastSavePath] = useState("");
@@ -75,7 +96,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   });
   const title = proposedPlanTitle(planMarkdown) ?? "Proposed plan";
   const lineCount = planMarkdown.split("\n").length;
-  const canCollapse = planMarkdown.length > 900 || lineCount > 20;
+  const canCollapse = detailOmitted || planMarkdown.length > 900 || lineCount > 20;
   const displayedPlanMarkdown = stripDisplayedPlanMarkdown(planMarkdown);
   const collapsedPreview = canCollapse
     ? buildCollapsedProposedPlanPreviewMarkdown(planMarkdown, { maxLines: 10 })
@@ -174,13 +195,15 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
             <EllipsisIcon aria-hidden="true" className="size-4" />
           </MenuTrigger>
           <MenuPopup align="end">
-            <MenuItem onClick={handleCopyPlan}>
+            <MenuItem onClick={handleCopyPlan} disabled={needsDetail}>
               {isCopied ? "Copied!" : "Copy to clipboard"}
             </MenuItem>
-            <MenuItem onClick={handleDownload}>Download as markdown</MenuItem>
+            <MenuItem onClick={handleDownload} disabled={needsDetail}>
+              Download as markdown
+            </MenuItem>
             <MenuItem
               onClick={openSaveDialog}
-              disabled={!canWriteFiles || !workspaceRoot || isSavingToWorkspace}
+              disabled={needsDetail || !canWriteFiles || !workspaceRoot || isSavingToWorkspace}
             >
               Save to workspace
             </MenuItem>
@@ -188,6 +211,16 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
         </Menu>
       </div>
       <div className="mt-4">
+        {expanded && needsDetail ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            {detail.error ??
+              (streaming
+                ? "Waiting for the plan to finish…"
+                : detail.isPending
+                  ? "Loading complete plan…"
+                  : "Complete plan is unavailable.")}
+          </p>
+        ) : null}
         <div
           ref={revealRef}
           className={cn("relative", isCollapsed && "max-h-104 overflow-hidden")}
@@ -223,9 +256,18 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               size="sm"
               variant="outline"
               data-scroll-anchor-ignore
-              onClick={() => setExpanded((value) => !value)}
+              onClick={() => {
+                if (expanded && detail.error) detail.refresh();
+                else setExpanded((value) => !value);
+              }}
             >
-              {expanded ? "Collapse plan" : "Expand plan"}
+              {expanded && detail.error
+                ? "Retry loading plan"
+                : expanded
+                  ? "Collapse plan"
+                  : needsDetail
+                    ? "Load complete plan"
+                    : "Expand plan"}
             </Button>
           </div>
         ) : null}
