@@ -23,6 +23,30 @@ const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
 const mockPeerArgs = (path: string) => [path];
 
 it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
+  it.effect.each([0, 9])("reports process termination and rejects reuse after exit %s", (code) =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const handle = yield* spawner.spawn(
+        ChildProcess.make(process.execPath, [
+          "-e",
+          `process.stdin.once('data', () => process.exit(${code}))`,
+        ]),
+      );
+      const context = yield* Layer.build(CodexClient.layerChildProcess(handle));
+      const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
+        Effect.provide(context),
+      );
+      assert.isTrue(yield* client.isRunning);
+      yield* client.notify("initialized", undefined);
+      const error = yield* Effect.flip(client.awaitTermination);
+      assert.instanceOf(error, CodexError.CodexAppServerProcessExitedError);
+      if (error._tag === "CodexAppServerProcessExitedError") assert.equal(error.code, code);
+      assert.isFalse(yield* client.isRunning);
+      const retry = yield* Effect.flip(client.request("account/read", {}));
+      assert.strictEqual(retry, error);
+    }),
+  );
+
   const makeHandle = (env?: Record<string, string>) =>
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;

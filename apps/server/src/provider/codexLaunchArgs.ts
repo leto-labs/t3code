@@ -12,6 +12,9 @@ const codexLaunchArgv = (launchArgs?: string): ReadonlyArray<string> => tokenize
 export const codexAppServerArgs = (launchArgs?: string) => [
   "app-server",
   ...codexLaunchArgv(launchArgs),
+  // A provider switch must release the shared writer before another account resumes it.
+  "-c",
+  "thread_unload_delay_secs=0",
 ];
 
 export const codexExecLaunchArgs = (launchArgs?: string) => {

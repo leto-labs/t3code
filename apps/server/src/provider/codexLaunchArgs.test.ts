@@ -8,8 +8,34 @@ describe("codexAppServerArgs", () => {
   it("preserves escaped TOML quotes in config values", () => {
     NodeAssert.deepStrictEqual(
       codexAppServerArgs(String.raw`--config model=\"gpt-6.1-sol\" --strict-config`),
-      ["app-server", "--config", 'model="gpt-6.1-sol"', "--strict-config"],
+      [
+        "app-server",
+        "--config",
+        'model="gpt-6.1-sol"',
+        "--strict-config",
+        "-c",
+        "thread_unload_delay_secs=0",
+      ],
     );
+  });
+
+  it("returns the app-server command for empty launch args", () => {
+    NodeAssert.deepStrictEqual(codexAppServerArgs(""), [
+      "app-server",
+      "-c",
+      "thread_unload_delay_secs=0",
+    ]);
+  });
+
+  it("appends parsed launch args after app-server", () => {
+    NodeAssert.deepStrictEqual(codexAppServerArgs("--strict-config --enable foo"), [
+      "app-server",
+      "--strict-config",
+      "--enable",
+      "foo",
+      "-c",
+      "thread_unload_delay_secs=0",
+    ]);
   });
 });
 
