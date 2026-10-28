@@ -730,11 +730,13 @@ function makeManager(input?: {
     if (input?.seed !== undefined) {
       yield* input.seed.pipe(Effect.provideContext(stores), Effect.orDie);
     }
+    const context = yield* Layer.build(layerManager);
     const manager = yield* GitManager.make.pipe(
-      Effect.provide(layerManager),
+      Effect.provideContext(context),
       Effect.provideContext(stores),
     );
-    return { manager, providerCalls };
+    const settings = Context.get(context, ServerSettings.ServerSettingsService);
+    return { manager, providerCalls, settings };
   });
 }
 
@@ -892,6 +894,40 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         state: "open",
         updatedAt: null,
       });
+    }),
+  );
+
+  it.effect("status keeps the last known PR without a lookup when background refresh is off", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/status-refresh-off"]);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/status-refresh-off"]);
+      const { manager, providerCalls, settings } = yield* makeManager({
+        providerScenario: {
+          prListSequence: [
+            [
+              {
+                number: 16,
+                title: "Known PR",
+                url: "https://github.com/pingdotgg/codething-mvp/pull/16",
+                baseRefName: "main",
+                headRefName: "feature/status-refresh-off",
+              },
+            ],
+          ],
+        },
+      });
+
+      expect((yield* manager.status({ cwd: repoDir })).pr?.number).toBe(16);
+      const lookups = listed(providerCalls).length;
+      yield* settings.updateSettings({ backgroundPullRequestRefreshEnabled: false });
+      yield* manager.invalidateStatus(repoDir);
+
+      expect((yield* manager.status({ cwd: repoDir })).pr?.number).toBe(16);
+      expect(listed(providerCalls)).toHaveLength(lookups);
     }),
   );
 

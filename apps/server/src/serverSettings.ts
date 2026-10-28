@@ -287,6 +287,13 @@ export class ServerSettingsService extends Context.Service<
   ) => layerTest(overrides, managedPolicy);
 }
 
+/** Unreadable settings keep background pull request work on, the behavior before this setting. */
+export const backgroundPullRequestRefreshEnabled = (service: ServerSettingsService["Service"]) =>
+  service.getSettings.pipe(
+    Effect.map((settings) => settings.backgroundPullRequestRefreshEnabled),
+    Effect.orElseSucceed(() => true),
+  );
+
 const makeTest = Effect.fn("serverSettings.makeTest")(function* (
   overrides: DeepPartial<ServerSettings> = {},
   managedPolicy?: ManagedPolicySummary,

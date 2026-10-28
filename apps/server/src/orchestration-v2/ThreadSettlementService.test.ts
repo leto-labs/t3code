@@ -793,6 +793,34 @@ describe("ThreadSettlementServiceV2 worker", () => {
       }),
     ),
   );
+  it.effect(
+    "keeps inactivity settlement but skips network PR lookups when background refresh is off",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const old = makeThread("inactive");
+          const recent = makeThread("recent", {
+            branch: "feature",
+            latestUserMessageAt: DateTime.makeUnsafe(NOW),
+          });
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot([old, recent]),
+            settings: { ...DEFAULT_SERVER_SETTINGS, backgroundPullRequestRefreshEnabled: false },
+          });
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            assert.deepStrictEqual(yield* Ref.get(fixture.branchCalls), []);
+            assert.deepStrictEqual(yield* Ref.get(fixture.summaryCalls), []);
+            assert.deepStrictEqual(
+              (yield* Ref.get(fixture.commands)).map((c) => c.threadId),
+              [old.id],
+            );
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
+  );
   it.effect("settles a merged pull request stored only in the thread links", () =>
     Effect.scoped(
       Effect.gen(function* () {
