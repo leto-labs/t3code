@@ -46,6 +46,7 @@ import {
   ClockIcon,
   GitBranchIcon,
   MessageCircleQuestionIcon,
+  PhoneIcon,
   PinIcon,
   PinOffIcon,
   ShieldQuestionIcon,
@@ -114,6 +115,7 @@ import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { getTriggerDisplayModelName } from "../chat/providerIconUtils";
 import { shouldShowInstanceBadge, type ProviderInstanceEntry } from "../../providerInstances";
 import { useThreadRunningTerminalIds } from "../../state/terminalSessions";
+import { useLiveVoiceCall } from "../../state/liveVoice";
 import { InlineButton } from "../ui/button";
 import { Kbd } from "../ui/kbd";
 import { Menu, MenuItem, MenuItemDetail, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
@@ -665,6 +667,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const threadRef = scopeThreadRef(thread.environmentId, thread.id);
   const threadKey = scopedThreadKey(threadRef);
   const canOperateThread = useEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope);
+  const liveVoiceCall = useLiveVoiceCall(thread.environmentId, thread.id);
   const { leaseLiveStatus, rowRef: leaseRowRef } = useSidebarRowSubscriptionLease(props.isActive);
   const { revealRef } = props;
   const rowRef = (row: HTMLElement | null) => {
@@ -1482,6 +1485,23 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                       snoozeMenuOpen && "pointer-events-none absolute right-0 opacity-0",
                     )}
                   >
+                    {liveVoiceCall === null ? null : (
+                      <span
+                        className={cn(
+                          "mr-1 inline-flex items-center gap-1 font-medium",
+                          liveVoiceCall.state === "held"
+                            ? "text-warning-foreground"
+                            : "text-success",
+                        )}
+                      >
+                        <PhoneIcon aria-hidden className="size-3.5 shrink-0" />
+                        {liveVoiceCall.state === "held"
+                          ? liveVoiceCall.responseWaiting
+                            ? "Response waiting"
+                            : "On hold"
+                          : "On call"}
+                      </span>
+                    )}
                     {topStatus ? (
                       isWokeStatus ? (
                         <Tooltip>

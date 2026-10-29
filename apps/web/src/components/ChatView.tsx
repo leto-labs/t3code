@@ -911,8 +911,11 @@ export default function ChatView(props: ChatViewProps) {
   const [, setThreadErrorBannerDismissTick] = useState(0);
   const threadErrorIsServerRuntimeError =
     localServerError === null && visibleThreadError === serverRuntime?.lastError;
-  const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
-    .settings.defaultRuntimeMode;
+  const projectSettings = resolveProjectSettings(
+    settings,
+    activeThread?.projectId ?? null,
+  ).settings;
+  const defaultRuntimeMode = projectSettings.defaultRuntimeMode;
   const runtimeMode =
     composerRuntimeMode ??
     (isServerThread ? activeThread?.runtimeMode : undefined) ??
@@ -2845,7 +2848,7 @@ export default function ChatView(props: ChatViewProps) {
     scrollToEnd,
     setThreadError,
   });
-  const { onSend } = useComposerSend({
+  const { onSend, launchDraftForVoice } = useComposerSend({
     environmentId,
     routeThreadKey,
     currentRouteThreadKeyRef,
@@ -2926,6 +2929,7 @@ export default function ChatView(props: ChatViewProps) {
   };
   const onWorktreeSetupWorkLocallyStable = useStableCallback(onWorktreeSetupWorkLocally);
   const onComposerSendStable = useStableCallback(onSend);
+  const launchDraftForVoiceStable = useStableCallback(launchDraftForVoice);
   const sendPreviewAnnotation = (
     annotation: PreviewAnnotationPayload,
     image: ComposerImageAttachment | null,
@@ -3553,6 +3557,7 @@ export default function ChatView(props: ChatViewProps) {
                                 activeThread={activeThread}
                                 activeThreadRuns={serverProjection?.runs ?? EMPTY_RUNS}
                                 promptHistoryEntries={timelineEntries}
+                                isServerThread={isServerThread}
                                 forceExpandedOnMobile={
                                   forceExpandedMobileComposer && isDraftHeroState
                                 }
@@ -3628,6 +3633,8 @@ export default function ChatView(props: ChatViewProps) {
                                 }
                                 activeThreadModelSelection={activeThread?.modelSelection}
                                 activeProjectId={activeProject?.id ?? null}
+                                liveVoice={projectSettings.defaultLiveVoice}
+                                onEnsureLiveVoiceThread={launchDraftForVoiceStable}
                                 projectName={activeProject?.title}
                                 compactThreadUnavailable={compactThreadUnavailable}
                                 compactDisabled={compactDisabled}

@@ -79,6 +79,8 @@ Open **Settings → Worktrees → Cleanup** and turn on automatic worktree clean
 
 Yes. On iPhone and Android, dictation uses on-device speech by default; you can opt in to a paired environment instead. Web and desktop require you to choose an environment first. The transcript goes into your draft for review. See [Voice input](./voice-input.md).
 
+On web and desktop you can instead talk to Codex in a voice call on a thread. [Voice calls with Codex](./composer.md#voice-calls-with-codex)
+
 ## Does it work on Windows, Mac, and Linux?
 
 Yes, all three. Desktop app, CLI, the works. One catch: there is no `t3` binary for Intel Macs, so use the desktop app there. Windows folks can also run agents inside WSL. [Install](./install.md)

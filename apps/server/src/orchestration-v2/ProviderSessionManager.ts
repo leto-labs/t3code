@@ -165,6 +165,12 @@ export interface ProviderSessionManagerV2Shape {
     ProviderAdapter.ProviderAdapterV2Error | ProviderAdapterRegistry.ProviderAdapterRegistryV2Error
   >;
   readonly shutdown: Effect.Effect<void>;
+  /** Holds the session open and its thread loaded until the scope closes, like a running turn. */
+  readonly keepAlive: (input: {
+    readonly providerSessionId: ProviderSessionId;
+    readonly providerThreadId: ProviderThreadId;
+    readonly key: string;
+  }) => Effect.Effect<void, never, Scope.Scope>;
   readonly open: (input: {
     readonly threadId: ThreadId;
     readonly projectId?: ProjectId;
@@ -1554,6 +1560,17 @@ export const layerWithOptions = (
         providerThreadId: ProviderThreadId,
         runOrdinal: number,
       ) =>
+        releaseBusyKey(
+          providerSessionId,
+          providerThreadId,
+          busyTurnKey(providerThreadId, runOrdinal),
+        );
+
+      const releaseBusyKey = (
+        providerSessionId: ProviderSessionId,
+        providerThreadId: ProviderThreadId,
+        turnKey: string,
+      ) =>
         withActivityError(
           providerSessionId,
           Effect.gen(function* () {
@@ -1564,7 +1581,7 @@ export const layerWithOptions = (
                 return current;
               }
               const busyTurns = new Set(entry.busyTurns);
-              busyTurns.delete(busyTurnKey(providerThreadId, runOrdinal));
+              busyTurns.delete(turnKey);
               const updated = new Map(current);
               updated.set(key, {
                 ...entry,
@@ -2419,6 +2436,24 @@ export const layerWithOptions = (
               ),
             ),
         shutdown,
+        keepAlive: (input) => {
+          const turnKey = `${busyTurnPrefix(input.providerThreadId)}${input.key}`;
+          return Effect.acquireRelease(
+            Ref.get(sessions).pipe(
+              Effect.flatMap((current) => {
+                const entry = current.get(sessionKey(input.providerSessionId));
+                return entry === undefined
+                  ? Effect.void
+                  : markBusy(input.providerSessionId, turnKey, entry.runtime);
+              }),
+              Effect.ignore,
+            ),
+            () =>
+              releaseBusyKey(input.providerSessionId, input.providerThreadId, turnKey).pipe(
+                Effect.ignore,
+              ),
+          );
+        },
         open: (input) =>
           sessionOpen.withLock(
             input.providerSessionId,

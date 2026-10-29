@@ -84,6 +84,14 @@ import {
 } from "./auth.ts";
 import { ClientActivityReportInput } from "./background.ts";
 import {
+  LiveVoiceConfigureInput,
+  LiveVoiceEvent,
+  LiveVoiceRpcError,
+  LiveVoiceStartInput,
+  LiveVoiceStartResult,
+  LiveVoiceThreadInput,
+} from "./liveVoice.ts";
+import {
   FilesystemGetMetadataInput,
   FilesystemGetMetadataResult,
   FilesystemBrowseInput,
@@ -413,6 +421,11 @@ import { VcsError } from "./vcs.ts";
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
 
 export const WS_METHODS = {
+  liveVoicePrepare: "liveVoice.prepare",
+  liveVoiceConfigure: "liveVoice.configure",
+  liveVoiceStart: "liveVoice.start",
+  liveVoiceStop: "liveVoice.stop",
+  liveVoiceSubscribe: "liveVoice.subscribe",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -1492,6 +1505,34 @@ const WsVcsRefreshBranchRpc = Rpc.make(WS_METHODS.vcsRefreshBranch, {
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
+const LiveVoiceRpcFailure = Schema.Union([LiveVoiceRpcError, EnvironmentAuthorizationError]);
+const WsLiveVoicePrepareRpc = Rpc.make(WS_METHODS.liveVoicePrepare, {
+  payload: LiveVoiceThreadInput,
+  success: Schema.Struct({ prepared: Schema.Boolean }),
+  error: LiveVoiceRpcFailure,
+});
+const WsLiveVoiceConfigureRpc = Rpc.make(WS_METHODS.liveVoiceConfigure, {
+  payload: LiveVoiceConfigureInput,
+  success: Schema.Struct({ configured: Schema.Boolean }),
+  error: LiveVoiceRpcFailure,
+});
+const WsLiveVoiceStartRpc = Rpc.make(WS_METHODS.liveVoiceStart, {
+  payload: LiveVoiceStartInput,
+  success: LiveVoiceStartResult,
+  error: LiveVoiceRpcFailure,
+});
+const WsLiveVoiceStopRpc = Rpc.make(WS_METHODS.liveVoiceStop, {
+  payload: LiveVoiceThreadInput,
+  success: Schema.Struct({ stopped: Schema.Boolean }),
+  error: LiveVoiceRpcFailure,
+});
+const WsLiveVoiceSubscribeRpc = Rpc.make(WS_METHODS.liveVoiceSubscribe, {
+  payload: Schema.Struct({}),
+  success: LiveVoiceEvent,
+  stream: true,
+  error: EnvironmentAuthorizationError,
+});
+
 const WsSubscribeVcsStatusRpc = Rpc.make(WS_METHODS.subscribeVcsStatus, {
   payload: VcsStatusSubscriptionInput,
   success: VcsStatusStreamEvent,
@@ -2213,6 +2254,11 @@ export const WsRpcGroup = RpcGroup.make(
   WsMcpAppsReadResourceRpc,
   WsMcpAppsUpdateModelContextRpc,
   WsProviderUploadFeedbackRpc,
+  WsLiveVoicePrepareRpc,
+  WsLiveVoiceConfigureRpc,
+  WsLiveVoiceStartRpc,
+  WsLiveVoiceStopRpc,
+  WsLiveVoiceSubscribeRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeVcsBranchRpc,
   WsVcsRefreshBranchRpc,

@@ -74,6 +74,20 @@ describe("RPC authorization scopes", () => {
     }
   });
 
+  it("lets read-only clients follow voice calls but not start or end them", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.liveVoiceSubscribe)).toBe(
+      AuthOrchestrationReadScope,
+    );
+    for (const method of [
+      WS_METHODS.liveVoicePrepare,
+      WS_METHODS.liveVoiceConfigure,
+      WS_METHODS.liveVoiceStart,
+      WS_METHODS.liveVoiceStop,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
+
   it("rejects unknown RPC method names", () => {
     for (const method of ["server.notRegistered", "toString", "constructor"]) {
       expect(() => requiredScopeForRpcMethod(method)).toThrow(

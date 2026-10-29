@@ -15,6 +15,14 @@
       "types": "./src/zip/zipDirectory.ts",
       "default": "./src/zip/zipDirectory.ts"
     },
+    "./live-voice": {
+      "types": "./src/liveVoice/registry.ts",
+      "default": "./src/liveVoice/registry.ts"
+    },
+    "./state/live-voice": {
+      "types": "./src/state/liveVoice.ts",
+      "default": "./src/state/liveVoice.ts"
+    },
     "./workspace-basename-lookup": {
       "types": "./src/workspaceBasenameLookup.ts",
       "default": "./src/workspaceBasenameLookup.ts"

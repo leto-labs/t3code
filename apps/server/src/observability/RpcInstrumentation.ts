@@ -230,6 +230,11 @@ const RPC_AGGREGATES = {
   [WS_METHODS.subscribeServerConfig]: "server",
   [WS_METHODS.subscribeServerLifecycle]: "server",
   [WS_METHODS.subscribeAuthAccess]: "auth",
+  [WS_METHODS.liveVoicePrepare]: "voice",
+  [WS_METHODS.liveVoiceConfigure]: "voice",
+  [WS_METHODS.liveVoiceStart]: "voice",
+  [WS_METHODS.liveVoiceStop]: "voice",
+  [WS_METHODS.liveVoiceSubscribe]: "voice",
 } as const satisfies Readonly<Record<WsRpcMethod, string>>;
 
 const RPC_SPAN_PREFIX = "ws.rpc";

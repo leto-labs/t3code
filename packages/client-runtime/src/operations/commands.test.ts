@@ -40,6 +40,7 @@ import {
   interruptThreadTurn,
   revertThreadCheckpoint,
   resumeThreadQueue,
+  launchThread,
   startThreadTurn,
 } from "./commands.ts";
 
@@ -254,6 +255,41 @@ describe("V2 environment commands", () => {
           branch: "feature",
         },
       });
+    }).pipe(Effect.provide(layerTestRandom)),
+  );
+
+  it.effect("launches a draft into a new worktree without sending a message", () =>
+    Effect.gen(function* () {
+      const launches: OrchestrationV2ThreadLaunchInput[] = [];
+      const supervisor = yield* makeSupervisor({ commands: [], projects: [], launches });
+
+      yield* launchThread({
+        commandId: CommandId.make("launch-for-voice"),
+        threadId: v2ThreadId,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        bootstrap: {
+          createThread: {
+            projectId: ProjectId.make("project-1"),
+            title: "Voice call",
+            modelSelection: v2Projection.thread.modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: "main",
+            worktreePath: null,
+            createdAt: "2026-06-20T00:00:00.000Z",
+          },
+          prepareWorktree: { projectCwd: "/workspace/project", baseBranch: "main" },
+          runSetupScript: true,
+        },
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+
+      expect(launches[0]).toMatchObject({
+        threadId: v2ThreadId,
+        title: "Voice call",
+        workspaceStrategy: { type: "worktree", baseRef: "main" },
+      });
+      expect(launches[0]).not.toHaveProperty("initialMessage");
     }).pipe(Effect.provide(layerTestRandom)),
   );
 
