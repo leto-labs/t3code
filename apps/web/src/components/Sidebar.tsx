@@ -161,6 +161,8 @@ import { environmentProjects } from "../state/projects";
 import { threadEnvironment } from "../state/threads";
 import { useOlderSettledShelf, useOlderSettledShelfGrowth } from "../state/olderSettledShelf";
 import { useThreadSearch } from "../state/queries";
+import { useLiveVoiceCalls } from "../state/liveVoice";
+import { liveVoiceKey } from "@t3tools/client-runtime/live-voice";
 import { threadTriagePermitted, useOrchestrationCommand } from "../state/use-orchestration-command";
 import { readEnvironmentScope, useEnvironmentScope } from "../state/session";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -218,6 +220,7 @@ import {
   useThreadJumpHintsVisible,
   type SidebarListItem,
   type SidebarSection,
+  promoteLiveCallThreads,
 } from "./Sidebar.logic";
 import {
   createSidebarCollisionDetection,
@@ -508,8 +511,14 @@ function useSidebarThreads(input: {
     clockKey: `${nowMinute}:${snoozeWakeClock}:${inboxReturnsVersion}`,
   });
 
-  const { pinnedThreads, activeThreads, workingThreads, snoozedThreads, settledThreads } =
-    partition;
+  const liveVoiceCalls = useLiveVoiceCalls();
+  const hasLiveCall = (thread: SidebarThreadSummary) =>
+    liveVoiceCalls.has(liveVoiceKey(thread.environmentId, thread.id));
+  const pinnedThreads = partition.pinnedThreads;
+  const activeThreads = promoteLiveCallThreads(partition.activeThreads, hasLiveCall);
+  const workingThreads = promoteLiveCallThreads(partition.workingThreads, hasLiveCall);
+  const snoozedThreads = promoteLiveCallThreads(partition.snoozedThreads, hasLiveCall);
+  const settledThreads = promoteLiveCallThreads(partition.settledThreads, hasLiveCall);
   // Older settled threads load in pages; the shelf lists them only as far as they are loaded.
   const olderSettledShelf = useOlderSettledShelf({
     scopes: olderSettledScopes([...serverConfigs.keys()], scopedProjectKeys),
@@ -583,6 +592,10 @@ function useSidebarThreads(input: {
   }
   return {
     ...partition,
+    activeThreads,
+    workingThreads,
+    snoozedThreads,
+    settledThreads,
     threads,
     workingShelfEnabled,
     searchableThreads: [

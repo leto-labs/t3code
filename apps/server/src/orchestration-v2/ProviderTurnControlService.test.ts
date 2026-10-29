@@ -212,6 +212,7 @@ function layerSessions(
     ProviderSessionManager.ProviderSessionManagerV2.of({
       validateModelSelection: () => Effect.void,
       shutdown: Effect.void,
+      keepAlive: () => Effect.void,
       open: () => Effect.die("unused open"),
       get: (providerSessionId) =>
         Effect.succeed(providerSessionId === liveSessionId ? Option.some(runtime) : Option.none()),

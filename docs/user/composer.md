@@ -114,6 +114,16 @@ On web and desktop, press `Cmd+S` (macOS) or `Ctrl+S` (Windows/Linux) to stash t
 
 Dictate into the composer with the microphone button or `mod+shift+d` (web and desktop). Audio stays on-device or goes only to an environment/provider you explicitly choose in **Settings → Voice**. See [Voice input](./voice-input.md) for setup, mobile dictation, and microphone priority.
 
+## Voice calls with Codex
+
+On web and desktop, the green phone button in a Codex thread's composer starts a voice call on that thread. On a new draft, it first creates the thread and its workspace the same way a first message would. Codex answers out loud. When you ask for real work, such as reading files or changing code, the call hands the request to the thread as a normal run and speaks the result. Finished subagents on the thread check in with the call too.
+
+- **Handoff settings**: While a call is on, the composer's provider, model, reasoning, permissions, and mode apply to the next handoff; the composer shows what that will be. A handoff that already started keeps its settings. Sending a typed message puts the call on hold until that turn ends, then resumes it.
+- **History**: Phrases appear in the thread as you speak and are saved once finished, so the call stays in the history and comes along if you switch providers. A call keeps running while you visit other threads, and the sidebar lists threads with calls first in their section.
+- **One call at a time**: Each environment has one call with your microphone and speaker. Starting or resuming another call puts the current one on hold: it stays connected and records what Codex says, the sidebar shows **Response waiting**, and **Resume** plays the recording before going live again. If the browser cannot record, hold only mutes.
+- **Reconnecting**: While the call's audio connection or T3 itself is reconnecting, the call shows **Reconnecting**; if the audio connection does not recover within a few seconds, the call ends and you can start it again.
+- **Requirements**: Calls need microphone access, and remote browsers need an HTTPS connection to T3 Code. Choose the voice in **Settings → Threads → New threads → Voice**; a project can override it.
+
 ## Queued messages
 
 Queued messages appear at the end of the thread (web/desktop) or above the composer (mobile). From a queued message you can:
