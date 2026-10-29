@@ -1,5 +1,7 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  LIVE_VOICE_NAMES,
+  type LiveVoiceName,
   type ModelSelection,
   type WorktreeSubmodules,
   managedRuntimeModeDenial,
@@ -48,6 +50,11 @@ import {
 } from "./useScopedSettings";
 
 const WORKTREE_SUBMODULES_OPTIONS = ["recursive", "top-level", "none"] as const;
+function isLiveVoiceName(value: string | null): value is LiveVoiceName {
+  return value !== null && (LIVE_VOICE_NAMES as readonly string[]).includes(value);
+}
+const liveVoiceLabel = (voice: LiveVoiceName) => voice[0]!.toUpperCase() + voice.slice(1);
+
 function isWorktreeSubmodules(value: string | null): value is WorktreeSubmodules {
   return value !== null && (WORKTREE_SUBMODULES_OPTIONS as readonly string[]).includes(value);
 }
@@ -103,6 +110,7 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
     fallbackSelection?.model,
   );
   const mixedPermissions = useScopedSettingsMixed(["defaultRuntimeMode"]);
+  const mixedVoice = useScopedSettingsMixed(["defaultLiveVoice"]);
   const PermissionIcon = runtimeModeConfig[settings.defaultRuntimeMode].icon;
   const mixedWorkspace = useScopedSettingsMixed(["defaultThreadEnvMode"]);
   const mixedAutoPull = useScopedSettingsMixed(["defaultAutoPull"]);
@@ -322,6 +330,51 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
     />
   ) : null;
 
+  const voiceRow = (
+    <SettingsRow
+      serverScoped
+      settingKeys={["defaultLiveVoice"]}
+      mixed={mixedVoice}
+      {...searchableSetting("default-live-voice")}
+      description={
+        isProjectScope
+          ? "The Codex voice for calls in this project."
+          : "The Codex voice for calls. Projects can override it."
+      }
+      resetAction={
+        settings.defaultLiveVoice !== DEFAULT_SERVER_SETTINGS.defaultLiveVoice ? (
+          <SettingResetButton
+            label="default voice"
+            onClick={() =>
+              updateSettings({ defaultLiveVoice: DEFAULT_SERVER_SETTINGS.defaultLiveVoice })
+            }
+          />
+        ) : null
+      }
+      control={
+        <Select
+          value={mixedVoice ? null : settings.defaultLiveVoice}
+          onValueChange={(value) => {
+            if (isLiveVoiceName(value)) updateSettings({ defaultLiveVoice: value });
+          }}
+        >
+          <SelectTrigger size="sm" aria-label="Default voice">
+            <SelectValue>
+              {mixedVoice ? "Mixed" : liveVoiceLabel(settings.defaultLiveVoice)}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectPopup align="end" alignItemWithTrigger={false}>
+            {LIVE_VOICE_NAMES.map((voice) => (
+              <SelectItem key={voice} value={voice}>
+                {liveVoiceLabel(voice)}
+              </SelectItem>
+            ))}
+          </SelectPopup>
+        </Select>
+      }
+    />
+  );
+
   return (
     <SettingsSection
       id={category === "source-control" ? "source-control-defaults" : "project-defaults"}
@@ -332,6 +385,7 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
           {modelRow}
           {fallbackRow}
           {workspaceRow}
+          {voiceRow}
         </>
       ) : category === "general" ? (
         <>
@@ -410,6 +464,7 @@ export function ProjectDefaultsSettings({ category }: { category: ProjectSetting
             }
           />
           {workspaceRow}
+          {voiceRow}
         </>
       ) : (
         <>

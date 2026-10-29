@@ -94,6 +94,7 @@ import * as Function from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -1791,6 +1792,48 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ? Effect.void
             : Deferred.succeed(closed, undefined).pipe(Effect.asVoid);
         });
+        const realtimeEvents =
+          yield* PubSub.unbounded<ProviderAdapter.ProviderAdapterV2RealtimeEvent>();
+        const publishRealtime = (event: ProviderAdapter.ProviderAdapterV2RealtimeEvent) =>
+          PubSub.publish(realtimeEvents, event).pipe(Effect.asVoid);
+        yield* client.handleServerNotification("thread/realtime/sdp", ({ threadId, sdp }) =>
+          publishRealtime({ type: "sdp", threadId, answerSdp: sdp }),
+        );
+        yield* client.handleServerNotification("thread/realtime/transcript/delta", (params) =>
+          params.role === "user" || params.role === "assistant"
+            ? publishRealtime({
+                type: "transcript",
+                threadId: params.threadId,
+                role: params.role,
+                text: params.delta,
+                done: false,
+              })
+            : Effect.void,
+        );
+        yield* client.handleServerNotification("thread/realtime/transcript/done", (params) =>
+          params.role === "user" || params.role === "assistant"
+            ? publishRealtime({
+                type: "transcript",
+                threadId: params.threadId,
+                role: params.role,
+                text: params.text,
+                done: true,
+              })
+            : Effect.void,
+        );
+        yield* client.handleServerNotification("thread/realtime/itemAdded", ({ threadId, item }) =>
+          publishRealtime({ type: "item", threadId, item }),
+        );
+        yield* client.handleServerNotification("thread/realtime/error", ({ threadId, message }) =>
+          publishRealtime({ type: "error", threadId, message }),
+        );
+        yield* client.handleServerNotification("thread/realtime/closed", ({ threadId, reason }) =>
+          publishRealtime({
+            type: "closed",
+            threadId,
+            ...(reason === null || reason === undefined ? {} : { reason }),
+          }),
+        );
         const additionalContextByThread = yield* Ref.make(
           new Map<
             string,
@@ -7152,6 +7195,45 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
         };
 
+        const realtimeError = (detail: string) => (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CODEX_PROVIDER,
+            detail,
+            payload: cause,
+          });
+        // The generated protocol has the realtime notifications but not these
+        // experimental requests, so they go through the untyped request path.
+        const realtime: ProviderAdapter.ProviderAdapterV2Realtime = {
+          subscribe: PubSub.subscribe(realtimeEvents).pipe(Effect.map(Stream.fromSubscription)),
+          start: Effect.fn("CodexAdapterV2.realtimeStart")(
+            function* (startInput) {
+              yield* ensureInitialized;
+              yield* client.raw.request("thread/realtime/start", {
+                threadId: startInput.providerThreadId,
+                outputModality: "audio",
+                // WebRTC uses the v3 voice lane; pinning it keeps host config from choosing websockets.
+                version: "v3",
+                voice: startInput.voice,
+                // T3 runs delegated work on the thread's own harness and returns the result.
+                clientManagedHandoffs: true,
+                realtimeStartInstructions:
+                  "Use the client delegation handoff for any request that needs real work, facts, files, tools, or subagents. Keep small talk in voice. The T3 application executes delegated work and returns the result.",
+                transport: { type: "webrtc", sdp: startInput.offerSdp },
+              });
+            },
+            Effect.mapError(realtimeError("Failed to start Codex realtime.")),
+          ),
+          stop: Effect.fn("CodexAdapterV2.realtimeStop")(
+            function* (stopInput) {
+              yield* ensureInitialized;
+              yield* client.raw.request("thread/realtime/stop", {
+                threadId: stopInput.providerThreadId,
+              });
+            },
+            Effect.mapError(realtimeError("Failed to stop Codex realtime.")),
+          ),
+        };
+
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
@@ -7984,6 +8066,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
           ),
           mcpApps,
+          realtime,
           readThreadSnapshot: Effect.fn("CodexAdapterV2.readThreadSnapshot")(
             function* (threadInput) {
               const threadId = yield* getNativeThreadId(threadInput.providerThread);

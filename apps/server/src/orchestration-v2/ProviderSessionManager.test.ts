@@ -17,6 +17,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -30,6 +31,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
@@ -1030,6 +1032,40 @@ it.effect("ProviderSessionManagerV2 opens independent sessions concurrently", ()
         }),
       ),
     );
+  }),
+);
+
+it.effect("ProviderSessionManagerV2 keeps an idle session open while it is held alive", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread-provider-session-manager-keep-alive");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+      });
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      const hold = yield* Scope.make();
+      yield* manager
+        .keepAlive({
+          providerSessionId,
+          providerThreadId: ProviderThreadId.make("provider-thread-keep-alive"),
+          key: "live-voice",
+        })
+        .pipe(Scope.provide(hold));
+      yield* TestClock.adjust("2 seconds");
+      assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+      yield* Scope.close(hold, Exit.void);
+      yield* TestClock.adjust("2 seconds");
+      assert.equal((yield* Ref.get(state)).closeCount, 1);
+    }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 1_000 })));
   }),
 );
 

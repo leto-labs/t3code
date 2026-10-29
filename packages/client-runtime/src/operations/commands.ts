@@ -1,4 +1,5 @@
 import { remapComposerContextAttachments } from "@t3tools/shared/composerContextReferences";
+import type { OrchestrationV2ThreadLaunchInput } from "@t3tools/contracts";
 import {
   type ThreadLinkedPullRequest,
   CommandId,
@@ -145,7 +146,7 @@ export interface SetThreadInteractionModeInput extends ThreadCommandInput {
   readonly interactionMode: ProviderInteractionMode;
 }
 
-interface StartThreadBootstrap {
+export interface StartThreadBootstrap {
   readonly createThread?: {
     readonly projectId: ProjectId;
     readonly title: string;
@@ -185,6 +186,15 @@ export interface StartThreadTurnInput extends ThreadCommandInput {
   readonly dispatchMode?: "auto" | "queue" | "steer" | "restart" | "start";
   /** Start a new provider session; needs the server's `freshContext` capability. */
   readonly freshContext?: boolean;
+}
+
+/** Creates a draft's thread and prepares its workspace without sending a message. */
+export interface LaunchThreadInput extends ThreadCommandInput {
+  readonly bootstrap: StartThreadBootstrap;
+  readonly modelSelection?: ModelSelection;
+  readonly title?: string;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
 }
 
 export interface InterruptThreadTurnInput extends ThreadCommandInput {
@@ -669,6 +679,70 @@ export const setThreadInteractionMode = Effect.fn("EnvironmentCommands.setThread
   },
 );
 
+/** The workspace strategy and launch request a draft's first send uses. */
+const launchWithBootstrap = Effect.fn("EnvironmentCommands.launchWithBootstrap")(function* (
+  input: Omit<
+    OrchestrationV2ThreadLaunchInput,
+    "threadId" | "projectId" | "title" | "workspaceStrategy" | "modelSelection"
+  > & {
+    readonly threadId: ThreadId;
+    readonly bootstrap: StartThreadBootstrap;
+    readonly modelSelection?: ModelSelection;
+    readonly title?: string;
+  },
+) {
+  const { bootstrap: launch, title, ...request_ } = input;
+  const bootstrap = launch.createThread;
+  const prepareWorktree = launch.prepareWorktree;
+  const existingProjection = bootstrap === undefined ? yield* getProjection(input.threadId) : null;
+  const thread = bootstrap ?? existingProjection!.thread;
+  const workspaceStrategy =
+    prepareWorktree !== undefined
+      ? {
+          type: "worktree" as const,
+          baseRef: prepareWorktree.baseBranch,
+          ...(prepareWorktree.branch === undefined ? {} : { branch: prepareWorktree.branch }),
+          ...(prepareWorktree.startFromOrigin === undefined
+            ? {}
+            : { startFromOrigin: prepareWorktree.startFromOrigin }),
+        }
+      : bootstrap?.worktreePath
+        ? {
+            type: "existing_worktree" as const,
+            worktreePath: bootstrap.worktreePath,
+            ...(bootstrap.branch === null ? {} : { branch: bootstrap.branch }),
+          }
+        : {
+            type: "root" as const,
+            ...(bootstrap?.branch === null || bootstrap?.branch === undefined
+              ? {}
+              : { branch: bootstrap.branch }),
+          };
+  return yield* request(ORCHESTRATION_V2_WS_METHODS.launchThread, {
+    ...request_,
+    ...(bootstrap === undefined ? { reuseExistingThread: true } : {}),
+    projectId: thread.projectId,
+    title: title ?? thread.title,
+    modelSelection: input.modelSelection ?? thread.modelSelection,
+    workspaceStrategy,
+  });
+});
+
+export const launchThread = Effect.fn("EnvironmentCommands.launchThread")(function* (
+  input: LaunchThreadInput,
+) {
+  return yield* launchWithBootstrap({
+    commandId: yield* allocateCommandId(input),
+    creationSource: input.creationSource ?? "web",
+    threadId: input.threadId,
+    bootstrap: input.bootstrap,
+    ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+    ...(input.title === undefined ? {} : { title: input.title }),
+    runtimeMode: input.runtimeMode,
+    interactionMode: input.interactionMode,
+  });
+});
+
 export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(function* (
   input: StartThreadTurnInput,
 ) {
@@ -683,46 +757,19 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
     input.message.attachments,
     attachments,
   );
-  const bootstrap = input.bootstrap?.createThread;
-  const prepareWorktree = input.bootstrap?.prepareWorktree;
-  if (bootstrap !== undefined || prepareWorktree !== undefined) {
-    const existingProjection =
-      bootstrap === undefined ? yield* getProjection(input.threadId) : null;
-    const thread = bootstrap ?? existingProjection!.thread;
-    const workspaceStrategy =
-      prepareWorktree !== undefined
-        ? {
-            type: "worktree" as const,
-            baseRef: prepareWorktree.baseBranch,
-            ...(prepareWorktree.branch === undefined ? {} : { branch: prepareWorktree.branch }),
-            ...(prepareWorktree.startFromOrigin === undefined
-              ? {}
-              : { startFromOrigin: prepareWorktree.startFromOrigin }),
-          }
-        : bootstrap?.worktreePath
-          ? {
-              type: "existing_worktree" as const,
-              worktreePath: bootstrap.worktreePath,
-              ...(bootstrap.branch === null ? {} : { branch: bootstrap.branch }),
-            }
-          : {
-              type: "root" as const,
-              ...(bootstrap?.branch === null || bootstrap?.branch === undefined
-                ? {}
-                : { branch: bootstrap.branch }),
-            };
-    return yield* request(ORCHESTRATION_V2_WS_METHODS.launchThread, {
+  if (
+    input.bootstrap?.createThread !== undefined ||
+    input.bootstrap?.prepareWorktree !== undefined
+  ) {
+    return yield* launchWithBootstrap({
       commandId,
       creationSource: input.creationSource ?? "web",
       threadId: input.threadId,
-      ...(bootstrap === undefined ? { reuseExistingThread: true } : {}),
-      projectId: thread.projectId,
-      title: input.titleSeed ?? thread.title,
-      generateTitle: input.titleSeed !== undefined,
-      modelSelection: input.modelSelection ?? thread.modelSelection,
+      bootstrap: input.bootstrap,
+      ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
+      ...(input.titleSeed === undefined ? {} : { title: input.titleSeed, generateTitle: true }),
       runtimeMode: input.runtimeMode,
       interactionMode: input.interactionMode,
-      workspaceStrategy,
       initialMessage: {
         messageId: input.message.messageId,
         text: input.message.text,

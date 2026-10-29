@@ -25,6 +25,7 @@ import {
   CommandId,
   type GuestMessageId,
   isCompactionCommandMessage,
+  isLiveVoiceTranscriptItemId,
   isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
   MessageId,
@@ -630,6 +631,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
       return command.parentThreadId;
     case "secret_request.record":
     case "link_request.record":
+    case "voice.transcript.append":
       return command.threadId;
     case "thread.fork":
     case "thread.merge_back":
@@ -7311,8 +7313,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               providerSwitchCoveredRuns.map((run) => run.id),
             )),
           ];
+    // Voice rows are runless, so no covered run carries them to the new provider.
+    const providerSwitchVoiceItems =
+      !isProviderSwitch || canResumeAcrossInstances
+        ? []
+        : (yield* readHandoffItems(command.threadId, [null])).filter(
+            (item) =>
+              isLiveVoiceTranscriptItemId(item.id) &&
+              (targetLastCompletedRun === undefined ||
+                requiresFullProviderSwitchContext ||
+                (item.startedAt !== null &&
+                  DateTime.isGreaterThan(item.startedAt, targetLastCompletedRun.requestedAt))),
+          );
+    const providerSwitchHandoffItems = [
+      ...providerSwitchItems,
+      ...providerSwitchVoiceItems,
+    ].toSorted((left, right) => left.ordinal - right.ordinal);
+    const providerSwitchSourceInstanceId =
+      latestHandoffRun?.providerInstanceId ?? activeProviderThread?.providerInstanceId;
     const providerSwitchTransferId =
-      providerSwitchCoveredRuns.length === 0 || latestHandoffRun === undefined
+      (providerSwitchCoveredRuns.length === 0 && providerSwitchVoiceItems.length === 0) ||
+      providerSwitchSourceInstanceId === undefined
         ? null
         : yield* mapDispatchError(command)(
             idAllocator.allocate.contextTransfer({
@@ -7336,7 +7357,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     }
     const providerSwitchHandoff =
-      providerSwitchTransferId === null || latestHandoffRun === undefined
+      providerSwitchTransferId === null || providerSwitchSourceInstanceId === undefined
         ? null
         : yield* contextHandoffService
             .prepareProviderHandoff({
@@ -7351,17 +7372,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 ),
               ),
               toProviderThreadId: ensuredProviderThread.id,
-              fromProviderInstanceId: latestHandoffRun.providerInstanceId,
+              fromProviderInstanceId: providerSwitchSourceInstanceId,
               toProviderInstanceId: modelSelection.instanceId,
+              // A voice-only delta covers no run; the schema needs positive ordinals.
               coveredRunOrdinals: {
-                from: providerSwitchCoveredRuns[0]!.ordinal,
-                to: providerSwitchCoveredRuns.at(-1)!.ordinal,
+                from: providerSwitchCoveredRuns[0]?.ordinal ?? 1,
+                to: providerSwitchCoveredRuns.at(-1)?.ordinal ?? 1,
               },
               strategy:
                 targetProviderThread === undefined || requiresFullProviderSwitchContext
                   ? "full_thread_summary"
                   : "delta_since_target_last_seen",
-              items: providerSwitchItems,
+              items: providerSwitchHandoffItems,
               runs: projection.runs,
               createdAt: now,
             })
@@ -9366,6 +9388,79 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         });
       }
+    },
+  );
+
+  // Runless rows: they belong to the conversation without starting or joining a run.
+  const dispatchVoiceTranscriptAppend = Effect.fn("orchestrationV2.dispatch.voiceTranscriptAppend")(
+    function* (
+      command: Extract<
+        OrchestrationV2InternalCommand,
+        { readonly type: "voice.transcript.append" }
+      >,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, [])
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+          ),
+        );
+      const now = yield* DateTime.now;
+      const user = command.role === "user";
+      const creation = user
+        ? ({ createdBy: "user", creationSource: "web" } as const)
+        : ({ createdBy: "agent", creationSource: "provider" } as const);
+      const base = {
+        id: command.turnItemId,
+        threadId: command.threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: yield* nextTurnItemOrdinal(projection),
+        status: "completed",
+        title: user ? "Voice input" : "Voice response",
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        messageId: command.messageId,
+        text: command.text,
+      } as const;
+      const turnItem: OrchestrationV2TurnItem = user
+        ? { ...base, ...creation, type: "user_message", inputIntent: "turn_start", attachments: [] }
+        : { ...base, type: "assistant_message", streaming: false };
+      const emitEvent = emit(events, command);
+      const providerInstanceId = projection.thread.modelSelection.instanceId;
+      yield* emitEvent({
+        type: "message.updated",
+        threadId: command.threadId,
+        providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...creation,
+          id: command.messageId,
+          threadId: command.threadId,
+          runId: null,
+          nodeId: null,
+          role: command.role,
+          text: command.text,
+          attachments: [],
+          streaming: false,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        providerInstanceId,
+        occurredAt: now,
+        payload: turnItem,
+      });
     },
   );
 
@@ -13817,6 +13912,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "link_request.record":
         yield* dispatchLinkRequestRecord(command, events, effects);
+        break;
+      case "voice.transcript.append":
+        yield* dispatchVoiceTranscriptAppend(command, events);
         break;
       default:
         return yield* dispatchUnsupported(command);

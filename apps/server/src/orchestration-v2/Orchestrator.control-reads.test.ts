@@ -17,6 +17,7 @@ import {
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
+  liveVoiceTranscriptIds,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -196,6 +197,52 @@ it.effect(
         ],
       );
     }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("appends repeated voice phrases as runless rows without starting a turn", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const threadId = ThreadId.make("thread:voice-transcript");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-voice-transcript"),
+      threadId,
+      projectId: ProjectId.make("project:voice-transcript"),
+      title: "Voice",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    for (const sequence of [1, 2]) {
+      const ids = liveVoiceTranscriptIds("call-1", sequence);
+      yield* orchestrator.dispatch({
+        type: "voice.transcript.append",
+        threadId,
+        role: "user",
+        text: "yes",
+        ...ids,
+      });
+      assert.deepEqual(yield* outbox.listByCommandId(ids.commandId), []);
+    }
+    const records = yield* projections.getThreadRecords(threadId, ["messages", "turnItems"]);
+    assert.deepEqual(
+      records.messages.map((message) => [message.text, message.runId]),
+      [
+        ["yes", null],
+        ["yes", null],
+      ],
+    );
+    assert.deepEqual(
+      records.turnItems.map((item) => item.type),
+      ["user_message", "user_message"],
+    );
+  }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect("marks a never-visited thread's first completion unread", () =>

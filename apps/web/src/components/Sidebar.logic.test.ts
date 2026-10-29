@@ -34,6 +34,7 @@ import {
   groupSidebarThreadsByProject,
   resolveSidebarFolderDot,
   sidebarFolderExpansionKeys,
+  promoteLiveCallThreads,
 } from "./Sidebar.logic";
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import {
@@ -1648,5 +1649,13 @@ describe("shouldCreateNewThreadInCurrentProject", () => {
     expect(shouldCreateNewThreadInCurrentProject(false, 1, 3)).toBe(true);
     expect(shouldCreateNewThreadInCurrentProject(false, 0, 0)).toBe(true);
     expect(shouldCreateNewThreadInCurrentProject(true, 2, 2)).toBe(true);
+  });
+});
+
+describe("promoteLiveCallThreads", () => {
+  it("moves threads with calls to the front of their shelf and keeps the rest in order", () => {
+    const shelf = ["a", "b", "c", "d"];
+    expect(promoteLiveCallThreads(shelf, (thread) => thread === "c")).toEqual(["c", "a", "b", "d"]);
+    expect(promoteLiveCallThreads(shelf, () => false)).toBe(shelf);
   });
 });

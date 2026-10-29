@@ -21,6 +21,7 @@ import {
   ThreadId,
   TurnItemId,
   ProviderDriverKind,
+  liveVoiceTranscriptIds,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -1224,6 +1225,101 @@ describe("orchestration v2 provider switching", () => {
           );
         }),
       ),
+  );
+
+  it.live("carries live voice rows to the next provider after a switch", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const cwd = yield* checkpointWorkspace("voice-provider-switch");
+        const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+        const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+          makeTestAdapter({
+            instanceId: CODEX_MODEL_SELECTION.instanceId,
+            driver: CODEX_DRIVER,
+            capabilities: CodexProviderCapabilitiesV2,
+            modelSelection: CODEX_MODEL_SELECTION,
+            responseByRunOrdinal: { 1: "Codex answer" },
+            capturedTurns,
+          }),
+          makeTestAdapter({
+            instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+            driver: CLAUDE_DRIVER,
+            capabilities: ClaudeProviderCapabilitiesV2,
+            modelSelection: CLAUDE_MODEL_SELECTION,
+            responseByRunOrdinal: {},
+            capturedTurns,
+          }),
+        ]);
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const runToCompletion = Effect.fn("runToCompletion")(function* (
+            ordinal: number,
+            modelSelection: ModelSelection,
+          ) {
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`voice-switch:${ordinal}`),
+              threadId,
+              messageId: MessageId.make(`voice-switch:${ordinal}`),
+              createdBy: "user",
+              creationSource: "web",
+              text: `Request ${ordinal}`,
+              attachments: [],
+              modelSelection,
+              dispatchMode: { type: "start_immediately" },
+            });
+            yield* orchestrator.streamStoredEvents.pipe(
+              Stream.filter(
+                ({ event }) =>
+                  event.type === "run.updated" &&
+                  event.payload.ordinal === ordinal &&
+                  (event.payload.status === "completed" || event.payload.status === "failed"),
+              ),
+              Stream.runHead,
+            );
+            yield* worker.drain();
+          });
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("voice-switch:create"),
+            threadId,
+            projectId,
+            createdBy: "user",
+            creationSource: "web",
+            title: "Voice switch",
+            modelSelection: CODEX_MODEL_SELECTION,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+          });
+          yield* runToCompletion(1, CODEX_MODEL_SELECTION);
+          yield* orchestrator.dispatch({
+            type: "voice.transcript.append",
+            threadId,
+            role: "user",
+            text: "Remember the blue widget.",
+            ...liveVoiceTranscriptIds("call-1", 1),
+          });
+          yield* runToCompletion(2, CLAUDE_MODEL_SELECTION);
+          const handoff = (yield* orchestrator.getThreadProjection(threadId)).contextHandoffs.at(
+            -1,
+          );
+          assert.include(
+            handoff?.history?.messages.map((message) => message.text) ?? [],
+            "Remember the blue widget.",
+          );
+        }).pipe(
+          Effect.provide(
+            ProviderReplayHarness.layerWithRegistry(
+              { name: "voice-provider-switch", runtimePolicyOverride: { cwd } },
+              layerRegistry,
+            ),
+          ),
+        );
+      }),
+    ),
   );
 
   it.live.each(["native", "legacy"] as const)(

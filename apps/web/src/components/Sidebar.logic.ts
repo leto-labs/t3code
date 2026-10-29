@@ -1355,3 +1355,13 @@ export function sortScopedProjectsForSidebar<
       left.id.localeCompare(right.id),
   );
 }
+
+/** Threads with a live voice call lead their shelf; everything else keeps its order. */
+export function promoteLiveCallThreads<T>(
+  threads: ReadonlyArray<T>,
+  isLive: (thread: T) => boolean,
+): ReadonlyArray<T> {
+  const live = threads.filter(isLive);
+  if (live.length === 0 || live.length === threads.length) return threads;
+  return [...live, ...threads.filter((thread) => !isLive(thread))];
+}

@@ -337,6 +337,7 @@ export function useComposerSend(input: ComposerSendInput) {
   const startThreadTurn = useOrchestrationCommand(threadEnvironment.startTurn, {
     reportFailure: false,
   });
+  const launchThread = useOrchestrationCommand(threadEnvironment.launch, { reportFailure: false });
   const uploadThreadFeedback = useOrchestrationCommand(threadEnvironment.uploadFeedback, {
     reportFailure: false,
   });
@@ -1441,5 +1442,83 @@ export function useComposerSend(input: ComposerSendInput) {
     }
   };
 
-  return { onSend };
+  /**
+   * A voice call on a draft creates the thread, worktree, and setup exactly as the first
+   * message would, but sends nothing.
+   */
+  const launchDraftForVoice = async (): Promise<void> => {
+    if (!isLocalDraftThread || !activeThread || !activeProject) return;
+    const sendCtx = composerRef.current?.getSendContext();
+    if (!sendCtx?.providerAvailable) throw new Error("Choose an available provider first.");
+    const { missingWorktreeBaseBranch, baseBranchForWorktree } = planComposerTurn({
+      messageText: "",
+      sendQueuesBehindSetup,
+      isServerThread,
+      activeMessageCount,
+      sendEnvMode,
+      worktreePath: activeThread.worktreePath,
+      activeThreadBranch,
+      resumeCompactionTokens: null,
+      keepFullHistory,
+      phase,
+      dispatchMode: "auto",
+      freshContext: false,
+    });
+    if (missingWorktreeBaseBranch) {
+      throw new Error("Select a base branch before starting a call in New worktree mode.");
+    }
+    const threadId = activeThread.id;
+    const title = "Voice call";
+    const modelSelection = createModelSelection(
+      sendCtx.selectedModelSelection.instanceId,
+      sendCtx.selectedModel || activeProjectDefaultModelSelection?.model || DEFAULT_MODEL,
+      sendCtx.selectedModelSelection.options,
+    );
+    markPromotedDraftThreadByRef(scopeThreadRef(environmentId, threadId));
+    const result = await launchThread({
+      environmentId,
+      input: {
+        threadId,
+        title,
+        modelSelection,
+        runtimeMode,
+        interactionMode: DEFAULT_INTERACTION_MODE,
+        bootstrap: {
+          createThread: {
+            projectId: activeProject.id,
+            title,
+            modelSelection,
+            runtimeMode,
+            interactionMode: DEFAULT_INTERACTION_MODE,
+            branch: activeThreadBranch,
+            worktreePath: activeThread.worktreePath,
+            createdAt: activeThread.createdAt,
+          },
+          ...(baseBranchForWorktree
+            ? {
+                prepareWorktree: {
+                  projectCwd: activeProject.workspaceRoot,
+                  baseBranch: baseBranchForWorktree,
+                  ...(startFromOrigin ? { startFromOrigin: true } : {}),
+                },
+                runSetupScript: true,
+              }
+            : {}),
+        },
+      },
+    });
+    if (result._tag === "Failure") {
+      const error = squashAtomCommandFailure(result);
+      if (draftId && draftThread) {
+        restoreFailedDraftThread(
+          draftId,
+          draftThread,
+          wasBootstrapThreadDeleted(error) ? newThreadId() : threadId,
+        );
+      }
+      throw error;
+    }
+  };
+
+  return { onSend, launchDraftForVoice };
 }

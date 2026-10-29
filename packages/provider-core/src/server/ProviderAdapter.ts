@@ -592,6 +592,39 @@ export interface ProviderAdapterV2McpCallToolResult {
   readonly _meta?: unknown;
 }
 
+/** Native thread ids; consumers filter to the thread they started. */
+export type ProviderAdapterV2RealtimeEvent =
+  | { readonly type: "sdp"; readonly threadId: string; readonly answerSdp: string }
+  | {
+      readonly type: "transcript";
+      readonly threadId: string;
+      readonly role: "user" | "assistant";
+      /** A partial delta, or the whole phrase once done. */
+      readonly text: string;
+      readonly done: boolean;
+    }
+  | { readonly type: "item"; readonly threadId: string; readonly item: unknown }
+  | { readonly type: "error"; readonly threadId: string; readonly message: string }
+  | { readonly type: "closed"; readonly threadId: string; readonly reason?: string };
+
+/** A realtime voice conversation on a native thread; the client owns the media path. */
+export interface ProviderAdapterV2Realtime {
+  /** Subscribed when this returns, so events after it reach the stream until the scope closes. */
+  readonly subscribe: Effect.Effect<
+    Stream.Stream<ProviderAdapterV2RealtimeEvent>,
+    never,
+    Scope.Scope
+  >;
+  readonly start: (input: {
+    readonly providerThreadId: string;
+    readonly offerSdp: string;
+    readonly voice: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly stop: (input: {
+    readonly providerThreadId: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+}
+
 export interface ProviderAdapterV2McpApps {
   readonly listTools: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
@@ -702,6 +735,8 @@ export interface ProviderAdapterV2SessionRuntime {
   }) => Effect.Effect<{ readonly feedbackId: string }, ProviderAdapterV2Error>;
   /** Absent means non-interactive apps with plain tool rows. */
   readonly mcpApps?: ProviderAdapterV2McpApps;
+  /** Absent means the provider has no live voice. */
+  readonly realtime?: ProviderAdapterV2Realtime;
   readonly rollbackThread: (
     input: ProviderAdapterV2RollbackThreadInput,
   ) => Effect.Effect<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error>;

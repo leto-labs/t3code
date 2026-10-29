@@ -3608,6 +3608,16 @@ const OrchestrationV2InternalCommand = Schema.Union([
       }),
     ),
   }),
+  /** Runless conversation rows finalized by a live voice call. */
+  Schema.Struct({
+    type: Schema.Literal("voice.transcript.append"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    messageId: MessageId,
+    turnItemId: TurnItemId,
+    role: Schema.Literals(["user", "assistant"]),
+    text: TrimmedNonEmptyString,
+  }),
 ]);
 export type OrchestrationV2InternalCommand = typeof OrchestrationV2InternalCommand.Type;
 
