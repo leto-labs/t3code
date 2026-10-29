@@ -2,6 +2,7 @@ import type { ThreadStructureRuntime } from "@t3tools/client-runtime/state/shell
 import { msg } from "gt-react";
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
 import {
+  isLiveVoiceHandoffMessageId,
   type AssetResource,
   type OrchestrationV2Checkpoint,
   type OrchestrationV2ExecutionNode,
@@ -603,6 +604,7 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
       foldedAnswerRunIdByMessageId.get(item.messageId) === item.runId
     )
       continue;
+    if (item.type === "user_message" && isLiveVoiceHandoffMessageId(item.messageId)) continue;
     const createdAt = projectedItemCreatedAt(row);
     const attempt = resolveAttempt(item);
     const attemptMetadata = attempt === undefined ? {} : { attempt };

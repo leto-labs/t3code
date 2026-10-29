@@ -5336,5 +5336,6 @@
   "8d545d54c0a9e950": "Die Befehle, Bearbeitungen und Suchen ausblenden, die Agenten ausführen. „Erfolgreiche ausblenden“ behält Fehler. „Zen“ zeigt nur endgültige Antworten. Genehmigungen, Fragen und Fehler werden immer angezeigt.",
   "97d594c690529a79": "T3 connections",
   "6eb6becf92d74b2d": "{phase} · RTT {rtt} · {reconnects, plural, one {{reconnects} reconnect} other {{reconnects} reconnects}}",
-  "fd72d067b54bcaed": "n/a"
+  "fd72d067b54bcaed": "n/a",
+  "8a3943aff8392e97": "The voice call ended while T3 was disconnected."
 }

@@ -161,6 +161,7 @@ import * as Keybindings from "./keybindings.ts";
 import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import * as ServerSettings from "./serverSettings.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
+import * as LiveVoiceService from "./voice/LiveVoiceService.ts";
 
 import * as EventStore from "./orchestration-v2/EventStore.ts";
 import * as ThreadManagement from "./orchestration-v2/ThreadManagementService.ts";
@@ -830,6 +831,7 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(AnalyticsService.AnalyticsService)({}),
   Layer.mock(AntigravityInstallation.AntigravityInstallation)({ managedDirectory: "/unused" }),
   Layer.mock(BackgroundPolicy.BackgroundPolicy)({}),
+  Layer.mock(LiveVoiceService.LiveVoiceService)({}),
   Layer.mock(CheckpointDiffQuery.CheckpointDiffQuery)({}),
   Layer.mock(NativeChildWorkQuery.NativeChildWorkQuery)({}),
   Layer.mock(CommandOutputHub.CommandOutputHub)({}),

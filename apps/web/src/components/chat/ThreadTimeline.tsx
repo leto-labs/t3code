@@ -3,6 +3,7 @@ import { type ComponentProps, useLayoutEffect } from "react";
 import { useIncrementalTimelineEntries } from "../../hooks/useIncrementalTimelineEntries";
 import type { TimelineEntriesInput, TimelineEntry } from "../../session-logic";
 import { useTimelineVisibleTurnItems } from "../../state/entities";
+import { useLiveVoiceTimelineMessages } from "../../state/liveVoice";
 import {
   peekRememberedThreadTimeline,
   rememberReadyThreadTimeline,
@@ -36,8 +37,12 @@ export function ThreadTimeline({
   detailLoading: boolean;
 }) {
   const visibleTurnItems = useTimelineVisibleTurnItems(threadDetailRef);
+  const liveVoiceMessages = useLiveVoiceTimelineMessages(threadDetailRef);
   const serverEntries = useIncrementalTimelineEntries(activeThreadKey, {
     ...entriesInput,
+    ...(liveVoiceMessages.length === 0
+      ? {}
+      : { optimisticMessages: [...entriesInput.optimisticMessages, ...liveVoiceMessages] }),
     visibleTurnItems,
   });
   const entries = draftEntries ?? serverEntries;
