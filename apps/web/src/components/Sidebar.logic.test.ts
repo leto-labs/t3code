@@ -40,6 +40,7 @@ import {
   resolveSidebarFolderDot,
   sidebarFolderExpansionKeys,
   withoutRemovedCheckout,
+  promoteLiveCallThreads,
 } from "./Sidebar.logic";
 import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import {
@@ -1854,5 +1855,13 @@ describe("filterSidebarProjectScopeItems", () => {
 
     expect(filter("")).toEqual([ADD_PROJECT_SCOPE_ITEM_VALUE, "all", "p1"]);
     expect(filter("project")).toEqual(["p1"]);
+  });
+});
+
+describe("promoteLiveCallThreads", () => {
+  it("moves threads with calls to the front of their shelf and keeps the rest in order", () => {
+    const shelf = ["a", "b", "c", "d"];
+    expect(promoteLiveCallThreads(shelf, (thread) => thread === "c")).toEqual(["c", "a", "b", "d"]);
+    expect(promoteLiveCallThreads(shelf, () => false)).toBe(shelf);
   });
 });

@@ -68,6 +68,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as FeedbackStore from "../feedback/FeedbackStore.ts";
 import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
 import * as TaskFolderStore from "../workspace/TaskFolderStore.ts";
+import * as LiveVoiceService from "../voice/LiveVoiceService.ts";
 
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
@@ -461,6 +462,15 @@ export const layerProduction = Layer.mergeAll(
   layerProviderContinuationWorkerProvided,
   layerAgentSessionScannerProvided,
   layerAgentSessionImporterProvided,
+  LiveVoiceService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        layerRuntimePolicyProvided,
+        layerThreadManagementProvided,
+        layerProviderSessionManagerProvided,
+      ),
+    ),
+  ),
   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
 ).pipe(
   Layer.provide(ResourceCleanupService.layer.pipe(Layer.provide(layerScheduledTaskProvided))),

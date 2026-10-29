@@ -339,6 +339,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "default-live-voice",
+    title: msg("Voice"),
+    to: "/settings/threads",
+    scope: "project-defaults",
+    searchTerms: [msg("live voice call codex realtime speech microphone")],
+  },
+  {
     id: "color-scheme",
     title: msg("Color scheme"),
     to: "/settings/appearance",
