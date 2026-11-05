@@ -3,7 +3,13 @@ import * as Schema from "effect/Schema";
 
 import { compareSemverVersions } from "./semver.ts";
 
-const CLI_RELEASE_REPOSITORY = "pingdotgg/t3code";
+declare const __T3CODE_BUILD_RELEASE_REPOSITORY__: string | undefined;
+
+// A fork's release build names its own GitHub repository, so its runtimes update from its releases.
+const CLI_RELEASE_REPOSITORY =
+  typeof __T3CODE_BUILD_RELEASE_REPOSITORY__ === "string" && __T3CODE_BUILD_RELEASE_REPOSITORY__
+    ? __T3CODE_BUILD_RELEASE_REPOSITORY__
+    : "pingdotgg/t3code";
 export const CLI_RELEASES_PAGE_URL = `https://github.com/${CLI_RELEASE_REPOSITORY}/releases`;
 export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
