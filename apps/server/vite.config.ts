@@ -30,6 +30,12 @@ if (!TELEMETRY_CHANNELS.includes(telemetryChannel)) {
   );
 }
 
+// Forks that publish their own releases set this so `t3 update` and the service install from them.
+const releaseRepository = process.env.T3CODE_RELEASE_REPOSITORY?.trim() ?? "";
+if (releaseRepository !== "" && !/^[\w.-]+\/[\w.-]+$/.test(releaseRepository)) {
+  throw new Error(`T3CODE_RELEASE_REPOSITORY must be "owner/repo", got "${releaseRepository}".`);
+}
+
 // tsdown SEA needs one chunk (sourcemaps count) and Node >=25.7, so package separately.
 // "bundle" emits the embedded CLI. "1" builds dist-exe/t3 from the bootstrap.
 // TEMPORARY one-time Node fix. Remove when fixed: https://github.com/nodejs/node/issues/67048
@@ -128,6 +134,7 @@ export default mergeConfig(
       define: {
         __T3CODE_BUILD_CHANNEL__: JSON.stringify(cliBuildChannel),
         __T3CODE_TELEMETRY_CHANNEL__: JSON.stringify(telemetryChannel),
+        __T3CODE_BUILD_RELEASE_REPOSITORY__: JSON.stringify(releaseRepository),
         __T3CODE_BUILD_RELAY_URL__: JSON.stringify(repoEnv.T3CODE_RELAY_URL?.trim() ?? ""),
         __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
           repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",
