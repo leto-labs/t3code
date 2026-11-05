@@ -98,6 +98,13 @@ const unitTestProject = {
 // Hash checkout paths to ports 20000-23999; Vitest's fixed port collides under inherited strictPort.
 // Stay below ephemeral ranges: Windows reserves Hyper-V/WSL blocks there and EACCES is not skipped.
 const browserTestApiPort = 20_000 + ((Hash.string(import.meta.dirname) >>> 0) % 4_000);
+// For hosts where Playwright cannot download its own Chromium.
+const playwrightExecutable = process.env.T3CODE_PLAYWRIGHT_EXECUTABLE?.trim();
+const playwrightProvider = playwright(
+  playwrightExecutable === undefined || playwrightExecutable.length === 0
+    ? {}
+    : { launchOptions: { executablePath: playwrightExecutable } },
+);
 
 const browserTestProject = {
   extends: true,
@@ -138,7 +145,7 @@ const browserTestProject = {
     browser: {
       enabled: true,
       headless: true,
-      provider: playwright(),
+      provider: playwrightProvider,
       instances: [{ browser: "chromium" }],
       screenshotFailures: false,
       commands: {
