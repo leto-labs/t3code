@@ -58,3 +58,23 @@ code.
 - `check:changed` against the base tag passes, including browser tests.
 - `node apps/server/scripts/responsiveness-e2e.ts --variants broker --repos 40` shows no
   multi-second probe stalls.
+
+## Releasing
+
+Tag the branch tip `v<upstream version>-t3custom.<n>`, for example `v0.1.7-t3custom.1`, and push
+that one tag. `.github/workflows/fork.yml` checks it, builds the Linux x64 CLI archive, and publishes
+it, with `SHA256SUMS`, as this repository's latest GitHub Release. Push tags one at a time: an
+upstream prerelease tag would also match the workflow.
+
+The build sets `T3CODE_RELEASE_REPOSITORY` to this repository, so a runtime installed from these
+releases updates from them too: `t3 update` installs the newest one, and `t3 update <version>` a
+specific one. A new machine installs with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/<owner>/t3code/<tag>/scripts/install.sh |
+  T3CODE_REPOSITORY=<owner>/t3code T3CODE_VERSION=<version> sh
+```
+
+The same workflow runs `vp run check:changed` against the upstream base tag on every push to a
+`fork/**` branch. Upstream's other workflows expect upstream's runners and secrets. Disable them in
+the fork's Actions settings and keep only Fork enabled.
