@@ -1,0 +1,213 @@
+name: Fork
+
+# A fork's own CI and releases. Upstream's workflows need upstream's runners and secrets.
+# - Pushing a fork/** branch runs `vp run check:changed` on the fork's commits, against the
+#   upstream release tag the branch is named after (fork/v0.1.7 checks against v0.1.7).
+#   Upstream's CI already covered that tag.
+# - Pushing a release tag such as v0.1.7-t3custom.1 runs the same check, then publishes the
+#   Linux x64 CLI archive and SHA256SUMS as a GitHub Release. The build names this repository
+#   as its release source, so `t3 update` on an installed fork runtime finds the next release here.
+on:
+  push:
+    branches:
+      - "fork/**"
+    tags:
+      - "v*.*.*-*"
+      - "!v*-nightly.*"
+      - "!v*-preview.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+jobs:
+  check:
+    name: Check fork commits
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Full history without blobs, so check:changed can find the merge base with the upstream tag.
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+
+      - name: Fetch upstream base tag
+        id: base
+        run: |
+          set -euo pipefail
+          if [[ ! "${GITHUB_REF_NAME##*/}" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            echo "::error::$GITHUB_REF_NAME does not name its upstream base, as fork/v0.1.7 or v0.1.7-t3custom.1 do."
+            exit 1
+          fi
+          base="${BASH_REMATCH[1]}"
+          if ! git rev-parse -q --verify "refs/tags/$base^{commit}" >/dev/null; then
+            git fetch -q --filter=blob:none --no-tags https://github.com/pingdotgg/t3code.git \
+              "refs/tags/$base:refs/tags/$base"
+          fi
+          echo "tag=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+
+      # check:changed runs the browser tests beside changed web files in headless Chromium.
+      - name: Resolve Playwright version
+        id: playwright_version
+        run: echo "version=$(node -p "require('./apps/web/node_modules/playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chromium
+        id: chromium_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-shell-${{ runner.os }}-${{ runner.arch }}-${{ steps.playwright_version.outputs.version }}
+
+      - name: Install Chromium for web browser tests
+        if: steps.chromium_cache.outputs.cache-hit != 'true'
+        run: node apps/web/node_modules/playwright/cli.js install --only-shell chromium
+
+      - name: Install missing Chromium system dependencies
+        run: |
+          browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+          test -n "$browser"
+          if ldd "$browser" | grep '=> not found'; then
+            node apps/web/node_modules/playwright/cli.js install-deps chromium
+          fi
+
+      - name: Check changes since the upstream base
+        run: vp run check:changed "refs/tags/${{ steps.base.outputs.tag }}"
+
+  release:
+    name: Linux x64 CLI release
+    needs: [check]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      T3CODE_RELEASE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          # Full history without blobs, so the release notes can list commits since the base tag.
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve version
+        id: meta
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::error::$TAG is not a fork release tag such as v0.1.7-t3custom.1."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "base=v${version%%-*}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+
+      - name: Cache resource monitor
+        id: resource_monitor_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor
+          key: resource-monitor-x86_64-unknown-linux-gnu-${{ hashFiles('native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build resource monitor
+        if: steps.resource_monitor_cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target x86_64-unknown-linux-gnu
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ steps.meta.outputs.version }}"
+
+      - name: Build server and web client
+        run: vp run --filter t3 build
+
+      - name: Apply web client branding
+        run: node scripts/apply-web-brand-assets.ts production apps/server/dist/client
+
+      - name: Build CLI single-executable
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Stage resource monitor
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor \
+            "$RUNNER_TEMP/cli-resource-monitor/linux-x64/"
+
+      - uses: ./.github/actions/setup-apt-mirrors
+
+      # The Linux archive ships libatomic.so.1 and points t3's RUNPATH at it.
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y patchelf libatomic1
+
+      - name: Build CLI archive
+        run: |
+          node scripts/build-cli-archive.ts \
+            --platform linux \
+            --arch x64 \
+            --version "${{ steps.meta.outputs.version }}" \
+            --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" \
+            --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ steps.meta.outputs.version }}"
+
+      - name: Write checksums and release notes
+        env:
+          BASE: ${{ steps.meta.outputs.base }}
+        run: |
+          set -euo pipefail
+          (cd release-cli && sha256sum t3-* > SHA256SUMS)
+          {
+            if git rev-parse -q --verify "refs/tags/$BASE^{commit}" >/dev/null ||
+              git fetch -q --filter=blob:none --no-tags https://github.com/pingdotgg/t3code.git \
+                "refs/tags/$BASE:refs/tags/$BASE"; then
+              echo "Upstream [$BASE](https://github.com/pingdotgg/t3code/releases/tag/$BASE) plus:"
+              echo
+              git log --no-merges --reverse --format='- %s' "$BASE..HEAD"
+            else
+              echo "Upstream base $BASE was not found."
+            fi
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-cli/* --clobber
+          else
+            gh release create "$TAG" release-cli/* --verify-tag --latest \
+              --title "T3 Code $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
