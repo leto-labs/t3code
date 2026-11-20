@@ -35,7 +35,8 @@ instead can put credentials where this provider will not find them.
 Check the account reported in provider settings after signing in. Existing
 threads can switch only between Claude instances with the same config directory.
 Separate account directories stay isolated, including their local conversation
-state. Claude does not have Codex's shared-home and shadow-home arrangement.
+state. Claude does not have Codex's shared-home and shadow-home arrangement; to move
+threads between accounts automatically, use [Claude Auto](#claude-auto).
 
 For presets that differ only in API keys or endpoints, use the instance's
 **Environment variables**. Variable assignments do not belong in **Launch arguments**.
@@ -88,6 +89,45 @@ limit was reached and the remaining wait when Claude provides a reset time.
 Claude Code holds the turn until that window reopens, so it can keep showing as
 working. Wait for the reset, or stop the turn and continue later. The warning's
 timestamp shows when the displayed wait started.
+
+## Claude Auto
+
+Claude Auto spreads threads across your Claude subscription accounts. Set up each account
+as its own Claude instance first, as described in
+[separate accounts](#separate-accounts-or-configurations). Then, in
+**Settings > Providers > Add provider**, choose **Claude Auto** and select the accounts it
+may use. Select **Claude Auto** in the model picker on web, desktop, or mobile.
+
+New threads go to the account whose weekly window resets first, since allowance left at a
+reset is lost. A Fable thread is limited by both the weekly window and the Fable weekly
+window; other models only by the weekly window. An account whose 5-hour window is used up
+is skipped until it resets. A thread stays on its account until the account runs out, or
+until it drops below 5% of its weekly window while another account has more. An account
+running three turns is skipped for new threads while another has room; set
+`autoPoolMaxRunningTurns` in the pool's `config` in `settings.json` to change that.
+
+When an account runs out mid-turn, Auto checks its usage and continues the same
+conversation on another account without resending your message. This also applies when
+Claude Code would pause the turn until the limit resets. If every account is out, the
+thread shows the reset time and waits. Auto routes on subscription usage only; it never
+counts extra usage, and it never buys or redeems resets.
+
+Each account keeps its own Claude config directory, login, settings, plugins, and MCP
+servers. When a thread moves, T3 Code stops the previous account's Claude process, then
+copies the conversation into the next account's directory. A moved thread therefore runs
+with the next account's settings and plugins, and starts without that account's prompt
+cache.
+
+Selected accounts are reserved for the pool: they disappear from the model picker and from
+agent tools, and their usage still shows in the usage dashboard. Threads that ran directly
+on an account keep their conversation when you switch them to Claude Auto. After you
+remove an account from the pool, a thread moved from Claude Auto to that account starts
+with a summary handoff. Claude Auto does not write titles or commit messages; those use
+the provider chosen for text generation. Members cannot set API keys, an API endpoint, or a
+cloud backend in their environment variables.
+
+Agents see Claude Auto as one entry in `provider_usage_limits`, with each account's windows
+in a breakdown, and use Claude Auto instead of a member account.
 
 ## Steering
 

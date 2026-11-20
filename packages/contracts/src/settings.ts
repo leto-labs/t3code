@@ -882,6 +882,10 @@ const InstanceIdleCompaction = Schema.Literals(
 
 export const ClaudeSettings = makeProviderSettingsSchema(
   {
+    ...autoPoolSettingsFields(
+      "Claude Auto",
+      "Explicit Claude subscription instance IDs. Each account keeps its own Claude home; Auto copies a thread's conversation to the account that runs its next turn.",
+    ),
     enabled: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(true)),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),

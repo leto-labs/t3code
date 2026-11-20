@@ -33,6 +33,7 @@ export function AutoPoolSection({
   const listedIds = new Set(candidates.map(([id]) => id));
   const missing = members.filter((id) => !listedIds.has(id));
   const config = value !== null && typeof value === "object" ? value : {};
+  const claude = driver === "claudeAgent";
   const update = async (id: string, selected: boolean) => {
     if (savingRef.current) return;
     savingRef.current = true;
@@ -51,11 +52,17 @@ export function AutoPoolSection({
   return (
     <>
       <SettingsRow
-        title={gt("Codex Auto accounts")}
-        description={gt(
-          "Choose the accounts Auto may use. Selected accounts are hidden from the composer and direct agent access. They can sign in separately but must share the server''s {path} session home.",
-          { path: "~/.codex" },
-        )}
+        title={claude ? gt("Claude Auto accounts") : gt("Codex Auto accounts")}
+        description={
+          claude
+            ? gt(
+                "Choose the accounts Auto may use. Selected accounts are hidden from the composer and direct agent access. Each keeps its own Claude home; Auto copies a thread's conversation to the account that runs its next turn.",
+              )
+            : gt(
+                "Choose the accounts Auto may use. Selected accounts are hidden from the composer and direct agent access. They can sign in separately but must share the server''s {path} session home.",
+                { path: "~/.codex" },
+              )
+        }
       />
       {members.length === 0 ? (
         <SettingsRow
@@ -79,7 +86,11 @@ export function AutoPoolSection({
               disabled={saving}
               checked={members.includes(id)}
               onCheckedChange={(checked) => update(id, Boolean(checked))}
-              aria-label={gt("Include {name} in Codex Auto", { name: instance.displayName || id })}
+              aria-label={
+                claude
+                  ? gt("Include {name} in Claude Auto", { name: instance.displayName || id })
+                  : gt("Include {name} in Codex Auto", { name: instance.displayName || id })
+              }
             />
           }
         />
@@ -88,24 +99,40 @@ export function AutoPoolSection({
         <SettingsRow
           key={id}
           title={id}
-          description={gt(
-            "This selected account is missing or is no longer a direct Codex subscription. Remove it to repair the pool.",
-          )}
+          description={
+            claude
+              ? gt(
+                  "This selected account is missing or is no longer a direct Claude subscription. Remove it to repair the pool.",
+                )
+              : gt(
+                  "This selected account is missing or is no longer a direct Codex subscription. Remove it to repair the pool.",
+                )
+          }
           control={
             <Switch
               disabled={saving}
               checked
               onCheckedChange={() => update(id, false)}
-              aria-label={gt("Remove {name} from Codex Auto", { name: id })}
+              aria-label={
+                claude
+                  ? gt("Remove {name} from Claude Auto", { name: id })
+                  : gt("Remove {name} from Codex Auto", { name: id })
+              }
             />
           }
         />
       ))}
       <SettingsRow
         title={gt("Supported models")}
-        description={gt(
-          "Auto offers only models, reasoning options, and service tiers supported by every selected account. Manage model visibility and favorites in Models below.",
-        )}
+        description={
+          claude
+            ? gt(
+                "Auto offers only models and options supported by every selected account. Manage model visibility and favorites in Models below.",
+              )
+            : gt(
+                "Auto offers only models, reasoning options, and service tiers supported by every selected account. Manage model visibility and favorites in Models below.",
+              )
+        }
       />
     </>
   );

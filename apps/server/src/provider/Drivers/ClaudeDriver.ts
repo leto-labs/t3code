@@ -1,4 +1,4 @@
-import { ClaudeSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { ClaudeSettings, ProviderDriverKind, autoPoolOwnerId } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import type * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -52,6 +52,7 @@ import {
   type ProviderInstance,
 } from "@t3tools/provider-core/server/driver";
 import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIdentity";
+import type { ServerProviderDraft } from "@t3tools/provider-core/server/snapshotProbe";
 import { enrichProviderSnapshotWithVersionAdvisory } from "@t3tools/provider-core/server/maintenanceResolver";
 import {
   haveProviderSnapshotSettingsChanged,
@@ -66,6 +67,8 @@ import {
 } from "./ClaudeHome.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { makeClaudeMaintenanceResolution } from "./ClaudeMaintenance.ts";
+import { claudeAutoContinuationKey, makeClaudeAutoProvider } from "./ClaudeAutoProvider.ts";
+import { reserveAutoPoolMember } from "../autoPoolMember.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -108,6 +111,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     enabled,
     config,
   }) {
+    if (config.autoPoolMemberIds)
+      return yield* makeClaudeAutoProvider({
+        instanceId,
+        displayName,
+        accentColor,
+        environment,
+        enabled,
+        config,
+      });
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -140,20 +152,35 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       Effect.provideService(Path.Path, path),
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
-    const continuationGroupKey = yield* makeClaudeContinuationGroupKey(effectiveConfig, processEnv);
+    const homeContinuationKey = yield* makeClaudeContinuationGroupKey(effectiveConfig, processEnv);
+    // A pooled member's conversations continue through its Auto instance, which copies them
+    // between homes. Membership changes without rebuilding this instance.
+    const host = yield* ProviderHost.ProviderHost;
+    const poolContinuationKey = (
+      providerInstances: Parameters<typeof autoPoolOwnerId>[0],
+    ): string => {
+      const owner = autoPoolOwnerId(providerInstances, instanceId);
+      return owner === undefined ? homeContinuationKey : claudeAutoContinuationKey(owner);
+    };
+    const settingsChanges = yield* host.settings.subscribe;
+    let continuationGroupKey = yield* host.settings.get.pipe(
+      Effect.map((settings) => poolContinuationKey(settings.providerInstances)),
+      Effect.orElseSucceed(() => homeContinuationKey),
+    );
     const configDir = yield* resolveClaudeHomePath(effectiveConfig, processEnv);
     const accountConfigPath = yield* ClaudeResetCredits.claudeAccountConfigPath(
       effectiveConfig.homePath.trim() || processEnv.CLAUDE_CONFIG_DIR?.trim()
         ? configDir
         : undefined,
     );
-    const stampIdentity = withInstanceIdentity({
-      instanceId,
-      driverKind: DRIVER_KIND,
-      displayName,
-      accentColor,
-      continuationGroupKey,
-    });
+    const stampIdentity = (snapshot: ServerProviderDraft) =>
+      withInstanceIdentity({
+        instanceId,
+        driverKind: DRIVER_KIND,
+        displayName,
+        accentColor,
+        continuationGroupKey,
+      })(snapshot);
 
     const scopedLimitNames = yield* makeClaudeScopedLimitNames;
     // The SDK's user source is the host's home, not a custom one; same rule as the adapter.
@@ -350,6 +377,17 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       ),
     );
 
+    yield* settingsChanges.pipe(
+      Stream.map((settings) => poolContinuationKey(settings.providerInstances)),
+      Stream.filter((key) => key !== continuationGroupKey),
+      Stream.runForEach((key) =>
+        Effect.sync(() => {
+          continuationGroupKey = key;
+        }).pipe(Effect.andThen(snapshot.refresh)),
+      ),
+      Effect.forkScoped,
+    );
+
     // Same rules as Codex: serialised on the config directory that holds the
     // login, one request id kept until Claude answers (a cooldown or rate
     // limit is an answer), then a re-probe.
@@ -421,8 +459,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       instanceId,
       driverKind: DRIVER_KIND,
       continuationIdentity: {
-        ...fallbackContinuationIdentity,
-        continuationKey: continuationGroupKey,
+        driverKind: fallbackContinuationIdentity.driverKind,
+        get continuationKey() {
+          return continuationGroupKey;
+        },
       },
       displayName,
       accentColor,
@@ -438,7 +478,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
         ),
-      orchestrationAdapter,
+      orchestrationAdapter: yield* reserveAutoPoolMember(orchestrationAdapter, instanceId),
       textGeneration,
       consumeResetCredit,
     } satisfies ProviderInstance;

@@ -5082,6 +5082,14 @@ function isClaudeEmptyTaskNotificationSuccess(message: SDKMessage): boolean {
   );
 }
 
+const CLAUDE_USAGE_LIMIT_PAUSE_ITEM = "usage-limit:";
+
+/** The notice for a turn Claude Code holds open until a spent usage window resets. */
+export const isClaudeUsageLimitPause = (event: ProviderAdapter.ProviderAdapterV2Event): boolean =>
+  event.type === "turn_item.updated" &&
+  event.turnItem.type === "system_notice" &&
+  event.turnItem.nativeItemRef?.nativeId?.startsWith(CLAUDE_USAGE_LIMIT_PAUSE_ITEM) === true;
+
 // The CLI throttles unchanged rate_limit_event frames, but repeats this
 // undeclared payload on each blocked assistant response.
 const isClaudeBlockedAssistantRateLimit = Schema.is(
@@ -11186,7 +11194,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               const limitKey = `${limitType}:${rateLimitInfo.resetsAt ?? "unknown"}`;
               if (!context.announcedUsageLimits.has(limitKey)) {
                 context.announcedUsageLimits.add(limitKey);
-                const nativeItemId = `usage-limit:${context.providerTurnId}:${limitKey}`;
+                const nativeItemId = `${CLAUDE_USAGE_LIMIT_PAUSE_ITEM}${context.providerTurnId}:${limitKey}`;
                 const notice = describeClaudeUsageLimit(
                   rateLimitInfo,
                   DateTime.toEpochMillis(now),
@@ -14898,6 +14906,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 nativeThreadId,
               ).size > 0
             );
+          }),
+          // The session manager unloads only multi-thread sessions; Auto pools call this before
+          // another account's home resumes the conversation, so it must wait for the CLI to exit.
+          unloadThread: Effect.fn("ClaudeAdapterV2.unloadThread")(function* ({ providerThread }) {
+            const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+            if (nativeThreadId !== undefined && nativeThreadId !== null)
+              yield* closeLiveQueryForNativeThread(nativeThreadId);
           }),
           ensureThread: Effect.fn("ClaudeAdapterV2.ensureThread")(
             function* (threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) {
