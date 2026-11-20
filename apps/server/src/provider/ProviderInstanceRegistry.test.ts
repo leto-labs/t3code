@@ -19,11 +19,13 @@ import {
   SecretProviderId,
   SettingsSecretValue,
   type SecretReference,
+  type ServerSettings as ServerSettingsSchema,
 } from "@t3tools/contracts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import { OpenCodeSettings } from "@t3tools/provider-opencode/settings";
 import { PiDriver } from "@t3tools/provider-pi/server";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -31,6 +33,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Scope from "effect/Scope";
 import * as Fiber from "effect/Fiber";
+import * as Stream from "effect/Stream";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -533,6 +536,73 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
         version: "2.1.219",
         auth: { status: "authenticated" },
       });
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.live("gives a pooled Claude member its Auto pool's continuation key", () =>
+    Effect.gen(function* () {
+      if (yield* HostProcess.isWindows) return;
+
+      const fixtures = yield* makeTildeProviderFixtures();
+      // Test settings publish no changes; the driver follows pool membership through them.
+      const host = yield* ProviderHost.ProviderHost;
+      const changes = yield* PubSub.unbounded<ServerSettingsSchema>();
+      let current = yield* host.settings.get;
+      const publish = (providerInstances: ServerSettingsSchema["providerInstances"]) =>
+        Effect.sync(() => {
+          current = { ...current, providerInstances };
+          return current;
+        }).pipe(Effect.flatMap((next) => PubSub.publish(changes, next)));
+      const memberId = ProviderInstanceId.make("claude_sam");
+      const driver = ProviderDriverKind.make("claudeAgent");
+      const memberEntry = {
+        driver,
+        enabled: true,
+        config: makeClaudeConfig({
+          enabled: true,
+          binaryPath: fixtures.claudeBinaryPath,
+          homePath: fixtures.claudeHomePath,
+        }),
+      };
+      const { registry } = yield* makeProviderInstanceRegistry<ClaudeDriverEnv>({
+        drivers: [ClaudeDriver],
+        configMap: { [memberId]: memberEntry },
+      }).pipe(
+        Effect.provideService(ProviderHost.ProviderHost, {
+          ...host,
+          settings: {
+            ...host.settings,
+            get: Effect.sync(() => current),
+            subscribe: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
+          },
+        }),
+      );
+      const member = (yield* registry.getInstance(memberId))!;
+      const homeKey = `claude:home:${fixtures.claudeHomePath}`;
+      expect(member.continuationIdentity.continuationKey).toBe(homeKey);
+
+      const published = (groupKey: string) =>
+        member.snapshot.streamChanges.pipe(
+          Stream.filter((snapshot) => snapshot.continuation?.groupKey === groupKey),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
+      const pooled = yield* published("claude:auto:claude_auto");
+      yield* publish({
+        [memberId]: memberEntry,
+        [ProviderInstanceId.make("claude_auto")]: {
+          driver,
+          config: { autoPoolMemberIds: [memberId] },
+        },
+      });
+      yield* Fiber.join(pooled);
+      // A thread moving from the member to its pool resumes the same native session.
+      expect(member.continuationIdentity.continuationKey).toBe("claude:auto:claude_auto");
+
+      const released = yield* published(homeKey);
+      yield* publish({ [memberId]: memberEntry });
+      yield* Fiber.join(released);
+      expect(member.continuationIdentity.continuationKey).toBe(homeKey);
     }).pipe(Effect.provide(layerTest)),
   );
 

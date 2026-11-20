@@ -11,6 +11,7 @@ import {
   autoPoolEligible,
   autoPoolHeadroom,
   autoPoolNote,
+  autoPoolWindowGroup,
 } from "./autoPoolPolicy.ts";
 
 const USAGE_FRESHNESS_MS = 60_000;
@@ -88,7 +89,8 @@ function poolEntry(
     const tightest = new Map<string, number>();
     for (const raw of limits.windows) {
       const window = autoPoolCurrentWindow(raw, nowMs);
-      const key = `${window.kind}:${window.model ?? window.limitId ?? ""}`;
+      const key = autoPoolWindowGroup(member, window);
+      if (key === undefined) continue;
       const remaining = 100 - window.usedPercent;
       tightest.set(key, Math.min(tightest.get(key) ?? 100, remaining));
       const group: PoolGroup = groups.get(key) ?? {

@@ -6,6 +6,7 @@ import type {
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import { isClaudeSubscriptionWindow, windowLimitsModel } from "./claudeUsageLimits.ts";
 
 /** Below this share of its binding window, a thread leaves its account at the next turn. */
 const AUTO_POOL_FLOOR_PERCENT = 5;
@@ -131,9 +132,27 @@ export function autoPoolNormalizeSelection(
   };
 }
 
-const appliesTo = (window: ServerProviderUsageWindow, model: string | undefined) =>
-  (window.model === undefined || window.model === model) &&
-  (window.modelIds === undefined || (model !== undefined && window.modelIds.includes(model)));
+// Claude names its model-scoped weekly windows by id and reports paid extra usage as a window.
+const appliesTo =
+  (provider: ServerProvider) =>
+  (window: ServerProviderUsageWindow, model: string | undefined): boolean =>
+    provider.driver === "claudeAgent"
+      ? isClaudeSubscriptionWindow(window) && windowLimitsModel(window, model ?? null)
+      : (window.model === undefined || window.model === model) &&
+        (window.modelIds === undefined || (model !== undefined && window.modelIds.includes(model)));
+
+/**
+ * Which pooled report row a member's window joins, or undefined when it is not subscription
+ * allowance. Claude's window ids name their model scope; other drivers scope by model or limit.
+ */
+export function autoPoolWindowGroup(
+  provider: ServerProvider,
+  window: ServerProviderUsageWindow,
+): string | undefined {
+  if (provider.driver !== "claudeAgent")
+    return `${window.kind}:${window.model ?? window.limitId ?? ""}`;
+  return isClaudeSubscriptionWindow(window) ? `${window.kind}:${window.id}` : undefined;
+}
 
 /**
  * The last published windows that limit `model` (account-wide ones when it is undefined),
@@ -147,7 +166,7 @@ function autoPoolWindows(
   const limits = provider.usageLimits;
   if (!limits || limits.unavailable) return undefined;
   return limits.windows
-    .filter((window) => appliesTo(window, model))
+    .filter((window) => appliesTo(provider)(window, model))
     .map((window) => autoPoolCurrentWindow(window, now));
 }
 
@@ -172,7 +191,7 @@ export function autoPoolResetAt(
   model: string | undefined,
 ): string | null {
   const exhausted = (provider.usageLimits?.windows ?? []).filter(
-    (window) => appliesTo(window, model) && window.usedPercent >= 100,
+    (window) => appliesTo(provider)(window, model) && window.usedPercent >= 100,
   );
   if (exhausted.length === 0 || exhausted.some((window) => !window.resetsAt)) return null;
   return exhausted

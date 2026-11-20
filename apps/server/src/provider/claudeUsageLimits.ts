@@ -63,6 +63,12 @@ export function windowLimitsModel(
   return model !== null && scopeToken(model).includes(window.id.slice(SCOPED_WINDOW_PREFIX.length));
 }
 
+const SPEND_WINDOW_ID = "monthly_spend";
+
+/** Paid extra usage is reported as a window but is not subscription allowance. */
+export const isClaudeSubscriptionWindow = (window: Pick<ServerProviderUsageWindow, "id">) =>
+  window.id !== SPEND_WINDOW_ID;
+
 function scopedWindow(
   displayName: string,
   usedPercent: number,
@@ -217,7 +223,7 @@ export function claudeUsageResponseToLimits(input: {
   const extra = response.rate_limits.extra_usage;
   if (spendPercent !== undefined) {
     windows.push({
-      id: "monthly_spend",
+      id: SPEND_WINDOW_ID,
       kind: "monthly",
       label: "Monthly spend",
       usedPercent: spendPercent,

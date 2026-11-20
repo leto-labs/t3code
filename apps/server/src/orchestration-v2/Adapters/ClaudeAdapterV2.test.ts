@@ -1500,6 +1500,105 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
   );
 });
 
+describe("ClaudeAdapterV2 unloadThread", () => {
+  it.effect("returns only after the CLI stops writing the conversation", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-claude-unload-",
+      });
+      const messages = yield* Queue.unbounded<SDKMessage, Cause.Done>();
+      const closeRequested = yield* Deferred.make<void>();
+      const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
+        instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
+        settings: DEFAULT_CLAUDE_SETTINGS,
+        environment: {},
+        attachmentsDir,
+        fileSystem,
+        path: yield* Path.Path,
+        random: yield* SecureRandom.SecureRandom,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        queryRunner: {
+          allocateSessionId: Effect.succeed("native-thread-claude-unload"),
+          open: () =>
+            Effect.succeed({
+              messages: Stream.fromQueue(messages),
+              offer: () => Effect.void,
+              setModel: () => Effect.void,
+              applyFlagSettings: () => Effect.void,
+              setPermissionMode: () => Effect.void,
+              renameSession: () => Effect.void,
+              backgroundTasks: () => Effect.succeed(false),
+              mcpServerStatus: Effect.succeed([]),
+              readMcpResource: () => Effect.die("unexpected MCP resource read"),
+              callMcpTool: () => Effect.die("unexpected MCP tool call"),
+              mcpAuthenticate: () => Effect.die("unexpected MCP sign-in"),
+              mcpSubmitOAuthCallbackUrl: () => Effect.die("unexpected MCP sign-in"),
+              reconnectMcpServer: () => Effect.die("unexpected MCP reconnect"),
+              listPermissionRules: Effect.succeed([]),
+              stopTask: () => Effect.void,
+              interrupt: Effect.void,
+              // The CLI exits, and its stream ends, after the close request.
+              close: Deferred.succeed(closeRequested, undefined).pipe(Effect.asVoid),
+            }),
+          forkSession: () => Effect.die("unused"),
+          subagentLaunchToolUseId: () => Effect.succeed(null),
+          subagentModel: () => Effect.succeed(null),
+          assertComplete: Effect.void,
+        },
+      });
+      const threadId = ThreadId.make("thread-claude-unload");
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-claude-unload"),
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        runtimePolicy: CLAUDE_TEST_RUNTIME_POLICY,
+      });
+      yield* runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-unload"),
+          text: "Work on it.",
+          attachments: [],
+        }),
+      );
+
+      const unload = yield* runtime.unloadThread!({
+        providerThread,
+        awaitWriterRelease: true,
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(closeRequested);
+      const early = yield* Fiber.join(unload).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkScoped,
+      );
+      yield* TestClock.adjust("1 second");
+      assert.isTrue(
+        Option.isNone(yield* Fiber.join(early)),
+        "unload returned before the CLI exited",
+      );
+      yield* Queue.end(messages);
+      yield* Fiber.join(unload);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+});
+
 describe("ClaudeAdapterV2 append-system-prompt-file launch argument", () => {
   const startTurnWithLaunchArgs = Effect.fnUntraced(function* (launchArgs: string, cwd: string) {
     const fileSystem = yield* FileSystem.FileSystem;
