@@ -47,6 +47,10 @@ interface RootTurn {
   latestOrdinal: number;
   readonly rootTurnIds: Set<ProviderTurnId>;
   readonly attempted: Set<string>;
+  /** Auto stopped a turn its account held for allowance, to continue it elsewhere. */
+  quotaPaused: boolean;
+  /** The highest turn item ordinal seen, so a failure Auto reports for a paused turn sorts last. */
+  itemOrdinal: number;
 }
 
 const accountOf = (member: AutoPoolMember) =>
@@ -73,10 +77,21 @@ export const makeAutoPoolAdapter = (input: {
   readonly quotaFailure: (failure: OrchestrationV2ProviderFailure) => AutoPoolQuotaFailure;
   /** True when the member refused the request for allowance before inference started. */
   readonly isAdmissionQuotaError?: (error: unknown) => boolean;
+  /** True for an event saying the member holds the turn open until its allowance resets. */
+  readonly isQuotaPause?: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean;
+  /**
+   * Makes the native conversation readable by `member` before it resumes it, for drivers whose
+   * accounts keep conversations in separate homes. The previous writer is released by then.
+   */
+  readonly prepareResume?: (
+    member: AutoPoolMember,
+    providerThread: OrchestrationV2ProviderThread,
+  ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
 }) => {
   const { driver, label } = input;
   const capabilities = input.capabilities;
   const admissionQuota = input.isAdmissionQuotaError ?? (() => false);
+  const prepareResume = input.prepareResume ?? (() => Effect.void);
   return ProviderAdapter.ProviderAdapterV2.of({
     instanceId: input.instanceId,
     driver,
@@ -196,6 +211,29 @@ export const makeAutoPoolAdapter = (input: {
                   pendingRequests.add(event.runtimeRequest.id);
                 else pendingRequests.delete(event.runtimeRequest.id);
                 break;
+              case "turn_item.updated":
+                {
+                  if (turn !== undefined && event.turnItem.providerThreadId === thread?.id)
+                    turn.itemOrdinal = Math.max(turn.itemOrdinal, event.turnItem.ordinal);
+                  const providerThread = thread;
+                  const providerTurnId = event.turnItem.providerTurnId;
+                  if (
+                    turn !== undefined &&
+                    turn.stop === undefined &&
+                    !turn.quotaPaused &&
+                    native === current &&
+                    providerThread !== undefined &&
+                    providerTurnId !== null &&
+                    event.turnItem.providerThreadId === providerThread.id &&
+                    input.isQuotaPause?.(event) === true
+                  ) {
+                    turn.quotaPaused = true;
+                    yield* current.runtime
+                      .interruptTurn({ providerThread, providerTurnId })
+                      .pipe(Effect.ignore, Effect.forkIn(sessionScope));
+                  }
+                }
+                break;
               case "node.updated":
                 if (["tool_call", "subagent", "hook"].includes(event.node.kind)) {
                   if (["pending", "running", "waiting"].includes(event.node.status))
@@ -226,15 +264,25 @@ export const makeAutoPoolAdapter = (input: {
                   event.runOrdinal !== turn.input.runOrdinal
                 )
                   break;
-                if (
-                  event.status === "failed" &&
-                  turn.stop === undefined &&
-                  native === current &&
-                  input.quotaFailure(event.failure) !== undefined
-                ) {
+                let quotaTerminal: FailedTerminal | undefined;
+                if (event.status === "failed") {
+                  if (input.quotaFailure(event.failure) !== undefined) quotaTerminal = event;
+                } else if (turn.quotaPaused && event.status !== "completed") {
+                  quotaTerminal = {
+                    ...event,
+                    status: "failed",
+                    failureItemOrdinal: turn.itemOrdinal + 1,
+                    failure: makeProviderFailure({
+                      class: "usage_limit",
+                      message: "The account paused the turn until its usage limit resets.",
+                      code: "usageLimitPause",
+                    }),
+                  };
+                }
+                if (quotaTerminal !== undefined && turn.stop === undefined && native === current) {
                   turn.rootTurnIds.add(event.providerTurnId);
                   // Recovery closes this reader's process, so it runs outside the reader.
-                  yield* recover(event, current, turn).pipe(Effect.forkIn(sessionScope));
+                  yield* recover(quotaTerminal, current, turn).pipe(Effect.forkIn(sessionScope));
                   return;
                 }
                 yield* input.router.release(threadId);
@@ -295,6 +343,7 @@ export const makeAutoPoolAdapter = (input: {
         runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
       ) {
         if (current.loaded || !thread?.nativeThreadRef) return;
+        yield* prepareResume(current.member, thread);
         thread = stamp(
           yield* current.runtime.resumeThread({
             providerThread: thread,
@@ -420,6 +469,7 @@ export const makeAutoPoolAdapter = (input: {
                 },
               };
               yield* switchTo(next, state.input.runtimePolicy);
+              state.quotaPaused = false;
               yield* startRoot(state);
               if (state.stop !== undefined) yield* interruptLatest(state.stop);
               return { done: true } as const;
@@ -464,6 +514,14 @@ export const makeAutoPoolAdapter = (input: {
                 )
               : use(native.runtime),
           ),
+        );
+
+      // Without a process, the next turn applies the change.
+      const ifNative = (
+        use: (runtime: Runtime) => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>,
+      ) =>
+        lock.withPermit(
+          Effect.suspend(() => (native === undefined ? Effect.void : use(native.runtime))),
         );
 
       const first = yield* open(
@@ -515,7 +573,8 @@ export const makeAutoPoolAdapter = (input: {
               request.runtimePolicy ?? sessionInput.runtimePolicy,
               sessionInput.projectId,
               (current, modelSelection) =>
-                current.runtime.resumeThread({ ...request, modelSelection }).pipe(
+                prepareResume(current.member, request.providerThread).pipe(
+                  Effect.andThen(current.runtime.resumeThread({ ...request, modelSelection })),
                   Effect.map((resumed) => {
                     current.loaded = true;
                     thread = stamp(resumed, current.member);
@@ -537,6 +596,8 @@ export const makeAutoPoolAdapter = (input: {
                   latestOrdinal: 0,
                   rootTurnIds: new Set(),
                   attempted: new Set(),
+                  quotaPaused: false,
+                  itemOrdinal: 0,
                 };
                 turn = state;
                 const chosen = yield* reserve(
@@ -579,6 +640,30 @@ export const makeAutoPoolAdapter = (input: {
         rollbackThread: (request) => withNative((runtime) => runtime.rollbackThread(request)),
         forkThread: (request) => withNative((runtime) => runtime.forkThread(request)),
         // Members run the same driver's adapter, so the first runtime decides which extras exist.
+        ...(optional.backgroundTasksEndWithProcess
+          ? { backgroundTasksEndWithProcess: optional.backgroundTasksEndWithProcess }
+          : {}),
+        ...(optional.applyModelSelection
+          ? {
+              applyModelSelection: (
+                request: Parameters<NonNullable<Runtime["applyModelSelection"]>>[0],
+              ) => ifNative((runtime) => runtime.applyModelSelection!(request)),
+            }
+          : {}),
+        ...(optional.applyThreadTitle
+          ? {
+              applyThreadTitle: (
+                request: Parameters<NonNullable<Runtime["applyThreadTitle"]>>[0],
+              ) => ifNative((runtime) => runtime.applyThreadTitle!(request)),
+            }
+          : {}),
+        ...(optional.awaitBackgroundTasks
+          ? {
+              awaitBackgroundTasks: (
+                request: Parameters<NonNullable<Runtime["awaitBackgroundTasks"]>>[0],
+              ) => withNative((runtime) => runtime.awaitBackgroundTasks!(request)),
+            }
+          : {}),
         ...(optional.compactThread
           ? {
               compactThread: (request: ProviderAdapter.ProviderAdapterV2TurnInput) =>

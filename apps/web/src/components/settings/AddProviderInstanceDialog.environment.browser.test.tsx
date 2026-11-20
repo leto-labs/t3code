@@ -229,6 +229,33 @@ describe("AddProviderInstanceDialog environment routing", () => {
     });
   });
 
+  it("creates Claude Auto as a Claude instance that lists its accounts", async () => {
+    setup();
+    settingsHooks.read.mockReturnValue({
+      providerInstances: {
+        claudeAgent_claude_sam: { driver: "claudeAgent", displayName: "Sam" },
+      },
+    });
+    await using _screen = await render(dialog());
+    await act(async () => radio("Claude Auto")!.click());
+    await click("Next");
+    await click("Next");
+    await act(async () =>
+      document.querySelector<HTMLElement>('[aria-label="Include Sam in Claude Auto"]')!.click(),
+    );
+    await click("Add instance");
+    expect(settingsHooks.mutate).toHaveBeenCalledWith({
+      operation: "create",
+      instanceId: "claude_auto",
+      instance: {
+        driver: "claudeAgent",
+        enabled: true,
+        displayName: "Claude Auto",
+        config: { autoPoolMemberIds: ["claudeAgent_claude_sam"] },
+      },
+    });
+  });
+
   it("awaits an atomic create before closing and retains prepared ACP metadata", async () => {
     setup();
     const mutation = deferred<{ readonly _tag: "Success"; readonly value: unknown }>();

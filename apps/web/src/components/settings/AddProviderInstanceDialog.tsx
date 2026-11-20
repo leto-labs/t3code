@@ -78,6 +78,13 @@ const DRIVER_OPTIONS = providerClients.definitions.filter(
 const AUTO_POOL_OPTIONS = [
   // oxlint-disable-next-line t3code/no-untranslated-copy -- product name
   { driverKind: DEFAULT_DRIVER_KIND, label: "Codex Auto", value: "codex-auto", id: "codex_auto" },
+  {
+    driverKind: ProviderDriverKind.make("claudeAgent"),
+    // oxlint-disable-next-line t3code/no-untranslated-copy -- product name
+    label: "Claude Auto",
+    value: "claude-auto",
+    id: "claude_auto",
+  },
 ].flatMap(({ driverKind, label, value, id }) => {
   const definition = providerClients.get(driverKind);
   return definition ? [{ ...definition, label, optionValue: value, autoInstanceId: id }] : [];
