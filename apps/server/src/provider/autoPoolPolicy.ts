@@ -2,6 +2,7 @@ import type {
   ModelSelection,
   ProviderOptionDescriptor,
   ServerProvider,
+  ServerProviderAuthStatus,
   ServerProviderModel,
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
@@ -24,6 +25,14 @@ export function autoPoolEligible(provider: ServerProvider): boolean {
     provider.status !== "error" &&
     provider.auth.status === "authenticated"
   );
+}
+
+/** Auto is signed in when any member is; it is signed out only when every member is. */
+export function autoPoolAuthStatus(members: readonly ServerProvider[]): ServerProviderAuthStatus {
+  if (members.some((member) => member.auth.status === "authenticated")) return "authenticated";
+  return members.length > 0 && members.every((member) => member.auth.status === "unauthenticated")
+    ? "unauthenticated"
+    : "unknown";
 }
 
 function intersectOptions(
