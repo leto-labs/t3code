@@ -37,7 +37,7 @@ import { ChildProcessSpawner } from "effect/process";
 import { vi } from "vite-plus/test";
 import * as ServerConfig from "../../config.ts";
 import * as ClaudeAdapterV2 from "../../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
-import { autoPoolChoose, autoPoolHeadroom } from "../autoPoolPolicy.ts";
+import { autoPoolAuthStatus, autoPoolChoose, autoPoolHeadroom } from "../autoPoolPolicy.ts";
 import { providerUsageReport } from "../providerUsageReport.ts";
 import { codexAutoFixture } from "../testUtils/codexAuto.ts";
 import {
@@ -123,6 +123,15 @@ it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
       remaining: 60,
       binding: { kind: "weekly", remaining: 60, resetsAt: Date.parse(iso(24)) },
     });
+  });
+
+  it("reports Auto as signed in only while a member account is", () => {
+    const signedIn = claudeMember("alice", []).read();
+    const signedOut = { ...signedIn, auth: { status: "unauthenticated" as const } };
+    const unknown = { ...signedIn, auth: { status: "unknown" as const } };
+    expect(autoPoolAuthStatus([signedOut, signedIn])).toBe("authenticated");
+    expect(autoPoolAuthStatus([signedOut, signedOut])).toBe("unauthenticated");
+    expect(autoPoolAuthStatus([signedOut, unknown])).toBe("unknown");
   });
 
   it("filters on a spent session window without ordering by it", () => {

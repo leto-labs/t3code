@@ -45,6 +45,7 @@ import {
   autoPoolAccountKey,
   autoPoolEligible,
   autoPoolHeadroom,
+  autoPoolAuthStatus,
   autoPoolModels,
   type AutoPoolHeadroom,
 } from "../autoPoolPolicy.ts";
@@ -258,7 +259,7 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
       installed: accounts.every((account) => account.snapshot.installed),
       status: "ready" as const,
       message: `Using ${accounts.length} selected Claude subscription account${accounts.length === 1 ? "" : "s"}.`,
-      auth: { status: "authenticated" as const },
+      auth: { status: autoPoolAuthStatus(accounts.map((account) => account.snapshot)) },
       models: autoPoolModels(accounts.map((account) => account.snapshot)),
     };
   }).pipe(

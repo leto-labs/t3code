@@ -36,7 +36,7 @@ import {
   codexAutoAdmissionQuotaError,
   isCodexAutoAdmissionQuotaError,
 } from "../codexAutoPolicy.ts";
-import { autoPoolAccountKey } from "../autoPoolPolicy.ts";
+import { autoPoolAccountKey, autoPoolAuthStatus } from "../autoPoolPolicy.ts";
 import { codexRateLimitsToLimits } from "../codexUsageLimits.ts";
 import {
   followAutoPoolMembers,
@@ -210,7 +210,10 @@ export const makeCodexAutoProvider = Effect.fn("makeCodexAutoProvider")(function
       installed: accounts.every((account) => account.snapshot.installed),
       status: "ready" as const,
       message: `Using ${accounts.length} selected Codex subscription account${accounts.length === 1 ? "" : "s"}.`,
-      auth: { status: "authenticated" as const, type: "chatgpt" },
+      auth: {
+        status: autoPoolAuthStatus(accounts.map((account) => account.snapshot)),
+        type: "chatgpt",
+      },
       models: codexAutoModels(accounts.map((account) => account.snapshot)),
     };
   }).pipe(
