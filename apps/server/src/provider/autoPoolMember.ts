@@ -1,7 +1,7 @@
 import {
   autoPoolMemberRejection,
   autoPoolOwnerId,
-  providerInstanceConfigEnabledFlag,
+  resolveProviderInstanceEnabled,
   readAutoPools,
   type ProviderDriverKind,
   type ProviderInstanceConfigMap,
@@ -66,8 +66,7 @@ export function currentAutoPool(
   driver: ProviderDriverKind,
 ) {
   const entry = instances[instanceId];
-  if (entry?.driver !== driver || providerInstanceConfigEnabledFlag(entry.config) === false)
-    return undefined;
+  if (entry?.driver !== driver || !resolveProviderInstanceEnabled(entry)) return undefined;
   const pool = readAutoPools({ [instanceId]: entry })[0];
   return pool &&
     !pool.memberIds.includes(instanceId) &&
