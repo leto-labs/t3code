@@ -61,13 +61,13 @@ const runtimePolicy = {
   interactionMode: "default" as const,
 };
 
-const markSpent = (account: ReturnType<typeof codexAutoFixture>) => {
+const setUsage = (account: ReturnType<typeof codexAutoFixture>, usedPercent = 100) => {
   const snapshot = account.read();
   account.set({
     ...snapshot,
     usageLimits: {
       ...snapshot.usageLimits!,
-      windows: snapshot.usageLimits!.windows.map((window) => ({ ...window, usedPercent: 100 })),
+      windows: snapshot.usageLimits!.windows.map((window) => ({ ...window, usedPercent })),
     },
   });
 };
@@ -101,6 +101,8 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
   const now = yield* DateTime.now;
   const iso = DateTime.formatIso(now);
   const accounts = [codexAutoFixture("a", iso), codexAutoFixture("b", iso)];
+  const load = yield* AutoPoolAccountLoad;
+  const loadsAtStart: number[] = [];
   const sharedHome = path.join(stateDir, ".codex");
   const overlays = new Map<string, string>();
   for (const account of accounts) {
@@ -277,6 +279,7 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
               );
               const history: readonly string[] = JSON.parse(yield* fs.readFileString(sessionFile));
               starts.push({ account: id, input, history });
+              loadsAtStart.push(load.count(autoPoolAccountKey(member.snapshot)!, ""));
               log.push(`start:${id}`);
               nativeStarts++;
               if (id === "b" && mode === "stop-race") {
@@ -345,7 +348,12 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
                   >["providerTurn"],
                 });
               }
-              if (nativeStarts === 1 && mode !== "identity" && !mode.startsWith("admission")) {
+              if (
+                nativeStarts === 1 &&
+                mode !== "identity" &&
+                mode !== "busy-resume" &&
+                !mode.startsWith("admission")
+              ) {
                 if (mode === "pending")
                   yield* Queue.offer(nativeEvents, {
                     type: "runtime_request.updated",
@@ -541,7 +549,9 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
     );
   return {
     adapter,
+    router,
     accounts,
+    loadsAtStart,
     runtime,
     turn,
     starts,
@@ -710,7 +720,7 @@ it.layer(NodeServices.layer)("Codex Auto native recovery", (it) => {
   it.effect("resumes the conversation on the available member before handoff probes", () =>
     Effect.gen(function* () {
       const h = yield* harness("identity");
-      markSpent(h.accounts[0]!);
+      setUsage(h.accounts[0]!);
       const resumed = yield* h.runtime.resumeThread({
         threadId: h.turn.appThread.id,
         providerThread: h.turn.providerThread,
@@ -726,7 +736,7 @@ it.layer(NodeServices.layer)("Codex Auto native recovery", (it) => {
   it.effect("preserves a loaded conversation when background work blocks the switch", () =>
     Effect.gen(function* () {
       const h = yield* harness("busy-resume");
-      markSpent(h.accounts[0]!);
+      setUsage(h.accounts[0]!);
       const refused = yield* h.runtime.resumeLoadedThread!({
         threadId: h.turn.threadId,
         providerThread: h.turn.providerThread,
@@ -741,6 +751,30 @@ it.layer(NodeServices.layer)("Codex Auto native recovery", (it) => {
       expect(h.closes).toEqual([]);
       expect(h.turn.providerThread.nativeThreadRef?.nativeId).toBe("native-shared-history");
     }),
+  );
+
+  it.effect(
+    "keeps serving the sticky member with allowance while a voluntary switch is blocked",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* harness("busy-resume");
+        setUsage(h.accounts[0]!, 96);
+        yield* h.runtime.resumeLoadedThread!({
+          threadId: h.turn.threadId,
+          providerThread: h.turn.providerThread,
+          modelSelection: h.turn.modelSelection,
+          runtimePolicy: h.turn.runtimePolicy,
+        });
+        yield* h.runtime.startTurn(h.turn);
+        expect((yield* h.readTerminal())[0]).toMatchObject({ status: "completed" });
+        expect(h.starts.map((turn) => turn.account)).toEqual(["a"]);
+        expect(h.loadsAtStart).toEqual([1]);
+        setUsage(h.accounts[0]!, 80);
+        const reserved = yield* h.router.reserve(h.turn.threadId, h.turn.modelSelection);
+        expect(reserved.instance.instanceId).toBe("a");
+        expect(h.opens).toEqual(["a"]);
+        expect(h.closes).toEqual([]);
+      }),
   );
 
   it.effect("hands off quota-limited turns with a queued child", () =>

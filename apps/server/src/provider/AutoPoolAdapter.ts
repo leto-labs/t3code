@@ -358,18 +358,26 @@ export const makeAutoPoolAdapter = (input: {
           accountOf(chosen) === accountOf(native.member)
         )
           return;
-        if (native !== undefined && !(yield* safeToSwitch(native)))
+        if (native !== undefined && !(yield* safeToSwitch(native))) {
+          const retained = yield* input.router
+            .reserveCurrent(threadId, selection, projectId, native.member)
+            .pipe(Effect.result);
+          if (retained._tag === "Success" && retained.success) return;
           return yield* new ProviderAdapter.ProviderAdapterResumeThreadError({
             driver,
             providerSessionId: sessionInput.providerSessionId,
             providerThreadId: providerThread.id,
             preserveNativeThread: true,
-            cause: new ProviderSetupError({
-              instanceId: input.instanceId,
-              operation: "session",
-              detail: `Resolve pending provider work before switching ${label} accounts.`,
-            }),
+            cause:
+              retained._tag === "Failure"
+                ? retained.failure
+                : new ProviderSetupError({
+                    instanceId: input.instanceId,
+                    operation: "session",
+                    detail: `Resolve pending provider work before switching ${label} accounts.`,
+                  }),
           });
+        }
         yield* switchTo(chosen, runtimePolicy);
       });
 
