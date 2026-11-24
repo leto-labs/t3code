@@ -24,7 +24,7 @@ export function limitRecoveryDeliveryMode(
   nowMs: number,
   poolCanRetryEarly?: boolean,
 ): "reset" | "headroom" | "expired" | null {
-  if (poolCanRetryEarly !== undefined && timing.failedAtMs < autoPoolRecoveryCutoff(nowMs))
+  if (poolCanRetryEarly !== undefined && timing.resetMs < autoPoolRecoveryCutoff(nowMs))
     return "expired";
   if (timing.reported && timing.resetMs <= nowMs) return "reset";
   return poolCanRetryEarly === true ? "headroom" : null;
