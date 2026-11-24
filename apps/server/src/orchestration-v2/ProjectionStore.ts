@@ -209,7 +209,13 @@ export type ProjectionLimitRecoveryCandidate = Pick<
   | "updatedAt"
   | "limitRecovery"
   | "snoozedUntil"
->;
+> & {
+  readonly autoPool?: {
+    readonly selection: OrchestrationV2AppThread["modelSelection"];
+    readonly projectId: ProjectId;
+    readonly observedAfter?: number;
+  };
+};
 
 export type ProjectionThreadPullRequests = Pick<
   OrchestrationV2AppThread,
@@ -681,6 +687,7 @@ export interface ProjectionStoreV2Shape {
     readonly now: DateTime.Utc;
     readonly autoResume: boolean;
     readonly snooze: boolean;
+    readonly autoPoolInstanceIds?: readonly ProviderInstanceId[];
   }) => Effect.Effect<ReadonlyArray<ProjectionLimitRecoveryCandidate>, ProjectionStoreV2Error>;
   /** Epoch ms of the next armed reset or snooze end after `now`, when a waiting thread becomes a candidate. */
   readonly getLimitRecoveryWakeAt: (
@@ -5045,14 +5052,30 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     const getLimitRecoveryCandidates = Effect.fn("ProjectionStore.getLimitRecoveryCandidates")(
       function* (options: Parameters<ProjectionStoreV2Shape["getLimitRecoveryCandidates"]>[0]) {
+        const poolIds = options.autoPoolInstanceIds ?? [];
+        const isPool =
+          poolIds.length === 0
+            ? sql`0`
+            : sql`COALESCE(t.provider_instance_id IN ${sql.in(poolIds)} AND t.provider_instance_id = r.provider_instance_id, 0)`;
+        const sameRecovery = sql`
+          json_extract(t.payload_json, '$.limitRecovery.runId') IS r.run_id
+          AND (
+            (${isPool})
+            OR json_extract(t.payload_json, '$.limitRecovery.resetAt') IS json_extract(item.payload_json, '$.failure.resetAt')
+          )
+        `;
         const rows = yield* sql<{
           readonly payload_json: string;
           readonly run_id: string;
           readonly completed_at: string | null;
           readonly failure_payload_json: string;
           readonly last_error: string | null;
+          readonly is_pool: number;
+          readonly is_recovery_run: number;
         }>`
           SELECT t.payload_json, r.run_id, r.completed_at,
+            (${isPool}) AS is_pool,
+            json_type(r.payload_json, '$.usageLimitContinuationOfRunId') IS NOT NULL AS is_recovery_run,
             item.payload_json AS failure_payload_json,
             (
               SELECT json_extract(session.payload_json, '$.lastError')
@@ -5103,24 +5126,27 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
             AND json_valid(item.payload_json)
             AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
-            AND json_extract(item.payload_json, '$.failure.resetAt') IS NOT NULL
-            AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
+            AND (
+              (${isPool})
+              OR julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
+            )
             AND (
               (
-                json_extract(t.payload_json, '$.limitRecovery.runId') IS r.run_id
-                AND json_extract(t.payload_json, '$.limitRecovery.resetAt') IS json_extract(item.payload_json, '$.failure.resetAt')
+                (${sameRecovery})
                 AND json_extract(t.payload_json, '$.limitRecovery.autoResume') = 1
-                AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) <= julianday(${DateTime.formatIso(options.now)})
                 AND (
-                  json_extract(t.payload_json, '$.snoozedUntil') IS NULL
-                  OR julianday(json_extract(t.payload_json, '$.snoozedUntil')) <= julianday(${DateTime.formatIso(options.now)})
+                  (${isPool})
+                  OR (
+                    julianday(json_extract(item.payload_json, '$.failure.resetAt')) <= julianday(${DateTime.formatIso(options.now)})
+                    AND (
+                      json_extract(t.payload_json, '$.snoozedUntil') IS NULL
+                      OR julianday(json_extract(t.payload_json, '$.snoozedUntil')) <= julianday(${DateTime.formatIso(options.now)})
+                    )
+                  )
                 )
               )
               OR (
-                (
-                  json_extract(t.payload_json, '$.limitRecovery.runId') IS NOT r.run_id
-                  OR json_extract(t.payload_json, '$.limitRecovery.resetAt') IS NOT json_extract(item.payload_json, '$.failure.resetAt')
-                )
+                NOT (${sameRecovery})
                 AND (
                   ${booleanInt(options.autoResume)}
                   OR (${booleanInt(options.snooze)} AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(${DateTime.formatIso(options.now)}))
@@ -5153,14 +5179,30 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             row.last_error,
           );
           if (summary.lastErrorClass !== "usage_limit") continue;
+          const latestRunCompletedAt =
+            row.completed_at === null ? null : DateTime.makeUnsafe(row.completed_at);
           candidates.push({
             id: thread.id,
             status: "failed",
             lastErrorClass: summary.lastErrorClass,
             usageLimitResetAt: summary.usageLimitResetAt,
             latestRunId: RunId.make(row.run_id),
-            latestRunCompletedAt:
-              row.completed_at === null ? null : DateTime.makeUnsafe(row.completed_at),
+            latestRunCompletedAt,
+            ...(row.is_pool
+              ? {
+                  autoPool: {
+                    selection: thread.modelSelection,
+                    projectId: thread.projectId,
+                    ...(row.is_recovery_run
+                      ? {
+                          observedAfter: DateTime.toEpochMillis(
+                            latestRunCompletedAt ?? thread.updatedAt,
+                          ),
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
             updatedAt: thread.updatedAt,
             archivedAt: thread.archivedAt,
             settledOverride: thread.settledOverride,
