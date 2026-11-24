@@ -210,6 +210,17 @@ const antigravityProviderInstance = {
   },
 } satisfies ProviderInstance;
 
+const poolInstanceId = ProviderInstanceId.make("codex_auto");
+const poolProviderInstance = {
+  ...providerInstance,
+  instanceId: poolInstanceId,
+  orchestrationAdapter: {
+    ...orchestrationAdapter,
+    instanceId: poolInstanceId,
+    hasUsageAllowance: () => Effect.succeed(true),
+  },
+} satisfies ProviderInstance;
+
 const layerTestProviderInstanceRegistry = Layer.merge(
   ModelManifest.layerTest,
   Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
@@ -217,6 +228,7 @@ const layerTestProviderInstanceRegistry = Layer.merge(
       Effect.succeed(
         [
           providerInstance,
+          poolProviderInstance,
           alternateProviderInstance,
           claudeProviderInstance,
           antigravityProviderInstance,
@@ -12935,6 +12947,8 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
 
   it.effect.each([
     "resume",
+    "pool-headroom",
+    "pool-unknown-reset",
     "resume-started",
     "resume-untagged",
     "queued-resume",
@@ -12956,13 +12970,15 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const events = yield* EventSink.EventSinkV2;
+      const pool = scenario === "pool-headroom" || scenario === "pool-unknown-reset";
+      const selection = pool ? { ...modelSelection, instanceId: poolInstanceId } : modelSelection;
       const threadId = ThreadId.make(`recovery:${scenario}`);
       const projectId = ProjectId.make(`recovery:project:${scenario}`);
       yield* seedProject({
         projectId,
         title: "Recovery project",
         workspaceRoot: process.cwd(),
-        defaultModelSelection: modelSelection,
+        defaultModelSelection: selection,
         createdAt: DateTime.formatIso(yield* DateTime.now),
       });
       yield* orchestrator.dispatch({
@@ -12971,7 +12987,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
         threadId,
         projectId,
         title: "Limited thread",
-        modelSelection,
+        modelSelection: selection,
         runtimeMode: "full-access",
         interactionMode: "default",
         branch: null,
@@ -13049,7 +13065,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
                 message: "Plan limit reached.",
                 code: "usageLimitExceeded",
                 retryable: null,
-                resetAt,
+                resetAt: scenario === "pool-unknown-reset" ? null : resetAt,
               },
             },
           },
@@ -13082,6 +13098,53 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       const shell = (yield* orchestrator.getShellSnapshot()).threads.find(
         (thread) => thread.id === threadId,
       )!;
+      if (pool) {
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const readCandidate = projections
+          .getLimitRecoveryCandidates({
+            now,
+            autoResume: true,
+            snooze: false,
+            autoPoolInstanceIds: [poolInstanceId],
+          })
+          .pipe(Effect.map((rows) => rows.find((row) => row.id === threadId)!));
+        const candidate = yield* readCandidate;
+        assert.equal(candidate.autoPool?.selection.instanceId, poolInstanceId);
+        const availability = { hasHeadroom: true };
+        const arm = limitRecoveryCommand(
+          candidate,
+          true,
+          DateTime.toEpochMillis(now),
+          false,
+          undefined,
+          availability,
+        );
+        assert(arm?.type === "thread.metadata.update" && arm.limitRecovery != null);
+        yield* orchestrator.autoArmLimitRecovery({
+          commandId: arm.commandId,
+          threadId,
+          limitRecovery: arm.limitRecovery,
+        });
+        const resume = limitRecoveryCommand(
+          yield* readCandidate,
+          true,
+          DateTime.toEpochMillis(now),
+          false,
+          undefined,
+          availability,
+        );
+        assert(resume?.type === "message.dispatch");
+        yield* orchestrator.dispatch(resume);
+        yield* orchestrator.dispatch(resume);
+        const recovered = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(recovered.runs, 2);
+        assert.equal(recovered.runs[1]?.usageLimitContinuationOfRunId, run.id);
+        assert.equal(
+          recovered.messages.find((message) => message.id === resume.messageId)?.text,
+          "Work on this.",
+        );
+        return;
+      }
       assert.isNull(limitRecoveryCommand(shell, false, DateTime.toEpochMillis(now)));
       if (scenario === "invalid-snooze") {
         const result = yield* orchestrator
