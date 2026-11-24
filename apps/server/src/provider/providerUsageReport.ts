@@ -28,7 +28,7 @@ interface PoolGroup {
 
 function usageEntry(provider: ServerProvider, nowMs: number, maxAgeMs: number): ReportEntry {
   const limits = provider.usageLimits;
-  const stale = autoPoolUsageIsStale(provider, nowMs, maxAgeMs);
+  const stale = autoPoolUsageIsStale(provider, nowMs, 2 * maxAgeMs);
   return {
     instanceId: provider.instanceId,
     driver: provider.driver,

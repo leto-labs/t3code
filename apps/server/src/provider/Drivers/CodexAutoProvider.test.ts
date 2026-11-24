@@ -87,12 +87,16 @@ const makeFixture = Effect.fn("CodexAutoProvider.test.fixture")(function* (
       [poolId]: { driver: ProviderDriverKind.make("codex"), config },
     } as ProviderInstanceConfigMap,
   };
-  const setMembers = (ids: readonly ProviderInstanceId[]) => {
+  const setMembers = (ids: readonly ProviderInstanceId[], enabled = true) => {
     settings = {
       ...settings,
       providerInstances: {
         ...configs,
-        [poolId]: { driver: ProviderDriverKind.make("codex"), config: { autoPoolMemberIds: ids } },
+        [poolId]: {
+          driver: ProviderDriverKind.make("codex"),
+          enabled,
+          config: { autoPoolMemberIds: ids },
+        },
       },
     };
   };
@@ -266,6 +270,8 @@ it.layer(NodeServices.layer)("Codex Auto instance", (it) => {
         ...selection,
         options: [{ id: "serviceTier", value: "ultrafast" }],
       });
+      setMembers([open!.instance.instanceId], false);
+      expect(yield* adapter.hasUsageAllowance!(selection, projectId)).toBe(false);
     }),
   );
 

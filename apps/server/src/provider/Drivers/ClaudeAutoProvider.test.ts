@@ -191,7 +191,7 @@ it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
       ]).read(),
     ];
     const auto: ServerProvider = { ...members[0]!, instanceId: poolId };
-    const report = providerUsageReport([auto, ...members], "2026-11-20T12:02:00.000Z", {
+    const report = providerUsageReport([auto, ...members], "2026-11-20T12:17:00.000Z", {
       pools: [
         { instanceId: poolId, memberIds: members.map((m) => m.instanceId), maxRunningTurns: 3 },
       ],
