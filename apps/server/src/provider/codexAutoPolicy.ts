@@ -8,7 +8,7 @@ import {
 import * as Schema from "effect/Schema";
 import { ProviderUsageLimitError } from "@t3tools/provider-core/server/failure";
 import {
-  autoPoolEligible,
+  autoPoolSubscriptionEligible,
   autoPoolHeadroom,
   autoPoolModels,
   type AutoPoolHeadroom,
@@ -50,7 +50,7 @@ export function codexAutoHeadroom(
   selection: ModelSelection,
   now: number,
 ): AutoPoolHeadroom | undefined {
-  if (!autoPoolEligible(provider) || provider.auth.type !== "chatgpt") return undefined;
+  if (!autoPoolSubscriptionEligible(provider)) return undefined;
   return autoPoolHeadroom(provider, selection.model, now);
 }
 

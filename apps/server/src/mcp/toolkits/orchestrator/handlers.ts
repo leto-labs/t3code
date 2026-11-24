@@ -1,6 +1,8 @@
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import { OrchestratorToolkit } from "./tools.ts";
 import * as Effect from "effect/Effect";
+import * as Duration from "effect/Duration";
+import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 
 import * as PeerForwarding from "../../../peer/PeerForwarding.ts";
 import * as PeerLinkRequests from "../../../peer/PeerLinkRequests.ts";
@@ -20,11 +22,14 @@ const handlers = {
     Effect.gen(function* () {
       const registry = yield* ProviderRegistry.ProviderRegistry;
       const settings = yield* ServerSettings.ServerSettingsService;
-      const pools = yield* settings.getSettings.pipe(
-        Effect.map((current) => readAutoPools(current.providerInstances)),
-        Effect.orElseSucceed(() => []),
+      const current = yield* settings.getSettings.pipe(Effect.option);
+      if (current._tag === "None") return yield* registry.usageReport(input);
+      const refresh = resolveServerBackgroundActivitySettings(current.value);
+      return yield* registry.usageReport(
+        input,
+        readAutoPools(current.value.providerInstances),
+        Duration.toMillis(refresh.providerHealthRefreshInterval),
       );
-      return yield* registry.usageReport(input, pools);
     }),
   ),
   orchestrator_capabilities: McpToolAccess.reads((input) =>

@@ -148,6 +148,11 @@ it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
     expect(autoPoolHeadroom(busy, OPUS, NOW)?.binding.kind).toBe("weekly");
   });
 
+  it("admits a new Claude subscription with a successful probe and no windows observed", () => {
+    const account = claudeMember("unused", []).read();
+    expect(claudeAutoHeadroom(account, selection, NOW)?.remaining).toBe(100);
+  });
+
   it("routes Fable away from an account whose Fable allowance is spent, but keeps Opus there", () => {
     const alice = claudeMember("alice", [
       window("seven_day", "weekly", 20, 24),
@@ -186,7 +191,7 @@ it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
       ]).read(),
     ];
     const auto: ServerProvider = { ...members[0]!, instanceId: poolId };
-    const report = providerUsageReport([auto, ...members], iso(0), {
+    const report = providerUsageReport([auto, ...members], "2026-11-20T12:02:00.000Z", {
       pools: [
         { instanceId: poolId, memberIds: members.map((m) => m.instanceId), maxRunningTurns: 3 },
       ],
@@ -204,6 +209,7 @@ it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
       { id: "pool:weekly:seven_day_fable", remainingPercent: 60, resetsAt: iso(24) },
     ]);
     expect(entry!.members?.map((member) => member.instanceId)).toEqual(["alice", "sam"]);
+    expect(entry!.members?.map((member) => member.status)).toEqual(["available", "available"]);
   });
 });
 
@@ -235,6 +241,7 @@ const promptText = (message: SDKUserMessage) => {
 const harness = Effect.fn("ClaudeAutoProvider.test.harness")(function* (turns: {
   readonly alice: readonly Turn[];
   readonly sam: readonly Turn[];
+  readonly failedProbe?: boolean;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -250,7 +257,9 @@ const harness = Effect.fn("ClaudeAutoProvider.test.harness")(function* (turns: {
   };
   accounts.alice.onRefresh((current) => ({
     ...current,
-    usageLimits: { checkedAt: iso(1), windows: [window("seven_day", "weekly", 100, 24)] },
+    usageLimits: turns.failedProbe
+      ? { ...current.usageLimits!, lastAttemptFailed: true }
+      : { checkedAt: iso(1), windows: [window("seven_day", "weekly", 100, 24)] },
   }));
   const appendLine = (member: keyof typeof homes, line: unknown) =>
     fs
@@ -336,7 +345,11 @@ const harness = Effect.fn("ClaudeAutoProvider.test.harness")(function* (turns: {
                   ? [
                       frame({
                         type: "rate_limit_event",
-                        rate_limit_info: { status: "rejected", rateLimitType: "seven_day" },
+                        rate_limit_info: {
+                          status: "rejected",
+                          rateLimitType: turns.failedProbe ? "five_hour" : "seven_day",
+                          ...(turns.failedProbe ? { resetsAt: Date.parse(iso(1)) / 1000 } : {}),
+                        },
                         uuid: uuid("00000000002"),
                         session_id: sessionId,
                       }),
@@ -425,6 +438,7 @@ const harness = Effect.fn("ClaudeAutoProvider.test.harness")(function* (turns: {
           random: yield* SecureRandom.SecureRandom,
           idAllocator: yield* IdAllocator.IdAllocatorV2,
           queryRunner: queryRunner(id),
+          onUsageLimits: (update) => accounts[id].instance.snapshot.applyUsageLimits(update),
         });
         return yield* native.openSession(session);
       }).pipe(Effect.provideContext(services)),
@@ -532,11 +546,11 @@ it.layer(layer)("Claude Auto account switching", (it) => {
       }),
   );
 
-  it.effect(
-    "stops a turn its account holds for a usage limit and continues on another account",
-    () =>
+  it.effect.each([false, true])(
+    "stops a turn held for a usage limit and continues on another account (probe failed: %s)",
+    (failedProbe) =>
       Effect.gen(function* () {
-        const h = yield* harness({ alice: ["pause"], sam: ["done"] });
+        const h = yield* harness({ alice: ["pause"], sam: ["done"], failedProbe });
         const providerThread = yield* h.runtime.ensureThread({
           threadId: h.threadId,
           modelSelection: selection,

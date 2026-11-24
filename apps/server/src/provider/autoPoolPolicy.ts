@@ -7,10 +7,24 @@ import type {
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import { isClaudeSubscriptionWindow, windowLimitsModel } from "./claudeUsageLimits.ts";
 
 /** Below this share of its binding window, a thread leaves its account at the next turn. */
 const AUTO_POOL_FLOOR_PERCENT = 5;
+
+export const AUTO_POOL_USAGE_REFRESH_INTERVAL_MS = Duration.toMillis(Duration.minutes(10));
+
+export function autoPoolUsageIsStale(provider: ServerProvider, now: number, maxAgeMs: number) {
+  const limits = provider.usageLimits;
+  return (
+    limits === undefined ||
+    now - Date.parse(limits.checkedAt) > maxAgeMs ||
+    limits.windows.some(
+      (window) => now - Date.parse(window.observedAt ?? limits.checkedAt) > maxAgeMs,
+    )
+  );
+}
 
 export function autoPoolAccountKey(provider: ServerProvider): string | undefined {
   const workspace = provider.auth.workspaceId;
@@ -18,13 +32,23 @@ export function autoPoolAccountKey(provider: ServerProvider): string | undefined
   return workspace && email ? `${workspace}:${email}` : undefined;
 }
 
-export function autoPoolEligible(provider: ServerProvider): boolean {
+function autoPoolEligible(provider: ServerProvider): boolean {
   return (
     provider.enabled &&
     provider.installed &&
     provider.status !== "error" &&
     provider.auth.status === "authenticated"
   );
+}
+
+const CLAUDE_NON_SUBSCRIPTION_AUTH = new Set(["apiKey", "bedrock", "customEndpoint"]);
+
+export function autoPoolSubscriptionEligible(provider: ServerProvider): boolean {
+  if (!autoPoolEligible(provider)) return false;
+  const type = provider.auth.type;
+  return provider.driver === "claudeAgent"
+    ? type !== undefined && !CLAUDE_NON_SUBSCRIPTION_AUTH.has(type)
+    : provider.driver === "codex" && type === "chatgpt";
 }
 
 /** Auto is signed in when any member is; it is signed out only when every member is. */
@@ -198,14 +222,19 @@ export function autoPoolExhausted(
 export function autoPoolResetAt(
   provider: ServerProvider,
   model: string | undefined,
+  now: number,
 ): string | null {
-  const exhausted = (provider.usageLimits?.windows ?? []).filter(
-    (window) => appliesTo(provider)(window, model) && window.usedPercent >= 100,
+  const exhausted = (autoPoolWindows(provider, model, now) ?? []).filter(
+    (window) => window.usedPercent >= 100,
   );
-  if (exhausted.length === 0 || exhausted.some((window) => !window.resetsAt)) return null;
+  if (
+    exhausted.length === 0 ||
+    exhausted.some((window) => !Number.isFinite(Date.parse(window.resetsAt ?? "")))
+  )
+    return null;
   return exhausted
     .map((window) => window.resetsAt!)
-    .sort()
+    .sort((a, b) => Date.parse(a) - Date.parse(b))
     .at(-1)!;
 }
 
@@ -214,13 +243,13 @@ export interface AutoPoolHeadroom {
   readonly remaining: number;
   /** The long window that limits this model most; its reset decides the order. */
   readonly binding: {
-    readonly kind: ServerProviderUsageWindow["kind"];
+    readonly kind: ServerProviderUsageWindow["kind"] | undefined;
     readonly remaining: number;
     readonly resetsAt: number | undefined;
   };
 }
 
-/** Undefined when the account has no account-wide usage data or any applicable window is spent. */
+/** Undefined when usage is unavailable or an applicable window is spent. */
 export function autoPoolHeadroom(
   provider: ServerProvider,
   model: string | undefined,
@@ -229,7 +258,7 @@ export function autoPoolHeadroom(
   const windows = autoPoolWindows(provider, model, now);
   if (
     !windows ||
-    !windows.some((window) => !window.limitId) ||
+    (provider.driver !== "claudeAgent" && !windows.some((window) => !window.limitId)) ||
     windows.some((window) => window.usedPercent >= 100)
   )
     return undefined;
@@ -240,10 +269,12 @@ export function autoPoolHeadroom(
     (a, b) =>
       b.usedPercent - a.usedPercent ||
       (reset(a) ?? Number.POSITIVE_INFINITY) - (reset(b) ?? Number.POSITIVE_INFINITY),
-  )[0]!;
+  )[0];
   return {
-    remaining: Math.min(...windows.map((window) => 100 - window.usedPercent)),
-    binding: { kind: binding.kind, remaining: 100 - binding.usedPercent, resetsAt: reset(binding) },
+    remaining: Math.min(100, ...windows.map((window) => 100 - window.usedPercent)),
+    binding: binding
+      ? { kind: binding.kind, remaining: 100 - binding.usedPercent, resetsAt: reset(binding) }
+      : { kind: undefined, remaining: 100, resetsAt: undefined },
   };
 }
 
@@ -308,9 +339,11 @@ export function autoPoolNote(
   const { binding } = candidate.headroom;
   const parts = [
     rank === 0 ? "First choice for new threads" : `Choice ${rank + 1} for new threads`,
-    binding.resetsAt === undefined
-      ? `${binding.kind} window ${Math.round(binding.remaining)}% left, reset unknown`
-      : `${binding.kind} window ${Math.round(binding.remaining)}% left, resets ${DateTime.formatIso(DateTime.makeUnsafe(binding.resetsAt))}`,
+    binding.kind === undefined
+      ? "No subscription usage window observed"
+      : binding.resetsAt === undefined
+        ? `${binding.kind} window ${Math.round(binding.remaining)}% left, reset unknown`
+        : `${binding.kind} window ${Math.round(binding.remaining)}% left, resets ${DateTime.formatIso(DateTime.makeUnsafe(binding.resetsAt))}`,
     `${candidate.running} of ${maxRunningTurns} running turns`,
   ];
   if (candidate.running >= maxRunningTurns) parts.push("at the cap, so new threads go elsewhere");

@@ -265,6 +265,15 @@ describe("claudeRateLimitEventToUpdate", () => {
     });
   });
 
+  it("records an explicitly rejected session window without utilization", () => {
+    expect(
+      claudeRateLimitEventToUpdate(
+        { status: "rejected", rateLimitType: "five_hour", resetsAt: 1_784_000_000 },
+        noNames,
+      ),
+    ).toMatchObject({ windows: [{ id: "five_hour", usedPercent: 100 }] });
+  });
+
   it("lands the streamed overage-included bucket on the row the probe named", () => {
     const event = {
       status: "allowed",
