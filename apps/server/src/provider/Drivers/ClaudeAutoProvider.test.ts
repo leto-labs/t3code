@@ -5,6 +5,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ClaudeSettings,
+  defaultInstanceIdForDriver,
   MessageId,
   NodeId,
   ProjectId,
@@ -42,6 +43,7 @@ import { providerUsageReport } from "../providerUsageReport.ts";
 import { codexAutoFixture } from "../testUtils/codexAuto.ts";
 import {
   claudeAutoHeadroom,
+  claudeAutoSessionSources,
   makeClaudeAutoAdapter,
   makeClaudeAutoRouter,
 } from "./ClaudeAutoProvider.ts";
@@ -103,6 +105,14 @@ function claudeMember(id: string, windows: readonly ServerProviderUsageWindow[])
 }
 
 it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
+  it("includes the implicit Claude home for the previous default instance", () => {
+    const current = ProviderInstanceId.make("current");
+    const previous = defaultInstanceIdForDriver(DRIVER);
+    const { sourceIds, requireTranscript } = claudeAutoSessionSources([current], {}, previous);
+    expect([...sourceIds]).toEqual([current, previous]);
+    expect(requireTranscript).toBe(false);
+  });
+
   it("binds a Fable request to its own weekly window and an Opus request to the account window", () => {
     const provider = claudeMember("alice", [
       window("five_hour", "session", 30, 2),
@@ -242,6 +252,7 @@ const harness = Effect.fn("ClaudeAutoProvider.test.harness")(function* (turns: {
   readonly alice: readonly Turn[];
   readonly sam: readonly Turn[];
   readonly failedProbe?: boolean;
+  readonly requireTranscript?: boolean;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -424,6 +435,7 @@ const harness = Effect.fn("ClaudeAutoProvider.test.harness")(function* (turns: {
       Effect.succeed({
         target: homes[member.instance.instanceId as keyof typeof homes],
         sources: [homes.alice, homes.sam],
+        requireTranscript: turns.requireTranscript ?? false,
       }),
     openNative: (member, session) =>
       Effect.gen(function* () {
@@ -569,6 +581,26 @@ it.layer(layer)("Claude Auto account switching", (it) => {
           "offer:sam",
         ]);
       }),
+  );
+
+  it.effect("allows a portable handoff when the deleted account held the only transcript", () =>
+    Effect.gen(function* () {
+      const h = yield* harness({ alice: [], sam: [], requireTranscript: true });
+      const providerThread = yield* h.runtime.ensureThread({
+        threadId: h.threadId,
+        modelSelection: selection,
+        runtimePolicy,
+      });
+      const failure = yield* h.runtime
+        .resumeThread({ providerThread, threadId: h.threadId })
+        .pipe(Effect.flip);
+      expect(failure).toMatchObject({
+        _tag: "ProviderAdapterResumeThreadError",
+        cause: { _tag: "ClaudeAutoTranscriptMissingError" },
+      });
+      if (failure._tag === "ProviderAdapterResumeThreadError")
+        expect(failure.preserveNativeThread).toBeUndefined();
+    }),
   );
 
   it.effect("keeps the conversation of a thread that moves to Auto from a pool member", () =>

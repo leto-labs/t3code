@@ -148,7 +148,6 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
                   driver: DRIVER,
                   providerSessionId,
                   providerThreadId: providerThread.id,
-                  preserveNativeThread: true,
                   cause,
                 })
               : new ProviderAdapter.ProviderAdapterProtocolError({
@@ -161,6 +160,21 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
     ),
   });
 });
+
+export function claudeAutoSessionSources(
+  memberIds: readonly ProviderInstanceId[],
+  instances: ServerSettings["providerInstances"],
+  previousMemberId?: ProviderInstanceId,
+) {
+  const sourceIds = new Set(memberIds);
+  const previousDeleted =
+    previousMemberId !== undefined &&
+    previousMemberId !== defaultInstanceIdForDriver(DRIVER) &&
+    !sourceIds.has(previousMemberId) &&
+    !Object.hasOwn(instances, previousMemberId);
+  if (previousMemberId !== undefined && !previousDeleted) sourceIds.add(previousMemberId);
+  return { sourceIds, requireTranscript: previousDeleted };
+}
 
 export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(function* (
   input: ProviderDriverCreateInput<ClaudeSettings>,
@@ -345,12 +359,11 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
         const { claudeHome: target } = yield* launch(member.instance.instanceId, settings);
         const memberIds =
           currentAutoPool(settings.providerInstances, input.instanceId, DRIVER)?.memberIds ?? [];
-        const sourceIds = new Set(memberIds);
-        const previousDeleted =
-          previousMemberId !== undefined &&
-          !sourceIds.has(previousMemberId) &&
-          !Object.hasOwn(settings.providerInstances, previousMemberId);
-        if (previousMemberId !== undefined && !previousDeleted) sourceIds.add(previousMemberId);
+        const { sourceIds, requireTranscript } = claudeAutoSessionSources(
+          memberIds,
+          settings.providerInstances,
+          previousMemberId,
+        );
         const sources = yield* Effect.forEach(sourceIds, (id) =>
           launch(id, settings).pipe(
             Effect.map(({ claudeHome }) => claudeHome),
@@ -360,7 +373,7 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
         return {
           target,
           sources: sources.filter((source): source is string => source !== undefined),
-          requireTranscript: previousDeleted,
+          requireTranscript,
         };
       },
     ),
