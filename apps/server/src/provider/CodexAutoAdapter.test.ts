@@ -1,3 +1,5 @@
+import { AutoPoolAccountLoad } from "./AutoPoolAccountLoad.ts";
+import { autoPoolAccountKey } from "./autoPoolPolicy.ts";
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -59,6 +61,17 @@ const runtimePolicy = {
   interactionMode: "default" as const,
 };
 
+const markSpent = (account: ReturnType<typeof codexAutoFixture>) => {
+  const snapshot = account.read();
+  account.set({
+    ...snapshot,
+    usageLimits: {
+      ...snapshot.usageLimits!,
+      windows: snapshot.usageLimits!.windows.map((window) => ({ ...window, usedPercent: 100 })),
+    },
+  });
+};
+
 const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
   mode:
     | "recover"
@@ -67,6 +80,7 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
     | "tool"
     | "transport"
     | "identity"
+    | "busy-resume"
     | "rate-current"
     | "rate-stale"
     | "resume-failure"
@@ -191,6 +205,8 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
         );
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           isReusable: Ref.get(nativeReusable),
+          hasPendingBackgroundWorkForThread: () =>
+            Effect.succeed(mode === "busy-resume" && id === "a"),
           instanceId: poolId,
           driver,
           providerSessionId: session.providerSessionId,
@@ -694,15 +710,7 @@ it.layer(NodeServices.layer)("Codex Auto native recovery", (it) => {
   it.effect("resumes the conversation on the available member before handoff probes", () =>
     Effect.gen(function* () {
       const h = yield* harness("identity");
-      const spent = h.accounts[0]!;
-      const snapshot = spent.read();
-      spent.set({
-        ...snapshot,
-        usageLimits: {
-          ...snapshot.usageLimits!,
-          windows: snapshot.usageLimits!.windows.map((window) => ({ ...window, usedPercent: 100 })),
-        },
-      });
+      markSpent(h.accounts[0]!);
       const resumed = yield* h.runtime.resumeThread({
         threadId: h.turn.appThread.id,
         providerThread: h.turn.providerThread,
@@ -710,6 +718,28 @@ it.layer(NodeServices.layer)("Codex Auto native recovery", (it) => {
         runtimePolicy: h.turn.runtimePolicy,
       });
       expect(resumed.nativeMetadata?.executionInstanceId).toBe("b");
+      const load = yield* AutoPoolAccountLoad;
+      expect(load.count(autoPoolAccountKey(h.accounts[1]!.read())!, "")).toBe(0);
+    }),
+  );
+
+  it.effect("preserves a loaded conversation when background work blocks the switch", () =>
+    Effect.gen(function* () {
+      const h = yield* harness("busy-resume");
+      markSpent(h.accounts[0]!);
+      const refused = yield* h.runtime.resumeLoadedThread!({
+        threadId: h.turn.threadId,
+        providerThread: h.turn.providerThread,
+        modelSelection: h.turn.modelSelection,
+        runtimePolicy: h.turn.runtimePolicy,
+      }).pipe(Effect.flip);
+      expect(refused).toMatchObject({
+        _tag: "ProviderAdapterResumeThreadError",
+        preserveNativeThread: true,
+      });
+      expect(h.opens).toEqual(["a"]);
+      expect(h.closes).toEqual([]);
+      expect(h.turn.providerThread.nativeThreadRef?.nativeId).toBe("native-shared-history");
     }),
   );
 
