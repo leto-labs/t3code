@@ -497,7 +497,7 @@ function makeLocalCommandHarness(input: {
   readonly ensureThreadFailure?: unknown;
   readonly historyReadFailureAfterFallback?: unknown;
   readonly resumeFailure?: ProviderAdapter.ProviderAdapterV2Error;
-  readonly providerDriver?: "codex" | "antigravity";
+  readonly providerDriver?: "codex" | "antigravity" | "claudeAgent";
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -3453,6 +3453,26 @@ effectIt.effect("fails the run instead of replacing a native thread another clie
         failure: { class: "provider_error", message: detail },
       },
     ]);
+  }),
+);
+
+effectIt.effect("keeps the native conversation when an Auto account switch is blocked", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      providerDriver: "claudeAgent",
+      resumeFailure: new ProviderAdapter.ProviderAdapterResumeThreadError({
+        driver: ProviderDriverKind.make("claudeAgent"),
+        providerSessionId: ProviderSessionId.make("session"),
+        providerThreadId: ProviderThreadId.make("new-provider-thread"),
+        cause: "Resolve pending provider work before switching accounts.",
+        preserveNativeThread: true,
+      }),
+    });
+    yield* harness.start;
+    expect(harness.fallbackEnsureThread).not.toHaveBeenCalled();
+    expect(harness.projection().contextHandoffs).toEqual([]);
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
   }),
 );
 

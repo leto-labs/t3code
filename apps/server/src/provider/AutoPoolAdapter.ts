@@ -1,4 +1,5 @@
 import {
+  ProviderSetupError,
   type ModelSelection,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
@@ -6,6 +7,7 @@ import {
   type ProjectId,
   type ProviderDriverKind,
   type ProviderInstanceId,
+  type ProviderSessionId,
   type ProviderTurnId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
@@ -86,6 +88,7 @@ export const makeAutoPoolAdapter = (input: {
   readonly prepareResume?: (
     member: AutoPoolMember,
     providerThread: OrchestrationV2ProviderThread,
+    providerSessionId: ProviderSessionId,
   ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
 }) => {
   const { driver, label } = input;
@@ -343,6 +346,7 @@ export const makeAutoPoolAdapter = (input: {
       });
 
       const route = Effect.fn("AutoPoolAdapter.route")(function* (
+        providerThread: OrchestrationV2ProviderThread,
         selection: ModelSelection,
         projectId: ProjectId | undefined,
         runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
@@ -355,9 +359,17 @@ export const makeAutoPoolAdapter = (input: {
         )
           return;
         if (native !== undefined && !(yield* safeToSwitch(native)))
-          return yield* setupError(
-            `Resolve pending provider work before switching ${label} accounts.`,
-          );
+          return yield* new ProviderAdapter.ProviderAdapterResumeThreadError({
+            driver,
+            providerSessionId: sessionInput.providerSessionId,
+            providerThreadId: providerThread.id,
+            preserveNativeThread: true,
+            cause: new ProviderSetupError({
+              instanceId: input.instanceId,
+              operation: "session",
+              detail: `Resolve pending provider work before switching ${label} accounts.`,
+            }),
+          });
         yield* switchTo(chosen, runtimePolicy);
       });
 
@@ -367,7 +379,7 @@ export const makeAutoPoolAdapter = (input: {
         runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
       ) {
         if (current.loaded || !thread?.nativeThreadRef) return;
-        yield* prepareResume(current.member, thread);
+        yield* prepareResume(current.member, thread, sessionInput.providerSessionId);
         thread = stamp(
           yield* current.runtime.resumeThread({
             providerThread: thread,
@@ -553,7 +565,7 @@ export const makeAutoPoolAdapter = (input: {
           const selection = request.modelSelection ?? sessionInput.modelSelection;
           const policy = request.runtimePolicy ?? sessionInput.runtimePolicy;
           const previous = native;
-          yield* route(selection, sessionInput.projectId, policy);
+          yield* route(request.providerThread, selection, sessionInput.projectId, policy);
           if (alreadyLoaded && previous?.loaded && native === previous)
             return request.providerThread;
           return yield* admitted(
@@ -561,7 +573,11 @@ export const makeAutoPoolAdapter = (input: {
             policy,
             sessionInput.projectId,
             (current, modelSelection) =>
-              prepareResume(current.member, request.providerThread).pipe(
+              prepareResume(
+                current.member,
+                request.providerThread,
+                sessionInput.providerSessionId,
+              ).pipe(
                 Effect.andThen(current.runtime.resumeThread({ ...request, modelSelection })),
                 Effect.map((resumed) => {
                   current.loaded = true;
@@ -571,8 +587,7 @@ export const makeAutoPoolAdapter = (input: {
               ),
           );
         },
-        (effect) =>
-          lock.withPermit(effect).pipe(Effect.onError(() => input.router.release(threadId))),
+        (effect) => lock.withPermit(effect.pipe(Effect.ensuring(input.router.release(threadId)))),
       );
 
       const first = yield* open(
@@ -637,6 +652,7 @@ export const makeAutoPoolAdapter = (input: {
                 };
                 turn = state;
                 yield* route(
+                  turnInput.providerThread,
                   turnInput.modelSelection,
                   turnInput.appThread.projectId,
                   turnInput.runtimePolicy,

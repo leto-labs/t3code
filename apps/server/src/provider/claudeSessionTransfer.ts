@@ -2,9 +2,19 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 // Claude Code names a session's files after its id; anything else could escape the home.
 const SESSION_ID = /^[A-Za-z0-9_-]+$/;
+
+class ClaudeAutoTranscriptMissingError extends Schema.TaggedError<ClaudeAutoTranscriptMissingError>()(
+  "ClaudeAutoTranscriptMissingError",
+  {},
+) {
+  override get message() {
+    return "Claude Auto could not find the conversation transcript in any known account home.";
+  }
+}
 
 interface TranscriptCopy {
   readonly home: string;
@@ -53,8 +63,10 @@ export const transferClaudeSession = Effect.fn("transferClaudeSession")(function
   readonly sessionId: string;
   readonly target: string;
   readonly sources: readonly string[];
+  readonly requireTranscript?: boolean;
 }) {
-  if (!SESSION_ID.test(input.sessionId)) return;
+  if (!SESSION_ID.test(input.sessionId))
+    return input.requireTranscript ? yield* new ClaudeAutoTranscriptMissingError() : undefined;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const { sessionId, target } = input;
@@ -64,7 +76,11 @@ export const transferClaudeSession = Effect.fn("transferClaudeSession")(function
   const newest = copies.toSorted(
     (a, b) => b.modifiedAt - a.modifiedAt || Number(b.home === target) - Number(a.home === target),
   )[0];
-  if (newest === undefined || newest.home === target) return;
+  if (newest === undefined) {
+    if (input.requireTranscript) return yield* new ClaudeAutoTranscriptMissingError();
+    return;
+  }
+  if (newest.home === target) return;
   const from = path.join(newest.home, "projects", newest.project);
   const to = path.join(target, "projects", newest.project);
   yield* fileSystem.makeDirectory(to, { recursive: true });

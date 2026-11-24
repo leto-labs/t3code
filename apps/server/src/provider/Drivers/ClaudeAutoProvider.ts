@@ -7,6 +7,7 @@ import {
   type ModelSelection,
   type ProjectId,
   type ProviderInstanceId,
+  type ProviderSessionId,
   type ServerProvider,
   type ServerSettings,
 } from "@t3tools/contracts";
@@ -106,7 +107,11 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
       member: AutoPoolMember,
       previousMemberId?: ProviderInstanceId,
     ) => Effect.Effect<
-      { readonly target: string; readonly sources: readonly string[] },
+      {
+        readonly target: string;
+        readonly sources: readonly string[];
+        readonly requireTranscript?: boolean;
+      },
       ProviderSetupError
     >;
   },
@@ -123,7 +128,7 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
     // Claude Code can hold a limited turn open until the reset instead of failing it.
     isQuotaPause: isClaudeUsageLimitPause,
     prepareResume: Effect.fn("ClaudeAutoAdapter.prepareResume")(
-      function* (member, providerThread) {
+      function* (member, providerThread, _providerSessionId: ProviderSessionId) {
         const sessionId = providerThread.nativeThreadRef?.nativeId;
         if (sessionId === undefined || sessionId === null) return;
         const homes = yield* input.sessionHomes(
@@ -132,17 +137,24 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
         );
         yield* transferClaudeSession({ sessionId, ...homes });
       },
-      (effect, member) =>
+      (effect, member, providerThread, providerSessionId) =>
         effect.pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapter.ProviderAdapterProtocolError({
-                driver: DRIVER,
-                detail: `${LABEL} could not move the conversation to ${member.instance.instanceId}.`,
-                cause,
-              }),
+          Effect.mapError((cause) =>
+            cause._tag === "ClaudeAutoTranscriptMissingError"
+              ? new ProviderAdapter.ProviderAdapterResumeThreadError({
+                  driver: DRIVER,
+                  providerSessionId,
+                  providerThreadId: providerThread.id,
+                  preserveNativeThread: true,
+                  cause,
+                })
+              : new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: DRIVER,
+                  detail: `${LABEL} could not move the conversation to ${member.instance.instanceId}.`,
+                  cause,
+                }),
           ),
         ),
     ),
@@ -333,7 +345,11 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
         const memberIds =
           currentAutoPool(settings.providerInstances, input.instanceId, DRIVER)?.memberIds ?? [];
         const sourceIds = new Set(memberIds);
-        if (previousMemberId !== undefined) sourceIds.add(previousMemberId);
+        const previousDeleted =
+          previousMemberId !== undefined &&
+          !sourceIds.has(previousMemberId) &&
+          !Object.hasOwn(settings.providerInstances, previousMemberId);
+        if (previousMemberId !== undefined && !previousDeleted) sourceIds.add(previousMemberId);
         const sources = yield* Effect.forEach(sourceIds, (id) =>
           launch(id, settings).pipe(
             Effect.map(({ claudeHome }) => claudeHome),
@@ -343,6 +359,7 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
         return {
           target,
           sources: sources.filter((source): source is string => source !== undefined),
+          requireTranscript: previousDeleted,
         };
       },
     ),
