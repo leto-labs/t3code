@@ -819,6 +819,8 @@ export interface ProviderAdapterV2SessionRuntime {
     /** The native session is the only copy of the thread's imported history: fail when it is gone. */
     readonly importedNativeSession?: boolean;
   }) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
+  /** Called when a cached thread binding may need to move to another native runtime. */
+  readonly resumeLoadedThread?: ProviderAdapterV2SessionRuntime["resumeThread"];
   /** False means the native protocol explicitly does not support history injection. */
   readonly injectHistory?: (
     input: ProviderAdapterV2HistoricalContext & {
@@ -916,6 +918,12 @@ export class ProviderAdapterV2 extends Context.Service<
       selection: ModelSelection,
       projectId?: ProjectId,
     ) => Effect.Effect<void, ProviderAdapterV2Error>;
+    /** Cached subscription allowance for recovery scheduling, without opening a session. */
+    readonly hasUsageAllowance?: (
+      selection: ModelSelection,
+      projectId: ProjectId,
+      observedAfter?: number,
+    ) => Effect.Effect<boolean>;
     readonly planSelectionTransition: (
       input: ProviderSelectionTransitionInput,
     ) => Effect.Effect<ProviderSelectionTransitionPlan, ProviderAdapterV2Error>;

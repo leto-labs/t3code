@@ -1,6 +1,10 @@
 import {
   autoPoolMemberRejection,
   autoPoolOwnerId,
+  providerInstanceConfigEnabledFlag,
+  readAutoPools,
+  type ProviderDriverKind,
+  type ProviderInstanceConfigMap,
   type ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -55,3 +59,19 @@ export const reserveAutoPoolMember = Effect.fn("reserveAutoPoolMember")(function
       ),
   } satisfies ProviderAdapter.ProviderAdapterV2["Service"];
 });
+
+export function currentAutoPool(
+  instances: ProviderInstanceConfigMap,
+  instanceId: ProviderInstanceId,
+  driver: ProviderDriverKind,
+) {
+  const entry = instances[instanceId];
+  if (entry?.driver !== driver || providerInstanceConfigEnabledFlag(entry.config) === false)
+    return undefined;
+  const pool = readAutoPools({ [instanceId]: entry })[0];
+  return pool &&
+    !pool.memberIds.includes(instanceId) &&
+    new Set(pool.memberIds).size === pool.memberIds.length
+    ? pool
+    : undefined;
+}

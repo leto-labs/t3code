@@ -15,8 +15,8 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
-import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Fiber from "effect/Fiber";
@@ -71,6 +71,7 @@ export class ProviderRegistry extends Context.Service<
     readonly usageReport: (
       input: ProviderUsageReportInput,
       pools?: readonly AutoPoolConfig[],
+      healthRefreshIntervalMs?: number,
     ) => Effect.Effect<ProviderUsageReport>;
 
     readonly refresh: (
@@ -1444,7 +1445,11 @@ export const layer = Layer.effect(
 
     return {
       getProviders: Ref.get(providersRef),
-      usageReport: Effect.fn("ProviderRegistry.usageReport")(function* (input, pools = []) {
+      usageReport: Effect.fn("ProviderRegistry.usageReport")(function* (
+        input,
+        pools = [],
+        healthRefreshIntervalMs,
+      ) {
         let providers = yield* Ref.get(providersRef);
         const requested = (instanceId: ProviderInstanceId) =>
           input.instanceIds === undefined || input.instanceIds.includes(instanceId);
@@ -1469,7 +1474,11 @@ export const layer = Layer.effect(
         return providerUsageReport(
           providers.filter(selected),
           DateTime.formatIso(yield* DateTime.now),
-          { pools, runningTurns: (accountKey) => load.count(accountKey, "") },
+          {
+            pools,
+            ...(healthRefreshIntervalMs === undefined ? {} : { healthRefreshIntervalMs }),
+            runningTurns: (accountKey) => load.count(accountKey, ""),
+          },
         );
       }),
       refresh: (provider?: ProviderDriverKind) =>

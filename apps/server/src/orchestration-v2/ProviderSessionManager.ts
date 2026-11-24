@@ -2693,14 +2693,12 @@ export const layerWithOptions = (
               Effect.andThen(
                 isProviderThreadLoaded({ providerSessionId, threadId, providerThreadKey }),
               ),
-              Effect.flatMap((loaded) =>
-                loaded
-                  ? Effect.succeed({
-                      loaded: input.providerThread,
-                      linkedEnvironments: undefined,
-                    })
-                  : loadNatively(runtime.resumeThread(input)),
-              ),
+              Effect.flatMap((loaded) => {
+                if (!loaded) return loadNatively(runtime.resumeThread(input));
+                return runtime.resumeLoadedThread
+                  ? loadNatively(runtime.resumeLoadedThread(input))
+                  : Effect.succeed({ loaded: input.providerThread, linkedEnvironments: undefined });
+              }),
               Effect.tap(({ loaded: providerThread, linkedEnvironments }) =>
                 markProviderThreadLoaded({
                   providerSessionId,

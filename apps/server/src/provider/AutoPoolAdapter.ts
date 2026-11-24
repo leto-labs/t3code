@@ -112,6 +112,7 @@ export const makeAutoPoolAdapter = (input: {
           ),
         ),
     ),
+    hasUsageAllowance: input.router.hasUsageAllowance,
     planSelectionTransition: Effect.fn("ProviderAdapter.ProviderAdapterV2.planSelectionTransition")(
       () => Effect.succeed({ type: "apply_on_next_turn" as const }),
     ),
@@ -175,7 +176,7 @@ export const makeAutoPoolAdapter = (input: {
         if (pendingRequests.size > 0 || unfinishedNodes.size > 0) return false;
         const background =
           thread !== undefined && current.runtime.hasPendingBackgroundWorkForThread
-            ? current.runtime.hasPendingBackgroundWorkForThread(thread)
+            ? current.runtime.hasPendingBackgroundWorkForThread(thread, { includeSubagents: true })
             : (current.runtime.hasPendingBackgroundWork ?? Effect.succeed(false));
         return !(yield* background);
       });
@@ -236,7 +237,11 @@ export const makeAutoPoolAdapter = (input: {
                 break;
               case "node.updated":
                 if (["tool_call", "subagent", "hook"].includes(event.node.kind)) {
-                  if (["pending", "running", "waiting"].includes(event.node.status))
+                  if (
+                    event.node.status === "running" ||
+                    event.node.status === "waiting" ||
+                    (event.node.status === "pending" && event.node.kind !== "subagent")
+                  )
                     unfinishedNodes.add(event.node.id);
                   else unfinishedNodes.delete(event.node.id);
                 }
@@ -337,6 +342,25 @@ export const makeAutoPoolAdapter = (input: {
         return yield* open(next, runtimePolicy);
       });
 
+      const route = Effect.fn("AutoPoolAdapter.route")(function* (
+        selection: ModelSelection,
+        projectId: ProjectId | undefined,
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+      ) {
+        const chosen = yield* reserve(selection, projectId);
+        if (
+          native !== undefined &&
+          chosen.instance === native.member.instance &&
+          accountOf(chosen) === accountOf(native.member)
+        )
+          return;
+        if (native !== undefined && !(yield* safeToSwitch(native)))
+          return yield* setupError(
+            `Resolve pending provider work before switching ${label} accounts.`,
+          );
+        yield* switchTo(chosen, runtimePolicy);
+      });
+
       const ready = Effect.fn("AutoPoolAdapter.ready")(function* (
         current: Native,
         modelSelection: ModelSelection,
@@ -412,7 +436,7 @@ export const makeAutoPoolAdapter = (input: {
         current: Native,
         state: RootTurn,
       ) {
-        if (input.quotaFailure(terminal.failure) === "confirmed") return true;
+        if (state.quotaPaused || input.quotaFailure(terminal.failure) === "confirmed") return true;
         // A rate limit is transient unless a usage read taken after it shows the allowance is spent.
         const failedAt = yield* Clock.currentTimeMillis;
         const reported = yield* refreshAutoPoolMember(current.member).pipe(
@@ -443,7 +467,7 @@ export const makeAutoPoolAdapter = (input: {
                     "Resolve pending questions or unfinished provider work before continuing on another account.",
                 };
               state.attempted.add(accountOf(current.member));
-              if (input.quotaFailure(terminal.failure) === "confirmed")
+              if (state.quotaPaused || input.quotaFailure(terminal.failure) === "confirmed")
                 yield* input.router.refreshUsage(current.member);
               const next = yield* input.router.reserve(
                 threadId,
@@ -524,6 +548,33 @@ export const makeAutoPoolAdapter = (input: {
           Effect.suspend(() => (native === undefined ? Effect.void : use(native.runtime))),
         );
 
+      const resume = Effect.fn("AutoPoolAdapter.resume")(
+        function* (request: Parameters<Runtime["resumeThread"]>[0], alreadyLoaded = false) {
+          const selection = request.modelSelection ?? sessionInput.modelSelection;
+          const policy = request.runtimePolicy ?? sessionInput.runtimePolicy;
+          const previous = native;
+          yield* route(selection, sessionInput.projectId, policy);
+          if (alreadyLoaded && previous?.loaded && native === previous)
+            return request.providerThread;
+          return yield* admitted(
+            selection,
+            policy,
+            sessionInput.projectId,
+            (current, modelSelection) =>
+              prepareResume(current.member, request.providerThread).pipe(
+                Effect.andThen(current.runtime.resumeThread({ ...request, modelSelection })),
+                Effect.map((resumed) => {
+                  current.loaded = true;
+                  thread = stamp(resumed, current.member);
+                  return thread;
+                }),
+              ),
+          );
+        },
+        (effect) =>
+          lock.withPermit(effect).pipe(Effect.onError(() => input.router.release(threadId))),
+      );
+
       const first = yield* open(
         yield* reserve(sessionInput.modelSelection, sessionInput.projectId),
         sessionInput.runtimePolicy,
@@ -544,10 +595,10 @@ export const makeAutoPoolAdapter = (input: {
         hasPendingBackgroundWork: Effect.suspend(
           () => native?.runtime.hasPendingBackgroundWork ?? Effect.succeed(false),
         ),
-        hasPendingBackgroundWorkForThread: (providerThread) =>
+        hasPendingBackgroundWorkForThread: (providerThread, options) =>
           Effect.suspend(
             () =>
-              native?.runtime.hasPendingBackgroundWorkForThread?.(providerThread) ??
+              native?.runtime.hasPendingBackgroundWorkForThread?.(providerThread, options) ??
               Effect.succeed(false),
           ),
         ensureThread: (request) =>
@@ -566,23 +617,8 @@ export const makeAutoPoolAdapter = (input: {
                 ),
             ),
           ),
-        resumeThread: (request) =>
-          lock.withPermit(
-            admitted(
-              request.modelSelection ?? sessionInput.modelSelection,
-              request.runtimePolicy ?? sessionInput.runtimePolicy,
-              sessionInput.projectId,
-              (current, modelSelection) =>
-                prepareResume(current.member, request.providerThread).pipe(
-                  Effect.andThen(current.runtime.resumeThread({ ...request, modelSelection })),
-                  Effect.map((resumed) => {
-                    current.loaded = true;
-                    thread = stamp(resumed, current.member);
-                    return thread;
-                  }),
-                ),
-            ),
-          ),
+        resumeThread: (request) => resume(request),
+        resumeLoadedThread: (request) => resume(request, true),
         startTurn: (turnInput) =>
           lock
             .withPermit(
@@ -600,21 +636,11 @@ export const makeAutoPoolAdapter = (input: {
                   itemOrdinal: 0,
                 };
                 turn = state;
-                const chosen = yield* reserve(
+                yield* route(
                   turnInput.modelSelection,
                   turnInput.appThread.projectId,
+                  turnInput.runtimePolicy,
                 );
-                if (
-                  native === undefined ||
-                  chosen.instance !== native.member.instance ||
-                  accountOf(chosen) !== accountOf(native.member)
-                ) {
-                  if (native !== undefined && !(yield* safeToSwitch(native)))
-                    return yield* setupError(
-                      `Resolve pending provider work before switching ${label} accounts.`,
-                    );
-                  yield* switchTo(chosen, turnInput.runtimePolicy);
-                }
                 yield* startRoot(state);
               }),
             )

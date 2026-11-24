@@ -201,7 +201,9 @@ describe("Codex Auto catalog and usage", () => {
         windows: provider.usageLimits!.windows.map((window) => ({ ...window, usedPercent: 100 })),
       },
     };
-    expect(autoPoolResetAt(exhausted, selection.model)).toBe("2026-10-18T12:00:00.000Z");
+    expect(autoPoolResetAt(exhausted, selection.model, Date.parse(CODEX_AUTO_NOW))).toBe(
+      "2026-10-18T12:00:00.000Z",
+    );
     expect(
       autoPoolResetAt(
         {
@@ -212,6 +214,7 @@ describe("Codex Auto catalog and usage", () => {
           },
         },
         selection.model,
+        Date.parse(CODEX_AUTO_NOW),
       ),
     ).toBeNull();
   });
@@ -234,7 +237,7 @@ describe("Codex Auto catalog and usage", () => {
     );
     expect(report.instances[0]).toMatchObject({
       status: "probeFailed",
-      stale: true,
+      stale: false,
       checkedAt: CODEX_AUTO_NOW,
       windows: [
         expect.objectContaining({ remainingPercent: 90 }),

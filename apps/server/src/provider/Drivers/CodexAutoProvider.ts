@@ -3,6 +3,7 @@ import {
   ProviderDriverKind,
   ProviderSetupError,
   resolveProjectProviderInstanceEnabled,
+  AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS,
   type ProjectId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
@@ -45,6 +46,7 @@ import {
   type AutoPoolMember,
 } from "../AutoPoolRouter.ts";
 import { makeAutoPoolAdapter } from "../AutoPoolAdapter.ts";
+import { currentAutoPool } from "../autoPoolMember.ts";
 import { autoPoolTextGeneration } from "../autoPoolTextGeneration.ts";
 import { resolveCodexLaunchArgs } from "../codexLaunchArgs.ts";
 
@@ -113,15 +115,22 @@ export const makeCodexAutoProvider = Effect.fn("makeCodexAutoProvider")(function
       instanceId: input.instanceId,
       detail: "Codex Auto requires distinct, non-recursive member instance IDs.",
     });
+  const readSettings = host.settings.get.pipe(
+    Effect.mapError(() => failure("Codex Auto could not read provider configuration.")),
+  );
   const members = Effect.fn("members")(function* (projectId?: ProjectId) {
     return yield* Effect.gen(function* () {
-      if (ids.length === 0)
+      const settings = yield* readSettings;
+      const memberIds =
+        currentAutoPool(
+          settings.providerInstances,
+          input.instanceId,
+          ProviderDriverKind.make("codex"),
+        )?.memberIds ?? [];
+      if (memberIds.length === 0)
         return yield* failure("Select Codex Auto subscription accounts before starting a session.");
-      const settings = yield* host.settings.get.pipe(
-        Effect.mapError(() => failure("Codex Auto could not read provider configuration.")),
-      );
       const result: AutoPoolMember[] = [];
-      for (const id of ids) {
+      for (const id of memberIds) {
         const entry = settings.providerInstances[id];
         if (entry?.driver !== undefined && entry.driver !== "codex")
           return yield* failure("Codex Auto only supports Codex subscription accounts.");
@@ -250,9 +259,17 @@ export const makeCodexAutoProvider = Effect.fn("makeCodexAutoProvider")(function
   const router = yield* makeCodexAutoRouter({
     instanceId: input.instanceId,
     members,
-    ...(input.config.autoPoolMaxRunningTurns === undefined
-      ? {}
-      : { maxRunningTurns: input.config.autoPoolMaxRunningTurns }),
+    maxRunningTurns: host.settings.get.pipe(
+      Effect.map(
+        (settings) =>
+          currentAutoPool(
+            settings.providerInstances,
+            input.instanceId,
+            ProviderDriverKind.make("codex"),
+          )?.maxRunningTurns ?? AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS,
+      ),
+      Effect.orElseSucceed(() => AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS),
+    ),
   }).pipe(
     Effect.mapError(
       (cause) =>

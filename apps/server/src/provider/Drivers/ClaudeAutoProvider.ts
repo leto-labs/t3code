@@ -3,10 +3,12 @@ import {
   ProviderDriverKind,
   ProviderSetupError,
   resolveProjectProviderInstanceEnabled,
+  AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS,
   type ModelSelection,
   type ProjectId,
   type ProviderInstanceId,
   type ServerProvider,
+  type ServerSettings,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -43,12 +45,13 @@ import {
 } from "../AutoPoolRouter.ts";
 import {
   autoPoolAccountKey,
-  autoPoolEligible,
+  autoPoolSubscriptionEligible,
   autoPoolHeadroom,
   autoPoolAuthStatus,
   autoPoolModels,
   type AutoPoolHeadroom,
 } from "../autoPoolPolicy.ts";
+import { currentAutoPool } from "../autoPoolMember.ts";
 import { autoPoolTextGeneration } from "../autoPoolTextGeneration.ts";
 import { transferClaudeSession } from "../claudeSessionTransfer.ts";
 import { mergeClaudeProcessEnvironment, resolveClaudeHomePath } from "./ClaudeHome.ts";
@@ -67,7 +70,6 @@ const BILLING_OVERRIDES = [
   "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_USE_FOUNDRY",
 ];
-const NOT_SUBSCRIPTION_AUTH = new Set(["apiKey", "bedrock", "customEndpoint"]);
 
 /** Members share this key while pooled, so moving a member's thread to Auto keeps its session. */
 export const claudeAutoContinuationKey = (autoInstanceId: string) =>
@@ -79,9 +81,7 @@ export function claudeAutoHeadroom(
   selection: ModelSelection,
   now: number,
 ): AutoPoolHeadroom | undefined {
-  const type = provider.auth.type;
-  if (!autoPoolEligible(provider) || type === undefined || NOT_SUBSCRIPTION_AUTH.has(type))
-    return undefined;
+  if (!autoPoolSubscriptionEligible(provider)) return undefined;
   return autoPoolHeadroom(provider, selection.model, now);
 }
 
@@ -104,6 +104,7 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
     /** The member's Claude home, and every pool member's home a newer copy may sit in. */
     readonly sessionHomes: (
       member: AutoPoolMember,
+      previousMemberId?: ProviderInstanceId,
     ) => Effect.Effect<
       { readonly target: string; readonly sources: readonly string[] },
       ProviderSetupError
@@ -125,7 +126,10 @@ export const makeClaudeAutoAdapter = Effect.fn("makeClaudeAutoAdapter")(function
       function* (member, providerThread) {
         const sessionId = providerThread.nativeThreadRef?.nativeId;
         if (sessionId === undefined || sessionId === null) return;
-        const homes = yield* input.sessionHomes(member);
+        const homes = yield* input.sessionHomes(
+          member,
+          providerThread.nativeMetadata?.executionInstanceId,
+        );
         yield* transferClaudeSession({ sessionId, ...homes });
       },
       (effect, member) =>
@@ -170,13 +174,15 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
       detail: "Claude Auto requires distinct, non-recursive member instance IDs.",
     });
 
+  const readSettings = host.settings.get.pipe(
+    Effect.mapError(() => failure("Claude Auto could not read provider configuration.")),
+  );
+
   /** How a member runs: its own config, environment and Claude home. */
   const launch = Effect.fn("ClaudeAutoProvider.launch")(
-    function* (id: ProviderInstanceId) {
-      const settings = yield* host.settings.get.pipe(
-        Effect.mapError(() => failure("Claude Auto could not read provider configuration.")),
-      );
-      const entry = settings.providerInstances[id];
+    function* (id: ProviderInstanceId, settings?: ServerSettings) {
+      const current = settings ?? (yield* readSettings);
+      const entry = current.providerInstances[id];
       if (entry?.driver !== undefined && entry.driver !== DRIVER)
         return yield* failure("Claude Auto only supports Claude subscription accounts.");
       const config = yield* decodeClaudeSettings(entry?.config ?? {}).pipe(
@@ -195,7 +201,7 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
         hostEnvironment,
       );
       const claudeHome = yield* resolveClaudeHomePath(config, processEnvironment);
-      return { settings, config, environment, claudeHome };
+      return { config, environment, claudeHome };
     },
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.provideService(Path.Path, path),
@@ -204,13 +210,16 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
 
   const members = Effect.fn("ClaudeAutoProvider.members")(function* (projectId?: ProjectId) {
     return yield* Effect.gen(function* () {
-      if (ids.length === 0)
+      const settings = yield* readSettings;
+      const memberIds =
+        currentAutoPool(settings.providerInstances, input.instanceId, DRIVER)?.memberIds ?? [];
+      if (memberIds.length === 0)
         return yield* failure(
           "Select Claude Auto subscription accounts before starting a session.",
         );
       const result: AutoPoolMember[] = [];
-      for (const id of ids) {
-        const { settings } = yield* launch(id);
+      for (const id of memberIds) {
+        yield* launch(id, settings);
         const instance = yield* registry.get(id);
         if (!instance || instance.driverKind !== DRIVER)
           return yield* failure("A configured Claude Auto member is unavailable.");
@@ -291,9 +300,14 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
   const router = yield* makeClaudeAutoRouter({
     instanceId: input.instanceId,
     members,
-    ...(input.config.autoPoolMaxRunningTurns === undefined
-      ? {}
-      : { maxRunningTurns: input.config.autoPoolMaxRunningTurns }),
+    maxRunningTurns: host.settings.get.pipe(
+      Effect.map(
+        (settings) =>
+          currentAutoPool(settings.providerInstances, input.instanceId, DRIVER)?.maxRunningTurns ??
+          AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS,
+      ),
+      Effect.orElseSucceed(() => AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS),
+    ),
   }).pipe(
     Effect.mapError(
       (cause) =>
@@ -312,16 +326,26 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
   const orchestrationAdapter = yield* makeClaudeAutoAdapter({
     instanceId: input.instanceId,
     router,
-    sessionHomes: Effect.fn("ClaudeAutoProvider.sessionHomes")(function* (member) {
-      const target = yield* homeOf(member.instance.instanceId);
-      const sources = yield* Effect.forEach(ids, (id) =>
-        homeOf(id).pipe(Effect.orElseSucceed(() => undefined)),
-      );
-      return {
-        target,
-        sources: sources.filter((source): source is string => source !== undefined),
-      };
-    }),
+    sessionHomes: Effect.fn("ClaudeAutoProvider.sessionHomes")(
+      function* (member, previousMemberId) {
+        const target = yield* homeOf(member.instance.instanceId);
+        const settings = yield* readSettings;
+        const memberIds =
+          currentAutoPool(settings.providerInstances, input.instanceId, DRIVER)?.memberIds ?? [];
+        const sourceIds = new Set(memberIds);
+        if (previousMemberId !== undefined) sourceIds.add(previousMemberId);
+        const sources = yield* Effect.forEach(sourceIds, (id) =>
+          launch(id, settings).pipe(
+            Effect.map(({ claudeHome }) => claudeHome),
+            Effect.orElseSucceed(() => undefined),
+          ),
+        );
+        return {
+          target,
+          sources: sources.filter((source): source is string => source !== undefined),
+        };
+      },
+    ),
     openNative: Effect.fn("ClaudeAutoProvider.openNative")(
       function* (
         member: AutoPoolMember,
