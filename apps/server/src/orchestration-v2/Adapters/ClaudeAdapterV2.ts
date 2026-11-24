@@ -5159,6 +5159,7 @@ function isOverloadedResult(result: SDKResultMessage): boolean {
 function terminalStatusFromResult(
   message: SDKResultMessage,
   failureHint?: string,
+  refused = false,
 ): Extract<
   OrchestrationV2ProviderTurn["status"],
   "completed" | "interrupted" | "failed" | "cancelled"
@@ -5172,7 +5173,8 @@ function terminalStatusFromResult(
   }
   if (message.subtype === "success") {
     // The SDK can report API failures as subtype "success" with is_error set.
-    return isOverloadedResult(message) ||
+    return refused ||
+      isOverloadedResult(message) ||
       message.api_error_status === 429 ||
       terminalResultError(message.terminal_reason, failureHint) !== undefined ||
       (message.is_error && failureHint !== undefined)
@@ -5351,12 +5353,66 @@ function claudeRewrittenVersion(
     : undefined;
 }
 
+interface ClaudeRefusal {
+  readonly category: string | null;
+  readonly requestId: string | null;
+}
+
+// Structured refusal evidence covers the CLI's other wordings.
+const CLAUDE_SAFEGUARDS_REFUSAL =
+  /^API Error: [^\n]{1,80}'s safeguards flagged this (?:session|message)\b/;
+
+function claudeResultRefusal(
+  message: SDKResultMessage,
+  evidence: ClaudeRefusal | null,
+  failureHint: string | undefined,
+): ClaudeRefusal | undefined {
+  if (
+    failureHint !== undefined ||
+    message.subtype !== "success" ||
+    !(message.is_error || message.terminal_reason === "api_error") ||
+    message.api_error_status === 429 ||
+    message.api_error_status === 529
+  ) {
+    return undefined;
+  }
+  if (evidence !== null) return evidence;
+  return CLAUDE_SAFEGUARDS_REFUSAL.test(message.result.trim())
+    ? { category: null, requestId: null }
+    : undefined;
+}
+
+/** A refusal is deterministic for this request: keep Claude's words, category, and request ID. */
+function providerFailureFromRefusal(
+  message: Extract<SDKResultMessage, { subtype: "success" }>,
+  refusal: ClaudeRefusal,
+): OrchestrationV2ProviderFailure {
+  const text = message.result.trim();
+  const parts = [text.length > 0 ? text : "Claude declined to respond to this request."];
+  if (refusal.category !== null && !text.includes(`[${refusal.category}]`)) {
+    parts.push(`Details: \`[${refusal.category}]\``);
+  }
+  if (refusal.requestId !== null && !text.includes(refusal.requestId)) {
+    parts.push(`Request ID: ${refusal.requestId}`);
+  }
+  return makeProviderFailure({
+    class: "provider_error",
+    message: parts.join("\n\n"),
+    code: "model_refusal",
+    retryable: false,
+  });
+}
+
 function providerFailureFromResult(
   message: SDKResultMessage,
   receivedAt: DateTime.Utc,
   failureHint?: string,
   usageLimited = false,
+  refusal?: ClaudeRefusal,
 ): OrchestrationV2ProviderFailure | null {
+  if (refusal !== undefined && message.subtype === "success") {
+    return providerFailureFromRefusal(message, refusal);
+  }
   const gatewayResetAt =
     failureHint === undefined &&
     message.subtype === "success" &&
@@ -5676,6 +5732,8 @@ interface ActiveClaudeTurnContext {
     readonly type: string | null;
     readonly resetAt: string | null;
   } | null;
+  // Set while the latest root response is a safeguards refusal.
+  refusal: ClaudeRefusal | null;
   // Set while this turn's latest compaction status reports a failure, with
   // Claude's error text when it sent one.
   compactionFailure: { readonly message: string | undefined } | null;
@@ -11938,6 +11996,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   };
                 }
               }
+              if (message.message.stop_reason !== null || message.error !== undefined) {
+                context.refusal =
+                  message.message.stop_reason === "refusal"
+                    ? {
+                        category: message.message.stop_details?.category ?? null,
+                        requestId: message.request_id ?? null,
+                      }
+                    : null;
+              }
               if (message.error === "authentication_failed") {
                 context.authenticationFailureMessage = claudeSignedOutMessage({
                   configDir: adapterOptions.environment.CLAUDE_CONFIG_DIR,
@@ -12092,6 +12159,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               },
             });
             context.compaction = null;
+            return;
+          }
+
+          if (message.type === "system" && message.subtype === "model_refusal_no_fallback") {
+            context.refusal = {
+              category: message.api_refusal_category ?? context.refusal?.category ?? null,
+              requestId: message.request_id ?? context.refusal?.requestId ?? null,
+            };
             return;
           }
 
@@ -12977,6 +13052,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 (usageLimited
                   ? "Claude usage limit reached. Send the message again once the limit resets."
                   : rewrittenVersionError));
+            const refusal = interrupted
+              ? undefined
+              : claudeResultRefusal(message, context.refusal, failureHint);
             // Usage-limited /compact reports success; fail it so queued messages wait for the limit to clear.
             const limitedCompaction =
               usageLimited && message.subtype === "success" && message.local_command === "compact"
@@ -12995,6 +13073,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     bufferedResultArrivals.get(message) ?? completedAt,
                     failureHint,
                     usageLimited,
+                    refusal,
                   );
             const resultResetAt =
               resultFailure?.class === "usage_limit" ? resultFailure.resetAt : null;
@@ -13026,7 +13105,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? "interrupted"
               : limitedCompaction !== null
                 ? "failed"
-                : terminalStatusFromResult(message, failureHint);
+                : terminalStatusFromResult(message, failureHint, refusal !== undefined);
             // Claude answers a steer it has not read yet as the next native turn, which echoes
             // the steer. A result without echoes cannot prove that turn will come.
             if (
@@ -14637,6 +14716,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimit: null,
+              refusal: null,
               compactionFailure: null,
               nativeSessionTitle: null,
               steeredSegmentUsage: [],

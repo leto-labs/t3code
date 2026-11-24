@@ -3822,6 +3822,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly text?: string;
     readonly parentToolUseId?: string | null;
     readonly apiErrorParams?: unknown;
+    readonly stopReason?: "end_turn" | "refusal";
+    readonly stopDetails?: { readonly category: string | null };
+    readonly requestId?: string;
   }) =>
     claudeSdkFrame({
       type: "assistant",
@@ -3831,7 +3834,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         type: "message",
         role: "assistant",
         content: [{ type: "text", text: input.text ?? "Claude could not complete this request." }],
-        stop_reason: null,
+        stop_reason: input.stopReason ?? null,
+        ...(input.stopDetails === undefined
+          ? {}
+          : { stop_details: { type: "refusal", explanation: null, ...input.stopDetails } }),
         stop_sequence: null,
         usage: {
           input_tokens: 1,
@@ -3843,6 +3849,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       parent_tool_use_id: input.parentToolUseId ?? null,
       ...(input.error === undefined ? {} : { error: input.error }),
       ...(input.apiErrorParams === undefined ? {} : { api_error_params: input.apiErrorParams }),
+      ...(input.requestId === undefined ? {} : { request_id: input.requestId }),
       uuid: input.uuid,
       session_id: WAKE_NATIVE_SESSION,
     });
@@ -10114,6 +10121,145 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         terminal.failure.class,
         apiErrorStatus === 429 ? "usage_limit" : "provider_error",
       );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  const SYNTHETIC_REFUSAL_TEXT = [
+    "API Error: Opus 5.5's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time: Opus 5.5 is more capable and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these safeguards to reduce the amount of incorrectly flagged messages. Claude Code can't respond to your last message with Opus 5.5.",
+    "Try rephrasing the request in a new session or change your model.",
+    "Learn more: https://support.claude.com/en/articles/8106465",
+    "Details: `[cyber]`",
+    "Request ID: req_synthetic_refusal_0001",
+    "Message ID: msg_synthetic_refusal_0001",
+  ].join("\n\n");
+
+  it.effect.each([
+    {
+      name: "the CLI's full safeguards text without structured evidence",
+      frames: [],
+      result: SYNTHETIC_REFUSAL_TEXT,
+      expected: SYNTHETIC_REFUSAL_TEXT,
+    },
+    {
+      name: "a refusal stop reason on the root API error frame",
+      frames: [
+        {
+          stopReason: "refusal" as const,
+          stopDetails: { category: "cyber" },
+          requestId: "req_synthetic_refusal_0002",
+        },
+      ],
+      result: "API Error: Claude can't help with this. Start a new session to continue.",
+      expected:
+        "API Error: Claude can't help with this. Start a new session to continue.\n\nDetails: `[cyber]`\n\nRequest ID: req_synthetic_refusal_0002",
+    },
+    {
+      name: "a model_refusal_no_fallback notice",
+      frames: [],
+      noFallback: { category: "cyber", requestId: "req_synthetic_refusal_0003" },
+      result: "API Error: Claude can't help with this. Start a new session to continue.",
+      expected:
+        "API Error: Claude can't help with this. Start a new session to continue.\n\nDetails: `[cyber]`\n\nRequest ID: req_synthetic_refusal_0003",
+    },
+    {
+      name: "a refusal the same model answered on retry",
+      frames: [
+        { stopReason: "refusal" as const, stopDetails: { category: "cyber" } },
+        { stopReason: "end_turn" as const },
+      ],
+      result: "API Error: 400 Request rejected.",
+      expected: "API Error: 400 Request rejected.",
+    },
+    {
+      name: "a rate limit after a refusal",
+      frames: [{ stopReason: "refusal" as const, stopDetails: { category: "cyber" } }],
+      result: SYNTHETIC_REFUSAL_TEXT,
+      apiErrorStatus: 429,
+      expected: "Claude API rate limit reached. Try again later.",
+    },
+    {
+      name: "a completed reply that quotes the safeguards text",
+      frames: [{ stopReason: "end_turn" as const, text: SYNTHETIC_REFUSAL_TEXT }],
+      result: SYNTHETIC_REFUSAL_TEXT,
+      completed: true,
+      expected: undefined,
+    },
+  ])("classifies a Claude safeguards refusal for $name", (input) =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-claude-refusal"),
+          text: "Continue.",
+          attachments: [],
+        }),
+      );
+      yield* Queue.offerAll(harness.sdkMessages, [
+        ...input.frames.map((frame, index) =>
+          makeAssistantErrorFrame({
+            uuid: `00000000-0000-4000-8000-00000000071${index}`,
+            error: frame.stopReason === "refusal" ? "invalid_request" : undefined,
+            ...frame,
+          }),
+        ),
+        ...("noFallback" in input
+          ? [
+              claudeSdkFrame({
+                type: "system",
+                subtype: "model_refusal_no_fallback",
+                original_model: "claude-opus-5-5",
+                request_id: input.noFallback.requestId,
+                api_refusal_category: input.noFallback.category,
+                content: "",
+                uuid: "00000000-0000-4000-8000-000000000718",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            ]
+          : []),
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000719",
+          result: input.result,
+          ...("completed" in input
+            ? {}
+            : {
+                isError: true,
+                apiErrorStatus: input.apiErrorStatus ?? 400,
+                terminalReason: "api_error" as const,
+              }),
+        }),
+      ]);
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      if ("completed" in input) {
+        assert.equal(terminal.status, "completed");
+        return;
+      }
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.failure.message, input.expected);
+      const refused = input.expected !== input.result || input.result === SYNTHETIC_REFUSAL_TEXT;
+      if (input.apiErrorStatus === 429) {
+        assert.equal(terminal.failure.class, "usage_limit");
+      } else if (refused) {
+        assert.deepInclude(terminal.failure, {
+          class: "provider_error",
+          code: "model_refusal",
+          retryable: false,
+        });
+      } else {
+        assert.equal(terminal.failure.code, "api_error_400");
+      }
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
