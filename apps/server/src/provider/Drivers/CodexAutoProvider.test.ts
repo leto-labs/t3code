@@ -270,6 +270,8 @@ it.layer(NodeServices.layer)("Codex Auto instance", (it) => {
         ...selection,
         options: [{ id: "serviceTier", value: "ultrafast" }],
       });
+      setMembers([ProviderInstanceId.make("deleted-account"), open!.instance.instanceId]);
+      expect(yield* adapter.hasUsageAllowance!(selection, projectId)).toBe(true);
       setMembers([open!.instance.instanceId], false);
       expect(yield* adapter.hasUsageAllowance!(selection, projectId)).toBe(false);
     }),
