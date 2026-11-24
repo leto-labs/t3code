@@ -112,6 +112,16 @@ describe("limitRecoveryCommand arming", () => {
     assert.isNull(limitRecoveryCommand(thread, true, nowMs, true));
   });
 
+  it("does not revive old pool failures even after headroom returns", () => {
+    const old = failedThread(9 * 24 * HOUR_MS, 8 * 24 * HOUR_MS);
+    const recent = failedThread(7 * 24 * HOUR_MS, 6 * 24 * HOUR_MS);
+    assert.isNull(limitRecoveryCommand(old, true, nowMs, false, undefined, { hasHeadroom: true }));
+    assert.equal(
+      limitRecoveryCommand(recent, true, nowMs, false, undefined, { hasHeadroom: true })?.type,
+      "thread.metadata.update",
+    );
+  });
+
   it("still arms a failure whose reset only just passed", () => {
     const thread = failedThread(6 * HOUR_MS, HOUR_MS);
     const arm = limitRecoveryCommand(thread, true, nowMs);

@@ -1,3 +1,4 @@
+import { autoPoolRecoveryCutoff } from "./limitRecoveryTiming.ts";
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
 import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
@@ -212,6 +213,8 @@ export type ProjectionLimitRecoveryCandidate = Pick<
   readonly autoPool?: {
     readonly selection: OrchestrationV2AppThread["modelSelection"];
     readonly projectId: ProjectId;
+    readonly failedAt: DateTime.Utc;
+    readonly canRetryEarly?: boolean;
     readonly observedAfter?: number;
   };
 };
@@ -682,6 +685,10 @@ export interface ProjectionStoreV2Shape {
   readonly findThread: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2AppThread | null, ProjectionStoreV2Error>;
+  readonly canRetryAutoPoolBeforeReset: (
+    threadId: ThreadId,
+    runId: RunId,
+  ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
   readonly getLimitRecoveryCandidates: (options: {
     readonly now: DateTime.Utc;
     readonly autoResume: boolean;
@@ -5043,9 +5050,40 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         ),
     );
 
+    const canRetryAutoPoolBeforeReset = Effect.fn("ProjectionStore.canRetryAutoPoolBeforeReset")(
+      function* (threadId: ThreadId, runId: RunId) {
+        const maxEarlyRetries = 2;
+        const [row] = yield* sql<{ readonly failed_retries: number }>`
+          WITH RECURSIVE chain(run_id, previous_id, depth) AS (
+            SELECT run_id, json_extract(payload_json, '$.usageLimitContinuationOfRunId'), 1
+            FROM orchestration_v2_projection_runs
+            WHERE thread_id = ${threadId} AND run_id = ${runId} AND status = 'failed'
+            UNION ALL
+            SELECT run.run_id, json_extract(run.payload_json, '$.usageLimitContinuationOfRunId'), chain.depth + 1
+            FROM chain
+            JOIN orchestration_v2_projection_runs run ON run.run_id = chain.previous_id
+            WHERE run.thread_id = ${threadId} AND run.status = 'failed' AND chain.depth < ${maxEarlyRetries}
+          )
+          SELECT COUNT(*) AS failed_retries FROM chain
+          WHERE previous_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_run_attempts attempt
+            JOIN orchestration_v2_projection_provider_turns turn ON turn.run_attempt_id = attempt.attempt_id
+            WHERE attempt.thread_id = ${threadId} AND attempt.run_id = chain.run_id
+              AND turn.thread_id = ${threadId} AND turn.status = 'completed'
+          )
+        `;
+        return (row?.failed_retries ?? 0) < maxEarlyRetries;
+      },
+      (effect, threadId) =>
+        effect.pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause }))),
+    );
+
     const getLimitRecoveryCandidates = Effect.fn("ProjectionStore.getLimitRecoveryCandidates")(
       function* (options: Parameters<ProjectionStoreV2Shape["getLimitRecoveryCandidates"]>[0]) {
         const poolIds = options.autoPoolInstanceIds ?? [];
+        const poolCutoff = DateTime.formatIso(
+          DateTime.makeUnsafe(autoPoolRecoveryCutoff(DateTime.toEpochMillis(options.now))),
+        );
         const isPool =
           poolIds.length === 0
             ? sql`0`
@@ -5061,12 +5099,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           readonly payload_json: string;
           readonly run_id: string;
           readonly completed_at: string | null;
+          readonly requested_at: string;
           readonly failure_payload_json: string;
           readonly last_error: string | null;
           readonly is_pool: number;
           readonly is_recovery_run: number;
         }>`
-          SELECT t.payload_json, r.run_id, r.completed_at,
+          SELECT t.payload_json, r.run_id, r.completed_at, r.requested_at,
             (${isPool}) AS is_pool,
             json_type(r.payload_json, '$.usageLimitContinuationOfRunId') IS NOT NULL AS is_recovery_run,
             item.payload_json AS failure_payload_json,
@@ -5119,6 +5158,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
             AND json_valid(item.payload_json)
             AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
+            AND (NOT (${isPool}) OR julianday(COALESCE(r.completed_at, r.requested_at)) >= julianday(${poolCutoff}))
             AND (
               (${isPool})
               OR julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
@@ -5174,25 +5214,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           if (summary.lastErrorClass !== "usage_limit") continue;
           const latestRunCompletedAt =
             row.completed_at === null ? null : DateTime.makeUnsafe(row.completed_at);
+          const runId = RunId.make(row.run_id);
+          const failedAt = latestRunCompletedAt ?? DateTime.makeUnsafe(row.requested_at);
+          const retry =
+            row.is_pool && row.is_recovery_run
+              ? {
+                  canRetryEarly: yield* canRetryAutoPoolBeforeReset(thread.id, runId),
+                  observedAfter: DateTime.toEpochMillis(failedAt),
+                }
+              : {};
           candidates.push({
             id: thread.id,
             status: "failed",
             lastErrorClass: summary.lastErrorClass,
             usageLimitResetAt: summary.usageLimitResetAt,
-            latestRunId: RunId.make(row.run_id),
+            latestRunId: runId,
             latestRunCompletedAt,
             ...(row.is_pool
               ? {
                   autoPool: {
                     selection: thread.modelSelection,
                     projectId: thread.projectId,
-                    ...(row.is_recovery_run
-                      ? {
-                          observedAfter: DateTime.toEpochMillis(
-                            latestRunCompletedAt ?? thread.updatedAt,
-                          ),
-                        }
-                      : {}),
+                    failedAt,
+                    ...retry,
                   },
                 }
               : {}),
@@ -10085,6 +10129,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getPlan: readOnReader(getPlan),
       getProviderControlContext: readOnReader(getProviderControlContext),
       getLimitRecoveryCandidates: readOnReader(getLimitRecoveryCandidates),
+      canRetryAutoPoolBeforeReset: readOnReader(canRetryAutoPoolBeforeReset),
       getLimitRecoveryWakeAt: readOnReader(getLimitRecoveryWakeAt),
       getRecoveryThreadIds: readOnReader(getRecoveryThreadIds),
       getUnreadableThreadIds: readOnReader(getUnreadableThreadIds),
