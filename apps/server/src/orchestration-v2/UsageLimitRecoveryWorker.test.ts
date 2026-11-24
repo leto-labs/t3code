@@ -1,5 +1,10 @@
 import { assert, describe, expect, it } from "@effect/vitest";
-import { RunId, ThreadId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
+import {
+  RunId,
+  ThreadId,
+  type OrchestrationV2DomainEvent,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -8,6 +13,7 @@ import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -22,10 +28,14 @@ it.effect("idle sweeps skip SQL until the next wake time or a relevant event", (
     const startMs = Date.parse("2026-07-01T09:00:00.000Z");
     const queries = yield* Queue.unbounded<number>();
     const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+    const providers = yield* Queue.unbounded<ReadonlyArray<ServerProvider>>();
     const layer = UsageLimitRecoveryWorker.layer.pipe(
       Layer.provide(
         Layer.mergeAll(
           Scheduler.layer,
+          Layer.mock(ProviderRegistry.ProviderRegistry)({
+            streamChanges: Stream.fromQueue(providers),
+          }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({
             getLimitRecoveryCandidates: () =>
               Clock.currentTimeMillis.pipe(
@@ -66,6 +76,9 @@ it.effect("idle sweeps skip SQL until the next wake time or a relevant event", (
       yield* TestClock.adjust("5 seconds");
       // A streaming item at 90s does not wake it; the failed run does on the 95s tick.
       assert.equal(yield* Queue.take(queries), 95_000);
+      yield* Queue.offer(providers, []);
+      yield* TestClock.adjust("5 seconds");
+      assert.equal(yield* Queue.take(queries), 100_000);
     }).pipe(Effect.provide(layer));
   }),
 );
@@ -158,6 +171,30 @@ it.each([undefined, "paused", "blocked", "complete", "budget_limited"] as const)
     );
   },
 );
+
+it("resumes an armed pool failure early when a member regains headroom", () => {
+  expect(
+    limitRecoveryCommand(candidate, true, Date.parse(resetAt) - 1, false, undefined, {
+      hasHeadroom: true,
+    }),
+  ).toMatchObject({
+    type: "message.dispatch",
+    commandId: `limit-resume:${candidate.id}:${runId}:${Date.parse(resetAt)}:legacy`,
+    usageLimitContinuationOfRunId: runId,
+  });
+});
+
+it("arms a pool failure without a reported reset only when headroom returns", () => {
+  const thread = { ...candidate, usageLimitResetAt: null, limitRecovery: null };
+  expect(
+    limitRecoveryCommand(thread, true, nowMs, false, undefined, { hasHeadroom: false }),
+  ).toBeNull();
+  const arm = limitRecoveryCommand(thread, true, nowMs, false, undefined, { hasHeadroom: true });
+  expect(arm).toMatchObject({
+    type: "thread.metadata.update",
+    limitRecovery: { runId, autoResume: true, snooze: false },
+  });
+});
 
 it("does not resume a goal before reset or after cancellation", () => {
   expect(

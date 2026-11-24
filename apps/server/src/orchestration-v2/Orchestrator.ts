@@ -227,6 +227,7 @@ import {
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { limitRecoveryIsSnoozed, limitRecoveryTiming } from "./limitRecoveryTiming.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 const isMessageQuestionAnswer = Schema.is(
@@ -1686,6 +1687,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const providerSessions = yield* ProviderSessionManagerV2;
   const providerSwitchService = yield* ProviderSwitchServiceV2;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const resolveLimitRecoveryTiming = Effect.fn("Orchestrator.resolveLimitRecoveryTiming")(
+    function* (
+      run: OrchestrationV2Run | null,
+      reportedResetAt: string | null | undefined,
+      instanceId: ProviderInstanceId,
+    ) {
+      if (run === null) return null;
+      const failedAt = run.completedAt ?? run.requestedAt;
+      const reported = limitRecoveryTiming(reportedResetAt, failedAt, false);
+      if (reported !== null || run.providerInstanceId !== instanceId) return reported;
+      const adapter = yield* providerAdapters.get(instanceId).pipe(Effect.option);
+      return limitRecoveryTiming(
+        reportedResetAt,
+        failedAt,
+        Option.getOrUndefined(adapter)?.hasUsageAllowance !== undefined,
+      );
+    },
+  );
   const runtimePolicy = yield* RuntimePolicyV2;
   const threadForkService = yield* ThreadForkServiceV2;
   const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
@@ -4921,6 +4940,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const run = usageLimitBlockedRun(projection.runs, projection.turnItems, null);
       const failure = latestRootProviderFailure(run, projection.turnItems);
       const resetMs = Date.parse(command.limitRecovery.resetAt);
+      const timing = yield* resolveLimitRecoveryTiming(
+        run,
+        failure?.resetAt,
+        thread.providerInstanceId,
+      );
       if (command.limitRecovery.snooze === true && resetMs <= DateTime.toEpochMillis(now)) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
@@ -4936,12 +4960,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
       if (
-        !Number.isFinite(resetMs) ||
+        timing?.resetAt !== command.limitRecovery.resetAt ||
         thread.archivedAt !== null ||
         run?.id !== command.limitRecovery.runId ||
         failure?.class !== "usage_limit" ||
-        failure.resetAt !== command.limitRecovery.resetAt ||
-        resetMs <= DateTime.toEpochMillis(run.completedAt ?? run.requestedAt) ||
         projection.runtimeRequests.some((request) => request.status === "pending")
       ) {
         return yield* new OrchestratorDispatchError({
@@ -7382,22 +7404,57 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const failure = latestRootProviderFailure(run, projection.turnItems);
       const recovery = projection.thread.limitRecovery;
       const now = yield* DateTime.now;
+      const nowMs = DateTime.toEpochMillis(now);
+      const failedAt = run?.completedAt ?? run?.requestedAt;
+      const reportedTiming =
+        failedAt === undefined ? null : limitRecoveryTiming(failure?.resetAt, failedAt, false);
+      const needsHeadroom = reportedTiming === null || reportedTiming.resetMs > nowMs;
+      const matchesRecovery =
+        recovery?.autoResume === true &&
+        recovery.requestId === command.usageLimitRecoveryRequestId &&
+        recovery.runId === run?.id &&
+        recovery.runId === command.usageLimitContinuationOfRunId;
+      const beforePrompt =
+        run !== null &&
+        !projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId);
+      const poolAllowance =
+        (needsHeadroom || beforePrompt) &&
+        matchesRecovery &&
+        run.providerInstanceId === projection.thread.providerInstanceId
+          ? yield* providerAdapters.get(run.providerInstanceId).pipe(
+              Effect.map((adapter) => adapter.hasUsageAllowance),
+              Effect.orElseSucceed(() => undefined),
+            )
+          : undefined;
+      const hasHeadroom =
+        needsHeadroom && poolAllowance !== undefined
+          ? yield* poolAllowance(
+              projection.thread.modelSelection,
+              projection.thread.projectId,
+              run?.usageLimitContinuationOfRunId === undefined || failedAt === undefined
+                ? undefined
+                : DateTime.toEpochMillis(failedAt),
+            )
+          : false;
+      const timing =
+        reportedTiming ??
+        (failedAt === undefined
+          ? null
+          : limitRecoveryTiming(failure?.resetAt, failedAt, hasHeadroom));
+      const snoozed = limitRecoveryIsSnoozed(projection.thread, nowMs, hasHeadroom);
       if (
         run?.id !== command.usageLimitContinuationOfRunId ||
         failure?.class !== "usage_limit" ||
         threadShellFromProjection(projection).lastErrorClass !== "usage_limit" ||
-        !recovery?.autoResume ||
-        recovery.requestId !== command.usageLimitRecoveryRequestId ||
-        recovery.runId !== run.id ||
-        recovery.resetAt !== failure.resetAt ||
-        Date.parse(recovery.resetAt) > DateTime.toEpochMillis(now) ||
+        !matchesRecovery ||
+        recovery.resetAt !== timing?.resetAt ||
+        (needsHeadroom && !hasHeadroom) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.thread.settledOverride === "settled" ||
         projection.thread.providerInstanceId !== run.providerInstanceId ||
         projection.runtimeRequests.some((request) => request.status === "pending") ||
-        (projection.thread.snoozedUntil != null &&
-          DateTime.toEpochMillis(projection.thread.snoozedUntil) > DateTime.toEpochMillis(now))
+        snoozed
       ) {
         yield* emit(
           events,
@@ -7408,16 +7465,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: {
             ...projection.thread,
-            ...(recovery?.autoResume &&
-            recovery.requestId === command.usageLimitRecoveryRequestId &&
-            recovery.runId === command.usageLimitContinuationOfRunId &&
-            projection.thread.snoozedUntil != null &&
-            DateTime.toEpochMillis(projection.thread.snoozedUntil) > DateTime.toEpochMillis(now)
+            ...(matchesRecovery && (snoozed || (needsHeadroom && !hasHeadroom))
               ? { limitRecovery: { ...recovery, requestId: command.commandId } }
               : {}),
           },
         });
         return;
+      }
+      if (poolAllowance !== undefined && beforePrompt) {
+        const original = projection.messages.find((message) => message.id === run.userMessageId);
+        if (original !== undefined) {
+          command = {
+            ...command,
+            text: original.text,
+            attachments: original.attachments,
+            ...(original.context === undefined ? {} : { context: original.context }),
+          };
+        }
       }
     }
 
@@ -13593,15 +13657,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         })
         .pipe(mapDispatchError(input.command));
       const failure = latestRootProviderFailure(latest, turnItems);
-      if (
-        failure?.class === "usage_limit" &&
-        failure.resetAt != null &&
-        Number.isFinite(Date.parse(failure.resetAt)) &&
-        (recovery?.runId !== latest.id || recovery.resetAt !== failure.resetAt)
-      ) {
+      const timing =
+        failure?.class === "usage_limit"
+          ? yield* resolveLimitRecoveryTiming(latest, failure.resetAt, thread.providerInstanceId)
+          : null;
+      if (timing && (recovery?.runId !== latest.id || recovery.resetAt !== timing.resetAt)) {
         recovery = {
           runId: latest.id,
-          resetAt: failure.resetAt,
+          resetAt: timing.resetAt,
           autoResume: false,
           snooze: false,
         };
