@@ -204,6 +204,11 @@ const isProviderAdapterOpenSessionError = Schema.is(
   ProviderAdapter.ProviderAdapterOpenSessionError,
 );
 
+const preservesNativeThread = (error: unknown): boolean =>
+  Predicate.isTagged(error, "ProviderAdapterResumeThreadError") &&
+  Predicate.hasProperty(error, "preserveNativeThread") &&
+  error.preserveNativeThread === true;
+
 /**
  * Claude refuses these before it reads the prompt: replacing a process running background work,
  * launch arguments whose appended system prompt or settings cannot be read, or MCP registration
@@ -219,6 +224,7 @@ const PROMPT_REFUSAL_TAGS = [
 ] as const;
 
 const refusedBeforePrompt = (error: unknown): boolean =>
+  preservesNativeThread(error) ||
   PROMPT_REFUSAL_TAGS.some((tag) => Predicate.isTagged(error, tag)) ||
   (isProviderAdapterTurnStartError(error) && error.refusedBeforePrompt === true) ||
   (isProviderAdapterProtocolError(error) &&
@@ -1911,12 +1917,13 @@ export const layer: Layer.Layer<
         resumedRetryHandoff = undefined;
         if (!(yield* isCurrentAttemptInStatus("starting"))) return undefined;
         // Another client is still writing to the native thread, or the provider may have
-        // resumed it without answering. A fresh session would split the conversation, and a
-        // usage limit would bypass quota recovery.
+        // resumed it without answering. A fresh session would split the conversation; a load
+        // only temporarily blocked keeps it, and a usage limit would bypass quota recovery.
         if (
           resumed._tag === "Failure" &&
           (resumed.failure._tag === "ProviderAdapterThreadInUseError" ||
             outcomeUnknown(resumed.failure) ||
+            preservesNativeThread(resumed.failure) ||
             makeProviderFailure({ cause: resumed.failure }).class === "usage_limit")
         ) {
           return yield* loadFromProvider(Effect.fail(resumed.failure));

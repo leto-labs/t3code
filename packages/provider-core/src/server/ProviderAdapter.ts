@@ -296,6 +296,8 @@ export class ProviderAdapterResumeThreadError extends Schema.TaggedError<Provide
     driver: ProviderDriverKind,
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
+    /** The native conversation must remain bound for a later retry. */
+    preserveNativeThread: Schema.optional(Schema.Literal(true)),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

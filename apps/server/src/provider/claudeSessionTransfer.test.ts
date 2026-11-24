@@ -78,6 +78,22 @@ it.layer(NodeServices.layer)("transferClaudeSession", (it) => {
     }),
   );
 
+  it.effect("fails when a required transcript is missing from every known home", () =>
+    Effect.gen(function* () {
+      const { homes } = yield* setup;
+      const failed = yield* transferClaudeSession({
+        sessionId: SESSION,
+        target: homes.alice,
+        sources: [homes.sam],
+        requireTranscript: true,
+      }).pipe(Effect.result);
+      expect(failed).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "ClaudeAutoTranscriptMissingError" },
+      });
+    }),
+  );
+
   it.effect("ignores a session id that could name a path outside the home", () =>
     Effect.gen(function* () {
       const { fs, path, homes, write } = yield* setup;
