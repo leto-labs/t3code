@@ -1,5 +1,6 @@
 import {
   ClaudeSettings,
+  defaultInstanceIdForDriver,
   ProviderDriverKind,
   ProviderSetupError,
   resolveProjectProviderInstanceEnabled,
@@ -195,6 +196,8 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
     function* (id: ProviderInstanceId, settings?: ServerSettings) {
       const current = settings ?? (yield* readSettings);
       const entry = current.providerInstances[id];
+      if (entry === undefined && id !== defaultInstanceIdForDriver(DRIVER))
+        return yield* failure("The configured Claude Auto member no longer exists.");
       if (entry?.driver !== undefined && entry.driver !== DRIVER)
         return yield* failure("Claude Auto only supports Claude subscription accounts.");
       const config = yield* decodeClaudeSettings(entry?.config ?? {}).pipe(
@@ -333,15 +336,13 @@ export const makeClaudeAutoProvider = Effect.fn("makeClaudeAutoProvider")(functi
   );
   if (input.enabled && ids.length > 0) yield* keepAutoPoolUsageFresh(router);
 
-  const homeOf = (id: ProviderInstanceId) =>
-    launch(id).pipe(Effect.map(({ claudeHome }) => claudeHome));
   const orchestrationAdapter = yield* makeClaudeAutoAdapter({
     instanceId: input.instanceId,
     router,
     sessionHomes: Effect.fn("ClaudeAutoProvider.sessionHomes")(
       function* (member, previousMemberId) {
-        const target = yield* homeOf(member.instance.instanceId);
         const settings = yield* readSettings;
+        const { claudeHome: target } = yield* launch(member.instance.instanceId, settings);
         const memberIds =
           currentAutoPool(settings.providerInstances, input.instanceId, DRIVER)?.memberIds ?? [];
         const sourceIds = new Set(memberIds);
