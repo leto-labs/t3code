@@ -12950,6 +12950,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     "pool-headroom",
     "pool-unknown-reset",
     "pool-old-failure",
+    "pool-long-reset",
     "pool-retry-cap",
     "resume-started",
     "resume-untagged",
@@ -13027,10 +13028,9 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       const resetAt =
         scenario === "invalid-snooze"
           ? "not-a-date"
-          : DateTime.formatIso(DateTime.add(now, { minutes: 1 })).replace(
-              "Z",
-              scenario === "wake" ? "+00:00" : "Z",
-            );
+          : DateTime.formatIso(
+              DateTime.add(now, scenario === "pool-long-reset" ? { days: 11 } : { minutes: 1 }),
+            ).replace("Z", scenario === "wake" ? "+00:00" : "Z");
       const writeFailure = (run: OrchestrationV2Run, failedAt: DateTime.Utc) =>
         events.write({
           commandId: CommandId.make(`recovery:failure:${run.id}`),
@@ -13068,7 +13068,10 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
                   message: "Plan limit reached.",
                   code: "usageLimitExceeded",
                   retryable: null,
-                  resetAt: scenario === "pool-unknown-reset" ? null : resetAt,
+                  resetAt:
+                    scenario === "pool-unknown-reset" || scenario === "pool-old-failure"
+                      ? null
+                      : resetAt,
                 },
               },
             },
@@ -13076,7 +13079,9 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
         });
       yield* writeFailure(
         run,
-        scenario === "pool-old-failure" ? DateTime.subtract(now, { days: 9 }) : now,
+        scenario === "pool-old-failure" || scenario === "pool-long-reset"
+          ? DateTime.subtract(now, { days: 9 })
+          : now,
       );
       if (scenario === "queued-resume") {
         const queuedRun = projection.runs[1]!;
@@ -13107,14 +13112,17 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       )!;
       if (pool) {
         const projections = yield* ProjectionStore.ProjectionStoreV2;
-        const readCandidate = projections
-          .getLimitRecoveryCandidates({
-            now,
-            autoResume: true,
-            snooze: false,
-            autoPoolInstanceIds: [poolInstanceId],
-          })
-          .pipe(Effect.map((rows) => rows.find((row) => row.id === threadId)!));
+        const readCandidate = DateTime.now.pipe(
+          Effect.flatMap((now) =>
+            projections.getLimitRecoveryCandidates({
+              now,
+              autoResume: true,
+              snooze: false,
+              autoPoolInstanceIds: [poolInstanceId],
+            }),
+          ),
+          Effect.map((rows) => rows.find((row) => row.id === threadId)!),
+        );
         if (scenario === "pool-old-failure") {
           assert.isUndefined(yield* readCandidate);
           return;
@@ -13172,10 +13180,13 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
           threadId,
           limitRecovery: arm.limitRecovery,
         });
+        const recoveryTime =
+          scenario === "pool-long-reset" ? Date.parse(resetAt) : DateTime.toEpochMillis(now);
+        if (scenario === "pool-long-reset") yield* TestClock.setTime(recoveryTime);
         const resume = limitRecoveryCommand(
           yield* readCandidate,
           true,
-          DateTime.toEpochMillis(now),
+          recoveryTime,
           false,
           undefined,
           availability,

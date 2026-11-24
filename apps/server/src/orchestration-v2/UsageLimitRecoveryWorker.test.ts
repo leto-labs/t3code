@@ -113,12 +113,24 @@ describe("limitRecoveryCommand arming", () => {
   });
 
   it("does not revive old pool failures even after headroom returns", () => {
-    const old = failedThread(9 * 24 * HOUR_MS, 8 * 24 * HOUR_MS);
+    const old = { ...failedThread(9 * 24 * HOUR_MS, 8 * 24 * HOUR_MS), usageLimitResetAt: null };
     const recent = failedThread(7 * 24 * HOUR_MS, 6 * 24 * HOUR_MS);
     assert.isNull(limitRecoveryCommand(old, true, nowMs, false, undefined, { hasHeadroom: true }));
     assert.equal(
       limitRecoveryCommand(recent, true, nowMs, false, undefined, { hasHeadroom: true })?.type,
       "thread.metadata.update",
+    );
+  });
+
+  it("keeps pool recovery eligible through eight days after a reported reset", () => {
+    const thread = failedThread(20 * 24 * HOUR_MS, 7 * 24 * HOUR_MS);
+    const availability = { hasHeadroom: false };
+    assert.equal(
+      limitRecoveryCommand(thread, true, nowMs, false, undefined, availability)?.type,
+      "thread.metadata.update",
+    );
+    assert.isNull(
+      limitRecoveryCommand(thread, true, nowMs + 2 * 24 * HOUR_MS, false, undefined, availability),
     );
   });
 

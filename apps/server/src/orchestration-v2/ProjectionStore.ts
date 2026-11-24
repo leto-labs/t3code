@@ -5048,7 +5048,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
             AND json_valid(item.payload_json)
             AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
-            AND (NOT (${isPool}) OR julianday(COALESCE(r.completed_at, r.requested_at)) >= julianday(${poolCutoff}))
+            AND (
+              NOT (${isPool})
+              OR julianday(COALESCE(r.completed_at, r.requested_at)) >= julianday(${poolCutoff})
+              OR julianday(json_extract(item.payload_json, '$.failure.resetAt')) >= julianday(${poolCutoff})
+            )
             AND (
               (${isPool})
               OR julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
