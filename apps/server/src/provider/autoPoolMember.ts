@@ -1,6 +1,7 @@
 import {
   autoPoolMemberRejection,
   autoPoolOwnerId,
+  defaultInstanceIdForDriver,
   resolveProviderInstanceEnabled,
   readAutoPools,
   type ProviderDriverKind,
@@ -68,9 +69,15 @@ export function currentAutoPool(
   const entry = instances[instanceId];
   if (entry?.driver !== driver || !resolveProviderInstanceEnabled(entry)) return undefined;
   const pool = readAutoPools({ [instanceId]: entry })[0];
-  return pool &&
-    !pool.memberIds.includes(instanceId) &&
-    new Set(pool.memberIds).size === pool.memberIds.length
-    ? pool
-    : undefined;
+  if (
+    !pool ||
+    pool.memberIds.includes(instanceId) ||
+    new Set(pool.memberIds).size !== pool.memberIds.length
+  )
+    return undefined;
+  const defaultId = defaultInstanceIdForDriver(driver);
+  return {
+    ...pool,
+    memberIds: pool.memberIds.filter((id) => id === defaultId || Object.hasOwn(instances, id)),
+  };
 }
