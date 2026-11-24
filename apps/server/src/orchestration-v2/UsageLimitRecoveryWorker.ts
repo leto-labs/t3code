@@ -13,7 +13,11 @@ import * as Stream from "effect/Stream";
 import type { OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
-import { limitRecoveryIsSnoozed, limitRecoveryTiming } from "./limitRecoveryTiming.ts";
+import {
+  limitRecoveryDeliveryMode,
+  limitRecoveryIsSnoozed,
+  limitRecoveryTiming,
+} from "./limitRecoveryTiming.ts";
 import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -49,16 +53,22 @@ export function limitRecoveryCommand(
     return null;
   const timing = limitRecoveryTiming(
     thread.usageLimitResetAt,
-    thread.latestRunCompletedAt ?? thread.updatedAt,
+    thread.autoPool?.failedAt ?? thread.latestRunCompletedAt ?? thread.updatedAt,
     pool !== undefined,
   );
-  const hasHeadroom = pool?.hasHeadroom === true;
-  if (!timing || (!timing.reported && !hasHeadroom)) return null;
+  if (!timing) return null;
+  const mode = limitRecoveryDeliveryMode(
+    timing,
+    nowMs,
+    pool === undefined ? undefined : thread.autoPool?.canRetryEarly !== false,
+  );
+  const hasHeadroom = mode === "headroom" && pool?.hasHeadroom === true;
+  if (mode === "expired" || (!timing.reported && !hasHeadroom)) return null;
   const { resetMs, resetAt } = timing;
   const identity = `${thread.id}:${thread.latestRunId}:${resetMs}`;
   const recovery = thread.limitRecovery;
   if (recovery?.runId !== thread.latestRunId || recovery.resetAt !== resetAt) {
-    if (!hasHeadroom && nowMs - resetMs > MAX_OVERDUE_ARM_MS) return null;
+    if (pool === undefined && nowMs - resetMs > MAX_OVERDUE_ARM_MS) return null;
     if (!autoResume && (!snooze || resetMs <= nowMs || hasHeadroom)) return null;
     return {
       type: "thread.metadata.update",
@@ -74,7 +84,7 @@ export function limitRecoveryCommand(
   }
   if (
     !recovery.autoResume ||
-    (resetMs > nowMs && !hasHeadroom) ||
+    (mode !== "reset" && !hasHeadroom) ||
     limitRecoveryIsSnoozed(thread, nowMs, hasHeadroom)
   )
     return null;
@@ -105,9 +115,12 @@ const affectsLimitRecovery = (event: OrchestrationV2DomainEvent) =>
   event.type.startsWith("provider-session.") ||
   (event.type === "turn-item.updated" && event.payload.type === "error");
 
-const poolAvailabilityKey = (
-  pool: NonNullable<ProjectionStore.ProjectionLimitRecoveryCandidate["autoPool"]>,
-) => JSON.stringify(pool);
+const poolAvailabilityKey = ({
+  selection,
+  projectId,
+  observedAfter,
+}: NonNullable<ProjectionStore.ProjectionLimitRecoveryCandidate["autoPool"]>) =>
+  JSON.stringify([selection, projectId, observedAfter]);
 
 const makeSweep = Effect.gen(function* () {
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -174,7 +187,7 @@ const makeSweep = Effect.gen(function* () {
     for (const thread of candidates) {
       const pool = thread.autoPool;
       let hasHeadroom = false;
-      if (pool !== undefined && instances !== undefined) {
+      if (pool !== undefined && pool.canRetryEarly !== false && instances !== undefined) {
         const key = poolAvailabilityKey(pool);
         const cached = availability.get(key);
         if (cached !== undefined) {

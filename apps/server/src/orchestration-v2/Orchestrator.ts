@@ -228,7 +228,11 @@ import {
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
-import { limitRecoveryIsSnoozed, limitRecoveryTiming } from "./limitRecoveryTiming.ts";
+import {
+  limitRecoveryDeliveryMode,
+  limitRecoveryIsSnoozed,
+  limitRecoveryTiming,
+} from "./limitRecoveryTiming.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 const isMessageQuestionAnswer = Schema.is(
@@ -7415,41 +7419,38 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const now = yield* DateTime.now;
       const nowMs = DateTime.toEpochMillis(now);
       const failedAt = run?.completedAt ?? run?.requestedAt;
-      const reportedTiming =
-        failedAt === undefined ? null : limitRecoveryTiming(failure?.resetAt, failedAt, false);
-      const needsHeadroom = reportedTiming === null || reportedTiming.resetMs > nowMs;
       const matchesRecovery =
         recovery?.autoResume === true &&
         recovery.requestId === command.usageLimitRecoveryRequestId &&
         recovery.runId === run?.id &&
         recovery.runId === command.usageLimitContinuationOfRunId;
-      const beforePrompt =
-        run !== null &&
-        !projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId);
       const poolAllowance =
-        (needsHeadroom || beforePrompt) &&
-        matchesRecovery &&
-        run.providerInstanceId === projection.thread.providerInstanceId
+        matchesRecovery && run.providerInstanceId === projection.thread.providerInstanceId
           ? yield* providerAdapters.get(run.providerInstanceId).pipe(
               Effect.map((adapter) => adapter.hasUsageAllowance),
               Effect.orElseSucceed(() => undefined),
             )
           : undefined;
+      const timing =
+        failedAt === undefined
+          ? null
+          : limitRecoveryTiming(failure?.resetAt, failedAt, poolAllowance !== undefined);
+      const canRetryEarly =
+        poolAllowance === undefined || run === null
+          ? undefined
+          : run.usageLimitContinuationOfRunId === undefined ||
+            (yield* projectionStore
+              .canRetryAutoPoolBeforeReset(run.threadId, run.id)
+              .pipe(mapDispatchError(command)));
+      const mode = timing === null ? null : limitRecoveryDeliveryMode(timing, nowMs, canRetryEarly);
       const hasHeadroom =
-        needsHeadroom && poolAllowance !== undefined
+        mode === "headroom" && poolAllowance !== undefined
           ? yield* poolAllowance(
               projection.thread.modelSelection,
               projection.thread.projectId,
-              run?.usageLimitContinuationOfRunId === undefined || failedAt === undefined
-                ? undefined
-                : DateTime.toEpochMillis(failedAt),
+              run?.usageLimitContinuationOfRunId === undefined ? undefined : timing?.failedAtMs,
             )
           : false;
-      const timing =
-        reportedTiming ??
-        (failedAt === undefined
-          ? null
-          : limitRecoveryTiming(failure?.resetAt, failedAt, hasHeadroom));
       const snoozed = limitRecoveryIsSnoozed(projection.thread, nowMs, hasHeadroom);
       if (
         run?.id !== command.usageLimitContinuationOfRunId ||
@@ -7457,7 +7458,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadShellFromProjection(projection).lastErrorClass !== "usage_limit" ||
         !matchesRecovery ||
         recovery.resetAt !== timing?.resetAt ||
-        (needsHeadroom && !hasHeadroom) ||
+        (mode !== "reset" && !hasHeadroom) ||
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
         projection.thread.settledOverride === "settled" ||
@@ -7474,14 +7475,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           occurredAt: now,
           payload: {
             ...projection.thread,
-            ...(matchesRecovery && (snoozed || (needsHeadroom && !hasHeadroom))
+            ...(matchesRecovery &&
+            recovery.resetAt === timing?.resetAt &&
+            (snoozed || (mode === "headroom" && !hasHeadroom))
               ? { limitRecovery: { ...recovery, requestId: command.commandId } }
               : {}),
           },
         });
         return;
       }
-      if (poolAllowance !== undefined && beforePrompt) {
+      if (
+        poolAllowance !== undefined &&
+        !projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId)
+      ) {
         const original = projection.messages.find((message) => message.id === run.userMessageId);
         if (original !== undefined) {
           command = {
