@@ -12949,6 +12949,8 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     "resume",
     "pool-headroom",
     "pool-unknown-reset",
+    "pool-old-failure",
+    "pool-retry-cap",
     "resume-started",
     "resume-untagged",
     "queued-resume",
@@ -12970,7 +12972,7 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const events = yield* EventSink.EventSinkV2;
-      const pool = scenario === "pool-headroom" || scenario === "pool-unknown-reset";
+      const pool = scenario.startsWith("pool-");
       const selection = pool ? { ...modelSelection, instanceId: poolInstanceId } : modelSelection;
       const threadId = ThreadId.make(`recovery:${scenario}`);
       const projectId = ProjectId.make(`recovery:project:${scenario}`);
@@ -13029,48 +13031,53 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
               "Z",
               scenario === "wake" ? "+00:00" : "Z",
             );
-      yield* events.write({
-        commandId: CommandId.make(`recovery:failure:${scenario}`),
-        events: [
-          {
-            id: EventId.make(`recovery:run:${scenario}`),
-            type: "run.updated",
-            threadId,
-            occurredAt: now,
-            payload: { ...run, status: "failed", completedAt: now },
-          },
-          {
-            id: EventId.make(`recovery:error:${scenario}`),
-            type: "turn-item.updated",
-            threadId,
-            occurredAt: now,
-            payload: {
-              id: TurnItemId.make(`recovery:error:${scenario}`),
-              type: "error",
+      const writeFailure = (run: OrchestrationV2Run, failedAt: DateTime.Utc) =>
+        events.write({
+          commandId: CommandId.make(`recovery:failure:${run.id}`),
+          events: [
+            {
+              id: EventId.make(`recovery:run:${run.id}`),
+              type: "run.updated",
               threadId,
-              runId: run.id,
-              nodeId: run.rootNodeId,
-              providerThreadId: null,
-              providerTurnId: null,
-              nativeItemRef: null,
-              parentItemId: null,
-              ordinal: 2,
-              status: "failed",
-              title: "Usage limit reached",
-              startedAt: now,
-              completedAt: now,
-              updatedAt: now,
-              failure: {
-                class: "usage_limit",
-                message: "Plan limit reached.",
-                code: "usageLimitExceeded",
-                retryable: null,
-                resetAt: scenario === "pool-unknown-reset" ? null : resetAt,
+              occurredAt: failedAt,
+              payload: { ...run, status: "failed", completedAt: failedAt },
+            },
+            {
+              id: EventId.make(`recovery:error:${run.id}`),
+              type: "turn-item.updated",
+              threadId,
+              occurredAt: failedAt,
+              payload: {
+                id: TurnItemId.make(`recovery:error:${run.id}`),
+                type: "error",
+                threadId,
+                runId: run.id,
+                nodeId: run.rootNodeId,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 2,
+                status: "failed",
+                title: "Usage limit reached",
+                startedAt: failedAt,
+                completedAt: failedAt,
+                updatedAt: failedAt,
+                failure: {
+                  class: "usage_limit",
+                  message: "Plan limit reached.",
+                  code: "usageLimitExceeded",
+                  retryable: null,
+                  resetAt: scenario === "pool-unknown-reset" ? null : resetAt,
+                },
               },
             },
-          },
-        ],
-      });
+          ],
+        });
+      yield* writeFailure(
+        run,
+        scenario === "pool-old-failure" ? DateTime.subtract(now, { days: 9 }) : now,
+      );
       if (scenario === "queued-resume") {
         const queuedRun = projection.runs[1]!;
         yield* events.write({
@@ -13108,6 +13115,46 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
             autoPoolInstanceIds: [poolInstanceId],
           })
           .pipe(Effect.map((rows) => rows.find((row) => row.id === threadId)!));
+        if (scenario === "pool-old-failure") {
+          assert.isUndefined(yield* readCandidate);
+          return;
+        }
+        if (scenario === "pool-retry-cap") {
+          const plan = (
+            candidate: ProjectionStore.ProjectionLimitRecoveryCandidate,
+            at = DateTime.toEpochMillis(now),
+          ) => limitRecoveryCommand(candidate, true, at, false, undefined, { hasHeadroom: true });
+          for (let retries = 0; retries <= 2; retries++) {
+            const arm = plan(yield* readCandidate);
+            assert(arm?.type === "thread.metadata.update" && arm.limitRecovery != null);
+            yield* orchestrator.autoArmLimitRecovery({
+              commandId: arm.commandId,
+              threadId,
+              limitRecovery: arm.limitRecovery,
+            });
+            const armed = yield* readCandidate;
+            const resume = plan(armed);
+            if (retries === 2) {
+              assert.isNull(resume);
+              const afterReset = plan(armed, Date.parse(resetAt));
+              assert(afterReset?.type === "message.dispatch");
+              yield* orchestrator.dispatch({
+                ...afterReset,
+                commandId: CommandId.make(`${afterReset.commandId}:early-check`),
+              });
+              assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 3);
+              yield* TestClock.adjust("1 minute");
+              yield* orchestrator.dispatch(afterReset);
+              assert.lengthOf((yield* orchestrator.getThreadProjection(threadId)).runs, 4);
+              return;
+            }
+            assert(resume?.type === "message.dispatch");
+            yield* orchestrator.dispatch(resume);
+            const started = (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)!;
+            assert.equal(started.userMessageId, resume.messageId);
+            yield* writeFailure(started, now);
+          }
+        }
         const candidate = yield* readCandidate;
         assert.equal(candidate.autoPool?.selection.instanceId, poolInstanceId);
         const availability = { hasHeadroom: true };

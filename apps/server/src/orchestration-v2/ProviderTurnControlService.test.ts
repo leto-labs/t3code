@@ -133,6 +133,7 @@ function layerProjectionStore(
     ProjectionStore.ProjectionStoreV2,
     ProjectionStore.ProjectionStoreV2.of({
       apply: () => Effect.void,
+      canRetryAutoPoolBeforeReset: () => Effect.die("unused canRetryAutoPoolBeforeReset"),
       getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
       getLimitRecoveryWakeAt: () => Effect.die("unused getLimitRecoveryWakeAt"),
       getOpenRemoteDelegatedTasks: Effect.die("unused getOpenRemoteDelegatedTasks"),
