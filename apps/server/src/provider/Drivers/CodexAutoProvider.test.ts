@@ -4,6 +4,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   CodexSettings,
   DEFAULT_SERVER_SETTINGS,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -74,11 +75,27 @@ const makeFixture = Effect.fn("CodexAutoProvider.test.fixture")(function* (
       },
     ]),
   );
-  const settings = { ...DEFAULT_SERVER_SETTINGS, providerInstances: configs };
+
   const config = yield* decodeCodexSettings({
     autoPoolMemberIds:
       mode === "empty" ? [] : accounts.map((account) => account.instance.instanceId),
   });
+  let settings = {
+    ...DEFAULT_SERVER_SETTINGS,
+    providerInstances: {
+      ...configs,
+      [poolId]: { driver: ProviderDriverKind.make("codex"), config },
+    } as ProviderInstanceConfigMap,
+  };
+  const setMembers = (ids: readonly ProviderInstanceId[]) => {
+    settings = {
+      ...settings,
+      providerInstances: {
+        ...configs,
+        [poolId]: { driver: ProviderDriverKind.make("codex"), config: { autoPoolMemberIds: ids } },
+      },
+    };
+  };
   const instances = accounts.map((account) => ({
     ...account.instance,
     continuationIdentity: {
@@ -113,7 +130,7 @@ const makeFixture = Effect.fn("CodexAutoProvider.test.fixture")(function* (
         providerStatusCacheDir: baseDir,
       },
       settings: {
-        get: Effect.succeed(settings),
+        get: Effect.sync(() => settings),
         changes: Stream.empty,
         subscribe: Effect.succeed(Stream.empty),
         withSnapshot: (use) => use(settings),
@@ -136,7 +153,7 @@ const makeFixture = Effect.fn("CodexAutoProvider.test.fixture")(function* (
       ),
     ),
   );
-  return { provider, accounts, registryChanges, physicalChanges };
+  return { provider, accounts, registryChanges, physicalChanges, setMembers };
 });
 
 it.layer(NodeServices.layer)("Codex Auto instance", (it) => {
@@ -223,6 +240,33 @@ it.layer(NodeServices.layer)("Codex Auto instance", (it) => {
         const { provider } = yield* makeFixture(mode);
         expect(yield* provider.snapshot.refresh).toMatchObject({ status: "error", models: [] });
       }),
+  );
+
+  it.effect("uses the current membership through an existing Auto adapter", () =>
+    Effect.gen(function* () {
+      const { provider, accounts, setMembers } = yield* makeFixture();
+      const adapter = provider.orchestrationAdapter;
+      const selection = { instanceId: poolId, model: "gpt-test" };
+      const projectId = ProjectId.make("pool-member-change");
+      const [open, spent] = accounts;
+      const snapshot = spent!.read();
+      spent!.set({
+        ...snapshot,
+        usageLimits: {
+          ...snapshot.usageLimits!,
+          windows: snapshot.usageLimits!.windows.map((window) => ({ ...window, usedPercent: 100 })),
+        },
+      });
+      setMembers([spent!.instance.instanceId]);
+      expect(yield* adapter.hasUsageAllowance!(selection, projectId)).toBe(false);
+      setMembers([spent!.instance.instanceId, open!.instance.instanceId]);
+      expect(yield* adapter.hasUsageAllowance!(selection, projectId)).toBe(true);
+      setMembers([open!.instance.instanceId]);
+      yield* adapter.validateModelSelection!({
+        ...selection,
+        options: [{ id: "serviceTier", value: "ultrafast" }],
+      });
+    }),
   );
 
   it.effect("rechecks configured membership and narrows capabilities after reconciliation", () =>

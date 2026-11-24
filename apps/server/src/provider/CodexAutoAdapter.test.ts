@@ -63,6 +63,7 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
   mode:
     | "recover"
     | "pending"
+    | "queued-child"
     | "tool"
     | "transport"
     | "identity"
@@ -345,14 +346,14 @@ const harness = Effect.fn("CodexAutoAdapter.test.harness")(function* (
                       { type: "runtime_request.updated" }
                     >["runtimeRequest"],
                   });
-                if (mode === "tool")
+                if (mode === "tool" || mode === "queued-child")
                   yield* Queue.offer(nativeEvents, {
                     type: "node.updated",
                     driver,
                     node: {
                       id: NodeId.make("unfinished-tool"),
-                      kind: "tool_call",
-                      status: "running",
+                      kind: mode === "tool" ? "tool_call" : "subagent",
+                      status: mode === "tool" ? "running" : "pending",
                     } as Extract<
                       ProviderAdapter.ProviderAdapterV2Event,
                       { type: "node.updated" }
@@ -688,6 +689,37 @@ it.layer(NodeServices.layer)("Codex Auto native recovery", (it) => {
         expect(h.opens.length).toBeLessThanOrEqual(mode === "resume-failure" ? 2 : 1);
         expect(h.turn.providerThread.nativeThreadRef?.nativeId).toBe("native-shared-history");
       }),
+  );
+
+  it.effect("resumes the conversation on the available member before handoff probes", () =>
+    Effect.gen(function* () {
+      const h = yield* harness("identity");
+      const spent = h.accounts[0]!;
+      const snapshot = spent.read();
+      spent.set({
+        ...snapshot,
+        usageLimits: {
+          ...snapshot.usageLimits!,
+          windows: snapshot.usageLimits!.windows.map((window) => ({ ...window, usedPercent: 100 })),
+        },
+      });
+      const resumed = yield* h.runtime.resumeThread({
+        threadId: h.turn.appThread.id,
+        providerThread: h.turn.providerThread,
+        modelSelection: h.turn.modelSelection,
+        runtimePolicy: h.turn.runtimePolicy,
+      });
+      expect(resumed.nativeMetadata?.executionInstanceId).toBe("b");
+    }),
+  );
+
+  it.effect("hands off quota-limited turns with a queued child", () =>
+    Effect.gen(function* () {
+      const h = yield* harness("queued-child");
+      yield* h.runtime.startTurn(h.turn);
+      expect((yield* h.readTerminal())[0]).toMatchObject({ status: "completed" });
+      expect(h.starts).toHaveLength(2);
+    }),
   );
 
   it.effect("reports pool exhaustion with a reset for the shared recovery worker", () =>

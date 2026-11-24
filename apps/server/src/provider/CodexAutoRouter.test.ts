@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as ServerConfig from "../config.ts";
 import { makeCodexAutoRouter } from "./Drivers/CodexAutoProvider.ts";
+import { AutoPoolRoutingStates } from "./AutoPoolRouter.ts";
 import { autoPoolAccountKey } from "./autoPoolPolicy.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { CODEX_AUTO_MODEL, codexAutoFixture } from "./testUtils/codexAuto.ts";
@@ -18,11 +19,15 @@ const setup = Effect.gen(function* () {
   const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-codex-auto-" });
   const now = DateTime.formatIso(yield* DateTime.now);
   const accounts = ["alice", "bob", "carol"].map((id) => codexAutoFixture(id, now));
+  const routingStates = new Map();
   const make = () =>
     makeCodexAutoRouter({
       instanceId: poolId,
       members: () => Effect.succeed(accounts.map((account) => account.member())),
-    }).pipe(Effect.provide(ServerConfig.layerTest(stateDir, stateDir)));
+    }).pipe(
+      Effect.provideService(AutoPoolRoutingStates, routingStates),
+      Effect.provide(ServerConfig.layerTest(stateDir, stateDir)),
+    );
   return { accounts, make, stateDir };
 });
 
@@ -105,6 +110,30 @@ it.layer(NodeServices.layer)("Codex Auto durable admission", (it) => {
       }),
   );
 
+  it.effect("preserves assignments written through both generations of a pool", () =>
+    Effect.gen(function* () {
+      const { make, stateDir } = yield* setup;
+      const fs = yield* FileSystem.FileSystem;
+      const older = yield* make();
+      const newer = yield* make();
+      for (const [router, id] of [
+        [older, "old-thread"],
+        [newer, "new-thread"],
+      ] as const) {
+        const threadId = ThreadId.make(id);
+        yield* router.reserve(threadId, selection);
+        yield* router.release(threadId);
+      }
+      const config = yield* ServerConfig.ServerConfig.pipe(
+        Effect.provide(ServerConfig.layerTest(stateDir, stateDir)),
+      );
+      const saved = JSON.parse(
+        yield* fs.readFileString(`${config.stateDir}/codex-auto/codex_auto.json`),
+      );
+      expect(Object.keys(saved.assignments)).toEqual(["old-thread", "new-thread"]);
+    }),
+  );
+
   it.effect("rebalances a sticky thread away from an account without usage data", () =>
     Effect.gen(function* () {
       const { make, accounts } = yield* setup;
@@ -136,16 +165,22 @@ it.layer(NodeServices.layer)("Codex Auto durable admission", (it) => {
   it.effect("uses recent cached windows when every usage refresh fails together", () =>
     Effect.gen(function* () {
       const { make, accounts } = yield* setup;
-      for (const account of accounts)
+      for (const [index, account] of accounts.entries()) {
+        const snapshot = account.read();
         account.set({
-          ...account.read(),
-          usageLimits: { ...account.read().usageLimits!, lastAttemptFailed: true },
+          ...snapshot,
+          usageLimits: {
+            ...snapshot.usageLimits!,
+            lastAttemptFailed: true,
+            windows: snapshot.usageLimits!.windows.map((window) =>
+              index === 1 ? window : { ...window, usedPercent: 100 },
+            ),
+          },
         });
+      }
       const router = yield* make();
       const reservation = yield* router.reserve(ThreadId.make("cached-allowance"), selection);
-      expect(accounts.map((account) => account.instance.instanceId)).toContain(
-        reservation.instance.instanceId,
-      );
+      expect(reservation.instance.instanceId).toBe(accounts[1]!.instance.instanceId);
       yield* router.release(ThreadId.make("cached-allowance"));
     }),
   );
@@ -242,7 +277,7 @@ it.layer(NodeServices.layer)("Codex Auto durable admission", (it) => {
   );
 
   it.effect(
-    "uses the earliest complete account reset and does not schedule unknown allowance",
+    "uses the earliest complete account reset despite another account with unknown allowance",
     () =>
       Effect.gen(function* () {
         const { make, accounts } = yield* setup;
@@ -279,7 +314,10 @@ it.layer(NodeServices.layer)("Codex Auto durable admission", (it) => {
         const unavailable = yield* router
           .reserve(ThreadId.make("unknown-reset"), selection)
           .pipe(Effect.flip);
-        expect(makeProviderFailure({ cause: unavailable }).class).not.toBe("usage_limit");
+        expect(makeProviderFailure({ cause: unavailable })).toMatchObject({
+          class: "usage_limit",
+          resetAt: DateTime.formatIso(DateTime.makeUnsafe(now + 2 * 3_600_000)),
+        });
       }),
   );
 

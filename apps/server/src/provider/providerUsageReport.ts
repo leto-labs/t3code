@@ -4,17 +4,19 @@ import type {
   ProviderUsageReportPoolMember,
   ServerProvider,
 } from "@t3tools/contracts";
+import { DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import {
+  AUTO_POOL_USAGE_REFRESH_INTERVAL_MS,
   autoPoolAccountKey,
   autoPoolCompare,
   autoPoolCurrentWindow,
-  autoPoolEligible,
+  autoPoolSubscriptionEligible,
+  autoPoolUsageIsStale,
   autoPoolHeadroom,
   autoPoolNote,
   autoPoolWindowGroup,
 } from "./autoPoolPolicy.ts";
-
-const USAGE_FRESHNESS_MS = 60_000;
 
 type ReportEntry = ProviderUsageReport["instances"][number];
 type ReportWindow = ReportEntry["windows"][number];
@@ -24,15 +26,9 @@ interface PoolGroup {
   resetsAt?: string;
 }
 
-function usageEntry(provider: ServerProvider, now: string): ReportEntry {
+function usageEntry(provider: ServerProvider, nowMs: number, maxAgeMs: number): ReportEntry {
   const limits = provider.usageLimits;
-  const stale =
-    limits === undefined ||
-    Date.parse(now) - Date.parse(limits.checkedAt) > USAGE_FRESHNESS_MS ||
-    limits.windows.some(
-      (window) =>
-        Date.parse(now) - Date.parse(window.observedAt ?? limits.checkedAt) > USAGE_FRESHNESS_MS,
-    );
+  const stale = autoPoolUsageIsStale(provider, nowMs, maxAgeMs);
   return {
     instanceId: provider.instanceId,
     driver: provider.driver,
@@ -64,11 +60,13 @@ function poolEntry(
   auto: ServerProvider,
   members: readonly ServerProvider[],
   pool: AutoPoolConfig,
-  now: string,
+  nowMs: number,
+  maxAgeMs: number,
   runningTurns: (accountKey: string) => number,
 ): ReportEntry {
-  const nowMs = Date.parse(now);
-  const eligible = members.filter(autoPoolEligible);
+  const eligible = members.filter(
+    (member) => autoPoolSubscriptionEligible(member) && autoPoolAccountKey(member) !== undefined,
+  );
   const available = eligible.some((member) =>
     auto.models.some((model) => autoPoolHeadroom(member, model.slug, nowMs) !== undefined),
   );
@@ -120,13 +118,13 @@ function poolEntry(
       group.best = Math.max(group.best, remaining);
     }
   }
-  const rows = eligible.map((member) => usageEntry(member, now));
+  const rows = eligible.map((member) => usageEntry(member, nowMs, maxAgeMs));
   const memberRows = members.map((member): ProviderUsageReportPoolMember => {
     const rank = ranked.findIndex((candidate) => candidate.member === member);
     return {
-      ...usageEntry(member, now),
+      ...usageEntry(member, nowMs, maxAgeMs),
       runningTurns: running(member),
-      note: !autoPoolEligible(member)
+      note: !eligible.includes(member)
         ? "Not used: disabled, signed out, or unavailable."
         : autoPoolNote(ranked[rank], rank, pool.maxRunningTurns),
     };
@@ -159,11 +157,15 @@ export function providerUsageReport(
   providers: readonly ServerProvider[],
   now: string,
   options: {
+    readonly healthRefreshIntervalMs?: number;
     readonly pools?: readonly AutoPoolConfig[];
     readonly runningTurns?: (accountKey: string) => number;
   } = {},
 ): ProviderUsageReport {
   const pools = options.pools ?? [];
+  const nowMs = Date.parse(now);
+  const healthRefreshIntervalMs =
+    options.healthRefreshIntervalMs ?? Duration.toMillis(DEFAULT_PROVIDER_HEALTH_REFRESH_INTERVAL);
   const memberIds = new Set<string>(pools.flatMap((pool) => pool.memberIds));
   const byId = new Map(providers.map((provider) => [provider.instanceId, provider]));
   return {
@@ -173,12 +175,13 @@ export function providerUsageReport(
       .map((provider) => {
         const pool = pools.find((candidate) => candidate.instanceId === provider.instanceId);
         return pool === undefined
-          ? usageEntry(provider, now)
+          ? usageEntry(provider, nowMs, healthRefreshIntervalMs)
           : poolEntry(
               provider,
               pool.memberIds.flatMap((id) => byId.get(id) ?? []),
               pool,
-              now,
+              nowMs,
+              AUTO_POOL_USAGE_REFRESH_INTERVAL_MS,
               options.runningTurns ?? (() => 0),
             );
       }),

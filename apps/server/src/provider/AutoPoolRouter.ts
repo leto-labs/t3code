@@ -26,6 +26,9 @@ import * as ProviderInstanceLookup from "./ProviderInstanceLookup.ts";
 import {
   autoPoolAccountKey,
   autoPoolChoose,
+  AUTO_POOL_USAGE_REFRESH_INTERVAL_MS,
+  autoPoolSubscriptionEligible,
+  autoPoolUsageIsStale,
   autoPoolExhausted,
   autoPoolNormalizeSelection,
   autoPoolResetAt,
@@ -41,7 +44,10 @@ type RoutingState = typeof RoutingState.Type;
 // Assignments only carry stickiness; dropping the oldest just lets a thread rebalance.
 const MAX_ASSIGNMENTS = 1_000;
 const REFRESH_TIMEOUT = "20 seconds";
-const USAGE_REFRESH_INTERVAL = Duration.minutes(10);
+
+export class AutoPoolRoutingStates extends Context.Reference<
+  Map<string, { readonly lock: Semaphore.Semaphore; state: RoutingState | undefined }> | undefined
+>("t3/provider/AutoPoolRoutingStates", { defaultValue: () => undefined }) {}
 export interface AutoPoolMember {
   readonly instance: ProviderInstance;
   readonly snapshot: ServerProvider;
@@ -64,6 +70,11 @@ export class AutoPoolRouter extends Context.Service<
       selection: ModelSelection,
       projectId?: ProjectId,
     ) => Effect.Effect<ModelSelection, ProviderSetupError>;
+    readonly hasUsageAllowance: (
+      selection: ModelSelection,
+      projectId: ProjectId,
+      observedAfter?: number,
+    ) => Effect.Effect<boolean>;
     /** `exclude` holds account keys that already rejected this request. */
     readonly reserve: (
       threadId: ThreadId,
@@ -84,7 +95,7 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
   readonly label: string;
   /** Directory under the state dir that keeps this driver's thread assignments. */
   readonly stateDirectory: string;
-  readonly maxRunningTurns?: number;
+  readonly maxRunningTurns?: number | Effect.Effect<number>;
   readonly members: (
     projectId?: ProjectId,
   ) => Effect.Effect<readonly AutoPoolMember[], ProviderSetupError>;
@@ -101,10 +112,16 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
   const config = yield* ServerConfig.ServerConfig;
   const load = yield* AutoPoolAccountLoad;
   const filePath = path.join(config.stateDir, input.stateDirectory, `${input.instanceId}.json`);
-  const lock = yield* Semaphore.make(1);
+  const states = yield* AutoPoolRoutingStates;
+  const routing = states?.get(filePath) ?? {
+    lock: Semaphore.makeUnsafe(1),
+    state: undefined,
+  };
+  states?.set(filePath, routing);
+  const { lock } = routing;
   const error = (detail: string) =>
     new ProviderSetupError({ instanceId: input.instanceId, operation: "session", detail });
-  const stateResult = yield* fs.readFileString(filePath).pipe(
+  const read = fs.readFileString(filePath).pipe(
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(RoutingState))),
     Effect.catchTags({
       PlatformError: (cause) =>
@@ -116,7 +133,11 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
       error(`${input.label} routing state could not be read. Restore it before continuing.`),
     ),
   );
-  let state: RoutingState = stateResult;
+  yield* lock.withPermit(
+    Effect.gen(function* () {
+      routing.state ??= yield* read;
+    }),
+  );
   const tokenFor = (threadId: ThreadId) => `${input.instanceId}:${threadId}`;
   const save = (next: RoutingState) => {
     const pruned = {
@@ -128,9 +149,10 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
       Effect.mapError(() => error(`${input.label} could not persist the account assignment.`)),
       Effect.tap(() =>
         Effect.sync(() => {
-          state = pruned;
+          routing.state = pruned;
         }),
       ),
+      Effect.uninterruptible,
     );
   };
   const unsupported = () =>
@@ -143,6 +165,10 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
       (member) => refreshAutoPoolMember(member).pipe(Effect.timeoutOption(REFRESH_TIMEOUT)),
       { concurrency: 4, discard: true },
     ).pipe(Effect.ignore);
+  const headroomFor = (member: AutoPoolMember, selection: ModelSelection, now: number) =>
+    member.allowed === false ? undefined : input.headroom(member.snapshot, selection, now);
+  const modelsFor = (members: readonly AutoPoolMember[]) =>
+    input.models(members.map((member) => member.snapshot));
   // Returns undefined when no account has cached allowance for the request.
   const choose = Effect.fn("AutoPoolRouter.choose")(function* (
     threadId: ThreadId,
@@ -152,22 +178,25 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
   ) {
     const members = yield* input.members(projectId);
     const now = yield* Clock.currentTimeMillis;
-    const models = input.models(members.map((member) => member.snapshot));
+    const models = modelsFor(members);
     if (!autoPoolSelectionAllowed(models, selection)) return yield* unsupported();
     const candidates = members.flatMap((member, order) => {
       const key = autoPoolAccountKey(member.snapshot);
-      const headroom = input.headroom(member.snapshot, selection, now);
-      if (!key || !headroom || member.allowed === false || exclude.has(key)) return [];
+      const headroom = headroomFor(member, selection, now);
+      if (!key || !headroom || exclude.has(key)) return [];
       return [{ member, key, running: load.count(key, tokenFor(threadId)), headroom, order }];
     });
+    const state = routing.state!;
     const sticky = state.assignments[threadId];
+    const setting = input.maxRunningTurns ?? AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS;
+    const maxRunningTurns = typeof setting === "number" ? setting : yield* setting;
     const chosen = autoPoolChoose(candidates, {
       current: candidates.find(
         (candidate) =>
           candidate.member.instance.instanceId === sticky?.memberId &&
           candidate.key === sticky.accountKey,
       ),
-      maxRunningTurns: input.maxRunningTurns ?? AUTO_POOL_DEFAULT_MAX_RUNNING_TURNS,
+      maxRunningTurns,
     });
     if (!chosen) return undefined;
     const assignment = { memberId: chosen.member.instance.instanceId, accountKey: chosen.key };
@@ -184,7 +213,9 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
     threadId: ThreadId,
     selection: ModelSelection,
     projectId: ProjectId | undefined,
+    exclude: ReadonlySet<string>,
   ) {
+    const state = routing.state!;
     if (state.assignments[threadId]) {
       const { [threadId]: _stale, ...assignments } = state.assignments;
       yield* save({ assignments });
@@ -192,20 +223,23 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
     const members = yield* input.members(projectId);
     const now = yield* Clock.currentTimeMillis;
     const eligible = members.filter(
-      (member) => member.allowed !== false && member.snapshot.enabled,
+      (member) =>
+        member.allowed !== false &&
+        autoPoolSubscriptionEligible(member.snapshot) &&
+        autoPoolAccountKey(member.snapshot) !== undefined,
     );
-    const exhausted =
-      eligible.length > 0 &&
-      eligible.every((member) => autoPoolExhausted(member.snapshot, selection.model, now));
+    const limited =
+      exclude.size > 0 ||
+      eligible.some((member) => autoPoolExhausted(member.snapshot, selection.model, now));
     const resets = eligible
-      .map((member) => autoPoolResetAt(member.snapshot, selection.model))
+      .map((member) => autoPoolResetAt(member.snapshot, selection.model, now))
       .filter((reset): reset is string => reset !== null && Date.parse(reset) > now)
-      .sort();
+      .sort((a, b) => Date.parse(a) - Date.parse(b));
     const detail = `No ${input.label} subscription allowance is available.${resets[0] ? ` Next reported reset: ${resets[0]}.` : " Refresh usage after resolving unavailable account data."} No credits were redeemed or purchased.`;
-    return yield* exhausted
+    return yield* limited
       ? new ProviderUsageLimitError({
           detail,
-          resetAt: resets.length === eligible.length ? resets[0]! : null,
+          resetAt: resets[0] ?? null,
         })
       : error(detail);
   });
@@ -213,12 +247,28 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
     normalizeSelection: Effect.fn("AutoPoolRouter.normalizeSelection")((selection, projectId) =>
       input.members(projectId).pipe(
         Effect.flatMap((members) => {
-          const models = input.models(members.map((member) => member.snapshot));
+          const models = modelsFor(members);
           return autoPoolSelectionAllowed(models, selection)
             ? Effect.succeed(autoPoolNormalizeSelection(models, selection))
             : Effect.fail(unsupported());
         }),
       ),
+    ),
+    hasUsageAllowance: Effect.fn("AutoPoolRouter.hasUsageAllowance")(
+      function* (selection, projectId, observedAfter) {
+        const members = yield* input.members(projectId).pipe(Effect.orElseSucceed(() => []));
+        const now = yield* Clock.currentTimeMillis;
+        return (
+          autoPoolSelectionAllowed(modelsFor(members), selection) &&
+          members.some(
+            (member) =>
+              autoPoolAccountKey(member.snapshot) !== undefined &&
+              (observedAfter === undefined ||
+                Date.parse(member.snapshot.usageLimits?.checkedAt ?? "") > observedAfter) &&
+              headroomFor(member, selection, now) !== undefined,
+          )
+        );
+      },
     ),
     reserve: Effect.fn("AutoPoolRouter.reserve")(function* (
       threadId,
@@ -232,14 +282,15 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
       // Probes run outside the lock so one slow account cannot stall every reservation.
       yield* refreshAll(
         (yield* input.members(projectId)).filter(
-          (member) => !exclude.has(autoPoolAccountKey(member.snapshot) ?? ""),
+          (member) =>
+            member.allowed !== false && !exclude.has(autoPoolAccountKey(member.snapshot) ?? ""),
         ),
       );
       return yield* lock.withPermit(
         choose(threadId, selection, projectId, exclude).pipe(
           Effect.filterOrElse(
             (chosen) => chosen !== undefined,
-            () => noAllowance(threadId, selection, projectId),
+            () => noAllowance(threadId, selection, projectId, exclude),
           ),
         ),
       );
@@ -256,9 +307,8 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
       yield* refreshAll(
         members.filter(
           ({ snapshot }) =>
-            !snapshot.usageLimits ||
-            snapshot.usageLimits.lastAttemptFailed === true ||
-            now - Date.parse(snapshot.usageLimits.checkedAt) > maxAgeMs,
+            snapshot.usageLimits?.lastAttemptFailed === true ||
+            autoPoolUsageIsStale(snapshot, now, maxAgeMs),
         ),
       );
     }),
@@ -296,5 +346,8 @@ export const followAutoPoolMembers = Effect.fn("followAutoPoolMembers")(function
  */
 export const keepAutoPoolUsageFresh = (router: AutoPoolRouter["Service"]) =>
   router
-    .refreshStale(Duration.toMillis(USAGE_REFRESH_INTERVAL))
-    .pipe(Effect.repeat(Schedule.spaced(USAGE_REFRESH_INTERVAL)), Effect.forkScoped);
+    .refreshStale(AUTO_POOL_USAGE_REFRESH_INTERVAL_MS)
+    .pipe(
+      Effect.repeat(Schedule.spaced(Duration.millis(AUTO_POOL_USAGE_REFRESH_INTERVAL_MS))),
+      Effect.forkScoped,
+    );

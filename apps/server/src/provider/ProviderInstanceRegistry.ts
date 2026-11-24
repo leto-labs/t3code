@@ -27,6 +27,7 @@ import * as Stream from "effect/Stream";
 
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
 
+import { AutoPoolRoutingStates } from "./AutoPoolRouter.ts";
 import { buildUnavailableProviderSnapshot } from "./unavailableProviderSnapshot.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import * as ProviderInstanceLookup from "./ProviderInstanceLookup.ts";
@@ -609,13 +610,15 @@ export const makeProviderInstanceRegistry = Effect.fn(
   >(new Map());
   const changes = yield* PubSub.unbounded<void>();
   yield* Effect.addFinalizer(() => PubSub.shutdown(changes));
-  const driverContext = Context.add(baseContext, ProviderInstanceLookup.ProviderInstanceLookup, {
-    get: (id) => Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.instance)),
-    environment: (id) =>
-      Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.secrets.environment)),
-    changes: Stream.fromPubSub(changes),
-    subscribe: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
-  });
+  const driverContext = Context.add(baseContext, AutoPoolRoutingStates, new Map()).pipe(
+    Context.add(ProviderInstanceLookup.ProviderInstanceLookup, {
+      get: (id) => Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.instance)),
+      environment: (id) =>
+        Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.secrets.environment)),
+      changes: Stream.fromPubSub(changes),
+      subscribe: PubSub.subscribe(changes).pipe(Effect.map(Stream.fromSubscription)),
+    }),
+  );
 
   const state: RegistryState = { entries, unavailable, secretsUnreadable, changes };
   const reconcileWithR = makeReconcile({
