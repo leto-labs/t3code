@@ -82,6 +82,12 @@ export class AutoPoolRouter extends Context.Service<
       projectId?: ProjectId,
       exclude?: ReadonlySet<string>,
     ) => Effect.Effect<AutoPoolReservation, ProviderSetupError | ProviderUsageLimitError>;
+    readonly reserveCurrent: (
+      threadId: ThreadId,
+      selection: ModelSelection,
+      projectId: ProjectId | undefined,
+      member: AutoPoolMember,
+    ) => Effect.Effect<boolean, ProviderSetupError>;
     readonly release: (threadId: ThreadId) => Effect.Effect<void>;
     /** Re-reads one account's usage after it rejected a request for quota. */
     readonly refreshUsage: (member: AutoPoolMember) => Effect.Effect<void>;
@@ -175,13 +181,17 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
     selection: ModelSelection,
     projectId: ProjectId | undefined,
     exclude: ReadonlySet<string>,
+    restrictTo?: AutoPoolMember,
   ) {
     const members = yield* input.members(projectId);
     const now = yield* Clock.currentTimeMillis;
     const models = modelsFor(members);
     if (!autoPoolSelectionAllowed(models, selection)) return yield* unsupported();
+    const activeAccount = restrictTo && autoPoolAccountKey(restrictTo.snapshot);
     const candidates = members.flatMap((member, order) => {
       const key = autoPoolAccountKey(member.snapshot);
+      if (restrictTo && (member.instance !== restrictTo.instance || key !== activeAccount))
+        return [];
       const headroom = headroomFor(member, selection, now);
       if (!key || !headroom || exclude.has(key)) return [];
       return [{ member, key, running: load.count(key, tokenFor(threadId)), headroom, order }];
@@ -295,6 +305,12 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
         ),
       );
     }),
+    reserveCurrent: Effect.fn("AutoPoolRouter.reserveCurrent")(
+      (threadId, selection, projectId, member) =>
+        lock
+          .withPermit(choose(threadId, selection, projectId, new Set(), member))
+          .pipe(Effect.map((reservation) => reservation !== undefined)),
+    ),
     release: Effect.fn("AutoPoolRouter.release")((threadId) =>
       Effect.sync(() => {
         load.release(tokenFor(threadId));
