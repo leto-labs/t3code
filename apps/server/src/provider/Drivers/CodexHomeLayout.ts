@@ -246,6 +246,31 @@ const removePrivateSymlink = Effect.fn("CodexHomeLayout.removePrivateSymlink")(f
   }
 });
 
+// Codex rewrites some files by rename, which replaces a shadow home's link with a copy. A copy that
+// still matches the shared file loses nothing when relinked; a diverged one stays a conflict.
+const SAME_FILE_MAX_BYTES = 1024 * 1024;
+const isSameSmallFile = Effect.fn("CodexHomeLayout.isSameSmallFile")(
+  function* (fileSystem: FileSystem.FileSystem, left: string, right: string) {
+    const [leftInfo, rightInfo] = yield* Effect.all([
+      fileSystem.stat(left),
+      fileSystem.stat(right),
+    ]);
+    if (
+      leftInfo.type !== "File" ||
+      rightInfo.type !== "File" ||
+      leftInfo.size !== rightInfo.size ||
+      Number(leftInfo.size) > SAME_FILE_MAX_BYTES
+    )
+      return false;
+    const [leftBytes, rightBytes] = yield* Effect.all([
+      fileSystem.readFile(left),
+      fileSystem.readFile(right),
+    ]);
+    return leftBytes.every((byte, index) => byte === rightBytes[index]);
+  },
+  (effect) => effect.pipe(Effect.orElseSucceed(() => false)),
+);
+
 const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (input: {
   readonly fileSystem: FileSystem.FileSystem;
   readonly sharedHomePath: string;
@@ -276,7 +301,10 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
   );
 
   if (state._tag === "NotSymlink") {
-    if (!isReplaceableSharedRuntimeEntry(input.entryName)) {
+    if (
+      !isReplaceableSharedRuntimeEntry(input.entryName) &&
+      !(yield* isSameSmallFile(input.fileSystem, link, target))
+    ) {
       return yield* new CodexShadowHomeEntryConflictError({
         sharedHomePath: input.sharedHomePath,
         effectiveHomePath: input.effectiveHomePath,
