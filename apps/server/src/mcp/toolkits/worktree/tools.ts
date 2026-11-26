@@ -26,8 +26,17 @@ const dependencies = [
 const WorktreeToolFailure = Schema.Union([WorktreeMcpFailure, OrchestratorMcpFailure]);
 
 const WorktreeHandoffTool = Tool.make("t3_worktree_handoff", {
-  description:
-    "Move THIS thread into a new git worktree on a new branch. Runs the setup script by default. A separate agent in a worktree: `t3_thread_launch` with `workspaceStrategy`. Call last in your turn. The move ends the live session. `continuationPrompt` resumes work there next turn. Without it, the thread waits. The worktree stays after the thread is deleted. Fails if this thread has a worktree.",
+  description: [
+    "Move this thread to a Git worktree.",
+    "Use `existingWorktreePath` to select a clean worktree of this project, even if this thread already has a worktree.",
+    "Choose a worktree that no other non-archived thread uses.",
+    "Finish delegated tasks and subagents before you select an existing worktree.",
+    "Use `branch` to create a worktree. This thread must use the project checkout. Creation runs the setup script by default.",
+    "Use `t3_thread_launch` with `workspaceStrategy` for a separate thread.",
+    "Call this tool last in your turn. The move ends the live session.",
+    "Set `continuationPrompt` to resume work there in the next turn. Without it, the thread waits.",
+    "The worktree stays after the thread is deleted.",
+  ].join(" "),
   parameters: WorktreeMcpHandoffInput,
   success: WorktreeMcpHandoffResult,
   failure: WorktreeToolFailure,

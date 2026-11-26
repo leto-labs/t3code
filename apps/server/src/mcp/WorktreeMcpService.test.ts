@@ -1,17 +1,24 @@
 import { describe, expect, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import { makeSubagentChildThread } from "@t3tools/provider-core/server/subagentProjection";
+import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import {
   CommandId,
   EnvironmentId,
+  EventId,
+  NodeId,
   type OrchestrationV2ThreadProjection,
   type Project,
   ProjectId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnItemId,
   WorktreeMcpHandoffInput,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -19,16 +26,22 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ServerConfig from "../config.ts";
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import {
+  OrchestratorV2,
   OrchestratorDispatchError,
   OrchestratorProjectionError,
 } from "../orchestration-v2/Orchestrator.ts";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
@@ -45,11 +58,12 @@ const workspaceRoot = "/repo/project";
 
 const makeScope = (
   capabilities: ReadonlySet<McpInvocationContext.McpCapability>,
+  callerId = threadId,
 ): McpInvocationContext.McpInvocationScope => ({
   environmentId,
   requestNamespace: "provider-session-worktree-test",
   thread: {
-    threadId,
+    threadId: callerId,
     providerSessionId: "provider-session-worktree-test",
     providerInstanceId: ProviderInstanceId.make("claudeAgent"),
   },
@@ -300,6 +314,7 @@ const makeHarness = (options: HarnessOptions = {}) => {
                 },
               }),
         }),
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           listRefs,
           listLocalBranchNames,
@@ -384,6 +399,402 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
   }).pipe(Effect.provide(harness.layer));
 
 const decodeHandoffInput = Schema.decodeUnknownEffect(WorktreeMcpHandoffInput);
+
+const rebindGitLayer = GitVcsDriver.layer.pipe(
+  Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "handoff-rebind-" })),
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+);
+const rebindInstanceId = ProviderInstanceId.make("codex");
+const rebindRuntime = ProviderReplayHarness.layerWithRegistry(
+  { name: "existing-worktree-handoff" },
+  ProviderAdapterRegistry.layerSingle({
+    instanceId: rebindInstanceId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+    openSession: () => Effect.die("provider execution is disabled in handoff tests"),
+  }),
+  { runEffectWorker: false },
+);
+
+const makeRebindFixture = Effect.fn("makeRebindFixture")(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const git = yield* GitVcsDriver.GitVcsDriver;
+  const orchestrator = yield* OrchestratorV2;
+  const repo = yield* checkpointWorkspace("handoff-project");
+  const worktrees = yield* fs.realPath(
+    yield* fs.makeTempDirectoryScoped({ prefix: "handoff-worktrees-" }),
+  );
+  const source = path.join(worktrees, "source worktree");
+  const destination = path.join(worktrees, "destination worktree");
+  const gitAt = (cwd: string, ...args: ReadonlyArray<string>) =>
+    git.execute({ operation: "handoff-rebind-test", cwd, args });
+  yield* gitAt(repo, "worktree", "add", "-b", "source", source);
+  yield* gitAt(repo, "worktree", "add", "-b", "destination", destination);
+
+  const createThread = (id: ThreadId, branch: string, worktreePath: string) =>
+    orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`create:${id}`),
+      threadId: id,
+      projectId,
+      title: "Worktree handoff",
+      createdBy: "user",
+      creationSource: "web",
+      modelSelection: { instanceId: rebindInstanceId, model: "test" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch,
+      worktreePath,
+    });
+  yield* createThread(threadId, "source", source);
+  const createChild = Effect.fn("makeRebindFixture.createChild")(function* (parentId: ThreadId) {
+    const sink = yield* EventSink.EventSinkV2;
+    const { thread } = yield* orchestrator.getThreadRecords(parentId, []);
+    const now = yield* DateTime.now;
+    const child = makeSubagentChildThread({
+      parentThread: { ...thread, worktreePath: destination, branch: "destination" },
+      childThreadId: ThreadId.make(`child:${parentId}`),
+      parentNodeId: NodeId.make(`task:${parentId}`),
+      activeProviderThreadId: null,
+      providerInstanceId: rebindInstanceId,
+      modelSelection: thread.modelSelection,
+      title: "Finished task",
+      now,
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`create:${child.id}`),
+          type: "thread.created",
+          threadId: child.id,
+          occurredAt: now,
+          payload: { ...child, settledAt: now },
+        },
+      ],
+    });
+  });
+  const service = yield* WorktreeMcpService.WorktreeMcpService.pipe(
+    Effect.provide(
+      WorktreeMcpService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: orchestrator.getThreadRecords,
+              dispatch: orchestrator.dispatch,
+            }),
+            Layer.mock(ProjectService.ProjectService)({
+              getById: () => Effect.succeedSome({ ...project, workspaceRoot: repo }),
+            }),
+            Layer.mock(GitWorkflowService.GitWorkflowService)({}),
+            Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({}),
+            ServerSettings.layerTest({}),
+            Layer.mock(TaskFolders.TaskFolders)({}),
+            Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({
+              refreshStatus: () =>
+                Effect.succeed({
+                  isRepo: true,
+                  hasPrimaryRemote: false,
+                  isDefaultRef: false,
+                  refName: "destination",
+                  hasWorkingTreeChanges: false,
+                  workingTree: { files: [], insertions: 0, deletions: 0 },
+                  hasUpstream: false,
+                  aheadCount: 0,
+                  behindCount: 0,
+                  pr: null,
+                }),
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
+  return {
+    source,
+    destination,
+    repo,
+    fs,
+    path,
+    gitAt,
+    createThread,
+    createChild,
+    handoff: (
+      existingWorktreePath = destination,
+      callerId = threadId,
+      continuationPrompt?: string,
+    ) =>
+      service.handoff(makeScope(new Set(["worktree"]), callerId), {
+        existingWorktreePath,
+        continuationPrompt,
+      }),
+    readThread: () =>
+      orchestrator.getThreadRecords(threadId, []).pipe(Effect.map(({ thread }) => thread)),
+  };
+});
+
+const withRebindRuntime = Effect.provide(Layer.merge(rebindGitLayer, rebindRuntime));
+
+describe("rebinding to an existing worktree", () => {
+  it.live.each(["archived", "calling"] as const)(
+    "rebinds without changing Git when the %s thread has a settled child at the destination",
+    (owner) =>
+      Effect.gen(function* () {
+        const fixture = yield* makeRebindFixture();
+        if (owner === "archived") {
+          const archivedId = ThreadId.make("thread-archived-worktree");
+          yield* fixture.createThread(archivedId, "destination", fixture.destination);
+          yield* fixture.createChild(archivedId);
+          const orchestrator = yield* OrchestratorV2;
+          yield* orchestrator.dispatch({
+            type: "thread.archive",
+            commandId: CommandId.make("archive-occupant"),
+            threadId: archivedId,
+          });
+        } else {
+          yield* fixture.createChild(threadId);
+        }
+        const before = yield* fixture.gitAt(fixture.repo, "worktree", "list", "--porcelain");
+        const result = yield* fixture.handoff(`${fixture.destination}${fixture.path.sep}.`);
+        expect(result).toMatchObject({
+          worktreePath: fixture.destination,
+          branch: "destination",
+          baseRef: null,
+          startedFromOrigin: false,
+          setupScript: { status: "skipped" },
+        });
+        expect(yield* fixture.readThread()).toMatchObject({
+          worktreePath: fixture.destination,
+          branch: "destination",
+        });
+        expect((yield* fixture.gitAt(fixture.repo, "worktree", "list", "--porcelain")).stdout).toBe(
+          before.stdout,
+        );
+      }).pipe(withRebindRuntime),
+  );
+
+  it.live("refuses the worktree already bound to the caller", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      expectTypedFailure(yield* Effect.exit(fixture.handoff(fixture.source)), {
+        code: "invalid_request",
+        message: expect.stringContaining("This thread is already bound"),
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("resolves a relative path from the calling worktree and commits the continuation", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      const relative = fixture.path.relative(fixture.source, fixture.destination);
+      const prompt = "Run the release tests.";
+      const result = yield* fixture.handoff(relative, threadId, prompt);
+      expect(result.continuation).toMatchObject({ status: "scheduled" });
+      const orchestrator = yield* OrchestratorV2;
+      const { thread, messages, runs } = yield* orchestrator.getThreadRecords(threadId, [
+        "messages",
+        "runs",
+      ]);
+      expect(thread).toMatchObject({ worktreePath: fixture.destination, branch: "destination" });
+      expect(messages).toContainEqual(
+        expect.objectContaining({ text: prompt, runId: runs[0]?.id }),
+      );
+      expect(runs).toHaveLength(1);
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("refuses the project checkout", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      expectTypedFailure(yield* Effect.exit(fixture.handoff(fixture.repo)), {
+        code: "invalid_request",
+        message: expect.stringContaining("outside the project checkout"),
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("refuses a worktree of another repository", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      const other = yield* checkpointWorkspace("another-project");
+      const foreignWorktree = fixture.path.join(
+        fixture.path.dirname(fixture.destination),
+        "foreign",
+      );
+      yield* fixture.gitAt(other, "worktree", "add", "-b", "foreign", foreignWorktree);
+      expectTypedFailure(yield* Effect.exit(fixture.handoff(foreignWorktree)), {
+        code: "invalid_request",
+        message: expect.stringContaining("thread's project repository"),
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("refuses a dirty worktree even if Git hides untracked files by default", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      yield* fixture.gitAt(fixture.destination, "config", "status.showUntrackedFiles", "no");
+      yield* fixture.fs.writeFileString(
+        fixture.path.join(fixture.destination, "untracked"),
+        "local work",
+      );
+      expectTypedFailure(yield* Effect.exit(fixture.handoff()), {
+        code: "invalid_request",
+        message: expect.stringContaining("uncommitted changes"),
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("refuses a worktree with a detached HEAD", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      yield* fixture.gitAt(fixture.destination, "switch", "--detach");
+      expectTypedFailure(yield* Effect.exit(fixture.handoff()), {
+        code: "invalid_request",
+        message: expect.stringContaining("must have a local branch checked out"),
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("refuses a worktree bound to another non-archived thread", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      yield* fixture.createThread(
+        ThreadId.make("thread-destination-owner"),
+        "destination",
+        fixture.destination,
+      );
+      expectTypedFailure(yield* Effect.exit(fixture.handoff()), {
+        code: "invalid_request",
+        message: expect.stringContaining("already bound to thread 'thread-destination-owner'"),
+      });
+      expect(yield* fixture.readThread()).toMatchObject({
+        worktreePath: fixture.source,
+        branch: "source",
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live("lets only one thread claim a worktree when handoffs race", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeRebindFixture();
+      const otherId = ThreadId.make("competing-thread");
+      yield* fixture.createThread(otherId, "source", fixture.source);
+      const results = yield* Effect.all(
+        [
+          Effect.exit(fixture.handoff()),
+          Effect.exit(fixture.handoff(fixture.destination, otherId)),
+        ],
+        { concurrency: "unbounded" },
+      );
+      expect(results.filter(Exit.isSuccess)).toHaveLength(1);
+      const rejected = results.find(Exit.isFailure);
+      if (rejected === undefined) return expect.fail("Both handoffs succeeded");
+      expectTypedFailure(rejected, {
+        code: "invalid_request",
+        message: expect.stringContaining("already bound to thread"),
+      });
+    }).pipe(withRebindRuntime),
+  );
+
+  it.live.each([
+    { origin: "app_owned", status: "waiting", hasLiveItem: false, blocks: true },
+    { origin: "provider_native", status: "running", hasLiveItem: true, blocks: true },
+    { origin: "provider_native", status: "running", hasLiveItem: false, blocks: false },
+  ] as const)(
+    "handles a $status $origin child with live item $hasLiveItem",
+    ({ origin, status, hasLiveItem, blocks }) =>
+      Effect.gen(function* () {
+        const fixture = yield* makeRebindFixture();
+        const sink = yield* EventSink.EventSinkV2;
+        const now = yield* DateTime.now;
+        const task = NodeId.make("active-child");
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("event-active-child"),
+              type: "subagent.updated",
+              threadId,
+              nodeId: task,
+              occurredAt: now,
+              payload: {
+                id: task,
+                threadId,
+                runId: null,
+                parentNodeId: NodeId.make("parent"),
+                origin,
+                createdBy: "agent",
+                driver: ProviderDriverKind.make("codex"),
+                providerInstanceId: ProviderInstanceId.make("codex"),
+                providerThreadId: null,
+                childThreadId: origin === "app_owned" ? ThreadId.make("delegated-child") : null,
+                nativeTaskRef: null,
+                prompt: "Do work",
+                title: null,
+                model: null,
+                status,
+                result: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+        if (hasLiveItem) {
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("event-active-child-item"),
+                type: "turn-item.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: TurnItemId.make("active-child-item"),
+                  type: "subagent",
+                  threadId,
+                  runId: null,
+                  nodeId: task,
+                  providerThreadId: null,
+                  providerTurnId: null,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: 1,
+                  status,
+                  title: null,
+                  startedAt: now,
+                  completedAt: null,
+                  updatedAt: now,
+                  subagentId: task,
+                  origin,
+                  driver: ProviderDriverKind.make("codex"),
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                  childThreadId: null,
+                  prompt: "Do work",
+                  result: null,
+                },
+              },
+            ],
+          });
+        }
+        const exit = yield* Effect.exit(fixture.handoff());
+        if (blocks) {
+          expectTypedFailure(exit, {
+            code: "invalid_request",
+            message: expect.stringContaining("active delegated tasks or subagents"),
+          });
+        } else {
+          expect(Exit.isSuccess(exit)).toBe(true);
+        }
+        expect(yield* fixture.readThread()).toMatchObject({
+          worktreePath: blocks ? fixture.source : fixture.destination,
+          branch: blocks ? "source" : "destination",
+        });
+      }).pipe(withRebindRuntime),
+  );
+});
 
 describe("t3_worktree_handoff", () => {
   // regression: #22971 a separate send let the detach settle the run before its follow-up existed

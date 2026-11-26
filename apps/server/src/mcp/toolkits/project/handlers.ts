@@ -88,24 +88,15 @@ function worktreeCheckHint(
   }`;
 }
 
-/**
- * Require project worktrees so launches cannot target arbitrary host directories. Returns the
- * path Git registered, so the thread stays bound to that worktree.
- */
 const projectWorktreePath = Effect.fn("mcp.assertProjectWorktree")(function* (
   workspaceRoot: string,
   worktreePath: string,
 ) {
-  const git = yield* GitVcsDriver.GitVcsDriver;
-  const fileSystem = yield* FileSystem.FileSystem;
-  const real = (path: string) => fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
-  const registered = yield* git
-    .listWorktreePaths(workspaceRoot)
-    .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
-  const requested = yield* real(worktreePath);
-  for (const candidate of registered) {
-    if ((yield* real(candidate)) === requested) return candidate;
-  }
+  const registered = yield* GitVcsDriver.findRegisteredWorktreePath(
+    workspaceRoot,
+    worktreePath,
+  ).pipe(Effect.orElseSucceed(() => null));
+  if (registered !== null) return registered;
   return yield* new OrchestratorMcpFailure({
     code: "invalid_request",
     message:
