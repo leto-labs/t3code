@@ -13,6 +13,7 @@ import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
@@ -254,15 +255,42 @@ export const makeAutoPoolRouter = Effect.fn("makeAutoPoolRouter")(function* (inp
       : error(detail);
   });
   return AutoPoolRouter.of({
-    normalizeSelection: Effect.fn("AutoPoolRouter.normalizeSelection")((selection, projectId) =>
-      input.members(projectId).pipe(
-        Effect.flatMap((members) => {
-          const models = modelsFor(members);
-          return autoPoolSelectionAllowed(models, selection)
-            ? Effect.succeed(autoPoolNormalizeSelection(models, selection))
-            : Effect.fail(unsupported());
-        }),
-      ),
+    normalizeSelection: Effect.fn("AutoPoolRouter.normalizeSelection")(
+      function* (selection, projectId) {
+        const readMembers = Effect.suspend(() => input.members(projectId));
+        const selectionAllowed = (models: readonly ServerProviderModel[]) =>
+          autoPoolSelectionAllowed(models, selection);
+        const members = yield* readMembers;
+        const models = modelsFor(members);
+        if (selectionAllowed(models)) return autoPoolNormalizeSelection(models, selection);
+
+        // Startup continuations hold worker slots, so bound both the initial wait and the retry.
+        const available = yield* Stream.fromIterable(members).pipe(
+          Stream.mapEffect(({ instance }) => instance.snapshot.awaitFirstCheck ?? Effect.void, {
+            concurrency: "unbounded",
+            unordered: true,
+          }),
+          Stream.mapEffect(() => Effect.map(readMembers, modelsFor)),
+          Stream.filter(selectionAllowed),
+          Stream.runHead,
+          Effect.timeoutOrElse({ duration: REFRESH_TIMEOUT, orElse: () => Effect.succeedNone }),
+        );
+        if (Option.isSome(available)) return autoPoolNormalizeSelection(available.value, selection);
+
+        const current = yield* readMembers;
+        const currentModels = modelsFor(current);
+        if (selectionAllowed(currentModels))
+          return autoPoolNormalizeSelection(currentModels, selection);
+
+        const missingCatalogs = current.filter(
+          ({ snapshot }) => snapshot.status === "error" || snapshot.models.length === 0,
+        );
+        if (missingCatalogs.length === 0) return yield* unsupported();
+        yield* refreshAll(missingCatalogs).pipe(Effect.timeoutOption(REFRESH_TIMEOUT));
+        const refreshedModels = modelsFor(yield* readMembers);
+        if (!selectionAllowed(refreshedModels)) return yield* unsupported();
+        return autoPoolNormalizeSelection(refreshedModels, selection);
+      },
     ),
     hasUsageAllowance: Effect.fn("AutoPoolRouter.hasUsageAllowance")(
       function* (selection, projectId, observedAfter) {

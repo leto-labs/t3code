@@ -16167,7 +16167,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         // The completion reaction starts or holds the queue just after a run ends; settling
         // first would cancel an automatic wake it was about to start.
         const { runs } = yield* loadProjectionForCommand(command, ["runs"]);
-        const endedAt = latestExecutedRun(runs)?.completedAt;
+        const latestRun = latestExecutedRun(runs);
+        if (
+          latestRun !== null &&
+          (yield* awaitsRestartContinuation(latestRun).pipe(mapDispatchError(command)))
+        ) {
+          return yield* new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause: `Thread ${command.threadId} has a pending restart continuation.`,
+          });
+        }
+        const endedAt = latestRun?.completedAt;
         if (
           endedAt != null &&
           runs.some((run) => run.status === "queued") &&

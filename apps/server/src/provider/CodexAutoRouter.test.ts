@@ -2,8 +2,11 @@ import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as TestClock from "effect/testing/TestClock";
 import * as ServerConfig from "../config.ts";
 import { makeCodexAutoRouter } from "./Drivers/CodexAutoProvider.ts";
 import { AutoPoolRoutingStates } from "./AutoPoolRouter.ts";
@@ -20,10 +23,13 @@ const setup = Effect.gen(function* () {
   const now = DateTime.formatIso(yield* DateTime.now);
   const accounts = ["alice", "bob", "carol"].map((id) => codexAutoFixture(id, now));
   const routingStates = new Map();
-  const make = () =>
+  const make = (
+    members: Parameters<typeof makeCodexAutoRouter>[0]["members"] = () =>
+      Effect.succeed(accounts.map((account) => account.member())),
+  ) =>
     makeCodexAutoRouter({
       instanceId: poolId,
-      members: () => Effect.succeed(accounts.map((account) => account.member())),
+      members,
     }).pipe(
       Effect.provideService(AutoPoolRoutingStates, routingStates),
       Effect.provide(ServerConfig.layerTest(stateDir, stateDir)),
@@ -32,6 +38,69 @@ const setup = Effect.gen(function* () {
 });
 
 it.layer(NodeServices.layer)("Codex Auto durable admission", (it) => {
+  it.effect.each(["pending", "ready", "failed"] as const)(
+    "validates a selection when the first catalog check is %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const { make, accounts } = yield* setup;
+        const cold = accounts[0]!;
+        const warm = accounts[1]!;
+        const ready = cold.read();
+        cold.set({ ...ready, models: [] });
+        const firstCheck = yield* Deferred.make<void>();
+        const warmCheck = yield* Deferred.make<void>();
+        if (outcome !== "ready") yield* Deferred.succeed(warmCheck, undefined);
+        const members = [
+          { account: cold, check: firstCheck },
+          { account: warm, check: warmCheck },
+        ].map(({ account, check }) => ({
+          account,
+          instance: {
+            ...account.instance,
+            snapshot: { ...account.instance.snapshot, awaitFirstCheck: Deferred.await(check) },
+          },
+        }));
+        const router = yield* make(() =>
+          Effect.sync(() =>
+            members.map(({ account, instance }) => ({ instance, snapshot: account.read() })),
+          ),
+        );
+        const validating = yield* router
+          .normalizeSelection(selection)
+          .pipe(Effect.result, Effect.forkChild({ startImmediately: true }));
+        expect(validating.pollUnsafe()).toBeUndefined();
+
+        if (outcome === "pending") {
+          yield* TestClock.adjust("20 seconds");
+          expect(yield* Fiber.join(validating)).toMatchObject({
+            _tag: "Failure",
+            failure: {
+              detail: expect.stringContaining(
+                "not supported by every configured Codex Auto account",
+              ),
+            },
+          });
+          return;
+        }
+
+        if (outcome === "ready") {
+          cold.set(ready);
+        } else {
+          cold.set({ ...cold.read(), status: "error" });
+          cold.onRefresh(() => ready);
+        }
+        yield* Deferred.succeed(firstCheck, undefined);
+        yield* TestClock.adjust(0);
+        expect(validating.pollUnsafe()).toBeDefined();
+        expect(yield* Fiber.join(validating)).toMatchObject({
+          _tag: "Success",
+          success: selection,
+        });
+        expect(cold.refreshes()).toBe(outcome === "failed" ? 1 : 0);
+        expect(warm.refreshes()).toBe(0);
+      }),
+  );
+
   it.effect("reserves independent accounts atomically for simultaneous child launches", () =>
     Effect.gen(function* () {
       const { make } = yield* setup;

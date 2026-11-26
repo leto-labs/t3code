@@ -1,4 +1,5 @@
 import { vi } from "vite-plus/test";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -29,6 +30,7 @@ import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2Pend
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
@@ -38,6 +40,12 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
+import * as ServerConfig from "../../config.ts";
+import {
+  makeCodexAutoAdapter,
+  makeCodexAutoRouter,
+} from "../../provider/Drivers/CodexAutoProvider.ts";
+import { CODEX_AUTO_MODEL, codexAutoFixture } from "../../provider/testUtils/codexAuto.ts";
 import { CommandPolicyCapabilityUnsupportedError } from "../CommandPolicy.ts";
 import {
   ClaudeAgentSdkQueryRunnerError,
@@ -59,6 +67,7 @@ import * as EffectOutbox from "../EffectOutbox.ts";
 import * as ProjectionReplay from "./ProjectionReplay.ts";
 import * as ProjectionStore from "../ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
+import * as ProviderRuntimeRecoveryService from "../ProviderRuntimeRecoveryService.ts";
 import * as ProviderSessionManager from "../ProviderSessionManager.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
@@ -575,6 +584,130 @@ class ClaudeMcpRegistrationTimeoutError extends Schema.TaggedError<ClaudeMcpRegi
 ) {}
 
 describe("orchestration v2 provider switching", () => {
+  it.effect("defers auto-settlement until a Codex Auto turn can resume after server shutdown", () =>
+    Effect.gen(function* () {
+      const key = "codex-auto-shutdown-continuation";
+      const threadId = ThreadId.make(`thread:${key}`);
+      const toolCallId = TurnItemId.make(`turn-item:${key}`);
+      const instanceId = ProviderInstanceId.make("codex_auto");
+      const modelSelection = { instanceId, model: CODEX_AUTO_MODEL };
+      const now = DateTime.formatIso(yield* DateTime.now);
+      const account = codexAutoFixture("codex-member", now);
+      const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+      const native = makeTestAdapter({
+        instanceId,
+        driver: CODEX_DRIVER,
+        capabilities: CodexProviderCapabilitiesV2,
+        modelSelection,
+        responseByRunOrdinal: { 2: "Continued the interrupted work." },
+        capturedTurns,
+        holdFirstTurn: yield* Deferred.make<void>(),
+        heldRunningToolCall: { id: toolCallId, toolName: "test_tool" },
+        backgroundTasksEndWithProcess: true,
+      });
+      const layerConfig = Layer.effect(
+        ServerConfig.ServerConfig,
+        ProviderReplayHarness.makeReplayServerConfig(key).pipe(Effect.orDie),
+      );
+      const layerRegistry = Layer.unwrap(
+        Effect.gen(function* () {
+          const router = yield* makeCodexAutoRouter({
+            instanceId,
+            members: () => Effect.succeed([account.member()]),
+          });
+          return ProviderAdapterRegistry.layerFromAdapters([
+            makeCodexAutoAdapter({
+              instanceId,
+              router,
+              openNative: (_member, input) => native.openSession(input),
+            }),
+          ]);
+        }),
+      ).pipe(Layer.provide(layerConfig), Layer.provide(NodeServices.layer));
+
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`${key}:create`),
+          createdBy: "user",
+          creationSource: "web",
+          threadId,
+          projectId: ProjectId.make(`project:${key}`),
+          title: "Continue after shutdown",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        const afterSequence = yield* eventSink.latestSequence({ threadId });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${key}:dispatch`),
+          createdBy: "user",
+          creationSource: "web",
+          threadId,
+          messageId: MessageId.make(`${key}:message`),
+          text: "Run the tests.",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "start_immediately" },
+        });
+        yield* worker.drain();
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.filter(
+            ({ event }) => event.type === "turn-item.updated" && event.payload.id === toolCallId,
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+        );
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const source = before.runs[0]!;
+        assert.equal(source.status, "running");
+        assert.equal(before.turnItems.find((item) => item.id === toolCallId)?.status, "running");
+
+        yield* recovery.prepareForShutdown;
+        yield* sessions.shutdown;
+        yield* recovery.reconcile("shutdown");
+        yield* recovery.recover;
+        const recovered = yield* orchestrator.getThreadProjection(threadId);
+        const settle = yield* Effect.exit(
+          orchestrator.dispatch({
+            type: "thread.auto-settle",
+            commandId: CommandId.make(`${key}:auto-settle`),
+            threadId,
+            snapshotAt: recovered.thread.updatedAt,
+          }),
+        );
+
+        yield* worker.drain();
+        const resumed = yield* orchestrator.getThreadProjection(threadId);
+        assert.isTrue(Exit.isFailure(settle), "auto-settle must let the pending continuation run");
+        assert.equal(resumed.runs[1]?.restartContinuationOfRunId, source.id);
+        assert.equal(resumed.runs[1]?.providerInstanceId, instanceId);
+        assert.deepEqual(
+          (yield* Ref.get(capturedTurns)).map((turn) => turn.nativeThreadId),
+          [
+            before.providerThreads[0]?.nativeThreadRef?.nativeId,
+            before.providerThreads[0]?.nativeThreadRef?.nativeId,
+          ],
+        );
+      }).pipe(
+        Effect.provide(
+          ProviderReplayHarness.layerWithRegistry({ name: key }, layerRegistry, {
+            runEffectWorker: false,
+            continueThreadsAfterServerUpdate: true,
+          }),
+        ),
+      );
+    }),
+  );
+
   it.live.each([
     "compact-native",
     "compact-legacy",
