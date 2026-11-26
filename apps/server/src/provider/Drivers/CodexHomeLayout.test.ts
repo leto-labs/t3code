@@ -341,6 +341,31 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
     );
 
     it.effect.skipIf(!symlinksSupported)(
+      "relinks a shared file that the shadow home holds as an identical copy",
+      () =>
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+          const shadowRoot = yield* makeTempDir("t3code-codex-shadow-root-");
+          const shadowHome = path.join(shadowRoot, "shadow");
+          const config = '[mcp_servers.docs]\nurl = "http://127.0.0.1:9/mcp"\n';
+          yield* writeTextFile(path.join(sharedHome, "config.toml"), config);
+          yield* writeTextFile(path.join(shadowHome, "config.toml"), config);
+
+          yield* materializeCodexShadowHome(
+            yield* resolveCodexHomeLayout(
+              decodeCodexSettings({ homePath: sharedHome, shadowHomePath: shadowHome }),
+            ),
+          );
+
+          expect(yield* fileSystem.readLink(path.join(shadowHome, "config.toml"))).toBe(
+            path.join(sharedHome, "config.toml"),
+          );
+        }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)(
       "rejects shared entries that already exist in the shadow home as real files",
       () =>
         Effect.gen(function* () {
