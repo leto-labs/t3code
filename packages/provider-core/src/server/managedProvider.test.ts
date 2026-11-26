@@ -285,9 +285,10 @@ describe("makeManagedServerProvider", () => {
           assert.strictEqual(yield* Ref.get(checkCalls), 1);
 
           yield* Deferred.succeed(releaseCheck, undefined);
+          yield* provider.awaitFirstCheck!;
+          const latest = yield* provider.getSnapshot;
 
           const updates = Array.from(yield* Fiber.join(updatesFiber));
-          const latest = yield* provider.getSnapshot;
 
           assert.deepStrictEqual(updates, [refreshedSnapshot]);
           assert.deepStrictEqual(latest, refreshedSnapshot);

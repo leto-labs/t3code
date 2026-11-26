@@ -312,6 +312,7 @@ export function layerWithRegistry<Error>(
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
+  | ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService
   | CommandOutputRecorder.CommandOutputRecorder
   | ThreadCommandExecutor.ThreadCommandExecutor,
   Error | MigrationError | PlatformError.PlatformError | SqlError
@@ -612,10 +613,16 @@ export function layerWithRegistry<Error>(
   const layerEffectWorkerProvided = EffectWorker.layer.pipe(
     Layer.provide(Layer.merge(layerStores, layerEffectExecutorProvided)),
   );
+  const layerRuntimeRecovery = ProviderRuntimeRecoveryService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(layerStores, layerEventSinkProvided, IdAllocator.layer, layerServerSettings),
+    ),
+  );
   const layerReplayRuntime = Layer.mergeAll(
     layerEffectOutboxProvided,
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
+    layerRuntimeRecovery,
     layerEffectWorkerProvided,
     layerEventSinkProvided,
     layerContinuationWorkerProvided,
@@ -639,17 +646,7 @@ export function layerWithRegistry<Error>(
           ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService.use(
             (recovery) => recovery.recover,
           ).pipe(Effect.orDie),
-        ).pipe(
-          Layer.provide(ProviderRuntimeRecoveryService.layer),
-          Layer.provide(
-            Layer.mergeAll(
-              layerStores,
-              layerEventSinkProvided,
-              IdAllocator.layer,
-              layerServerSettings,
-            ),
-          ),
-        )
+        ).pipe(Layer.provide(layerRuntimeRecovery))
       : Layer.empty;
   return Layer.effect(
     Orchestrator.OrchestratorV2,

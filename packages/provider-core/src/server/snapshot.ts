@@ -23,6 +23,7 @@ export interface ManagedServerProvider {
   readonly getSnapshot: Effect.Effect<ServerProvider>;
   /** True while getSnapshot still returns the placeholder from before the first completed check. */
   readonly isAwaitingFirstCheck?: Effect.Effect<boolean>;
+  readonly awaitFirstCheck?: Effect.Effect<void>;
   readonly refresh: Effect.Effect<ServerProvider>;
   readonly refreshUsage?: Effect.Effect<void, ServerSettingsError>;
   readonly streamChanges: Stream.Stream<ServerProvider>;

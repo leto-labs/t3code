@@ -5,6 +5,7 @@ import {
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -29,7 +30,6 @@ interface ProviderSnapshotState {
   readonly enrichmentGeneration: number;
   // null preserves an explicitly cleared plan across probes and enrichment.
   readonly usageAuthLabel: string | null | undefined;
-  readonly checked: boolean;
 }
 
 function withUsageLimits(
@@ -87,11 +87,11 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   );
   const initialSettings = yield* input.getSettings;
   const initialSnapshot = yield* input.initialSnapshot(initialSettings);
+  const firstCheck = yield* Deferred.make<void>();
   const snapshotStateRef = yield* Ref.make<ProviderSnapshotState>({
     snapshot: initialSnapshot,
     enrichmentGeneration: 0,
     usageAuthLabel: undefined,
-    checked: false,
   });
   const settingsRef = yield* Ref.make(initialSettings);
   const recheckPendingRef = yield* Ref.make(false);
@@ -246,9 +246,12 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
         );
         return [
           { snapshot, generation },
-          { snapshot, enrichmentGeneration: generation, usageAuthLabel, checked: true },
+          { snapshot, enrichmentGeneration: generation, usageAuthLabel },
         ] as const;
       },
+    ).pipe(
+      Effect.tap(() => Deferred.succeed(firstCheck, undefined)),
+      Effect.uninterruptible,
     );
     yield* Ref.set(settingsRef, nextSettings);
     yield* PubSub.publish(changesPubSub, nextSnapshot);
@@ -465,7 +468,8 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   return {
     resolveMaintenance: input.resolveMaintenance,
     getSnapshot: Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot)),
-    isAwaitingFirstCheck: Ref.get(snapshotStateRef).pipe(Effect.map((state) => !state.checked)),
+    isAwaitingFirstCheck: Deferred.isDone(firstCheck).pipe(Effect.map((checked) => !checked)),
+    awaitFirstCheck: Deferred.await(firstCheck),
     refresh: input
       .resolveMaintenance({ fresh: true })
       .pipe(Effect.andThen(refreshSnapshot), Effect.tapError(Effect.logError), Effect.orDie),
