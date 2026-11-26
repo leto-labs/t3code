@@ -10852,7 +10852,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const task = subagents[0];
     if (task?.remoteChild === undefined || task.result !== null) return;
     const previous = task.remoteChild.pendingQuestions ?? [];
-    const { pendingQuestions } = command;
+    const pendingQuestions = [
+      ...new Map(command.pendingQuestions.map((question) => [question.id, question])).values(),
+    ];
+    if (
+      previous.length === pendingQuestions.length &&
+      previous.every(
+        (question, index) =>
+          question.id === pendingQuestions[index]?.id &&
+          question.blocking === pendingQuestions[index]?.blocking,
+      )
+    )
+      return;
     const now = yield* DateTime.now;
     const updatedTask = {
       ...task,

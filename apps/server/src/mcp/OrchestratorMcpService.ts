@@ -1011,10 +1011,13 @@ function threadStatus(
   activeStatus: OrchestratorMcpThreadListItem["status"] | null | undefined,
   settledStatus: OrchestratorMcpThreadListItem["status"],
   pendingBackgroundTasks: OrchestrationV2ThreadShell["pendingBackgroundTasks"],
+  hasBlockingRemoteQuestion = false,
 ) {
   if (activeStatus != null) return activeStatus;
   if (settledStatus === "failed") return settledStatus;
-  return backgroundWorkHoldsCompletion(pendingBackgroundTasks ?? []) ? "waiting" : settledStatus;
+  return hasBlockingRemoteQuestion || backgroundWorkHoldsCompletion(pendingBackgroundTasks ?? [])
+    ? "waiting"
+    : settledStatus;
 }
 
 const LIVE_LISTED_THREAD_STATUSES: ReadonlySet<OrchestratorMcpThreadListItem["status"]> = new Set([
@@ -1026,7 +1029,12 @@ const LIVE_LISTED_THREAD_STATUSES: ReadonlySet<OrchestratorMcpThreadListItem["st
 ]);
 
 function listedThreadStatus(shell: OrchestrationV2ThreadShell) {
-  return threadStatus(shell.activityRunStatus, shell.status, shell.pendingBackgroundTasks);
+  return threadStatus(
+    shell.activityRunStatus,
+    shell.status,
+    shell.pendingBackgroundTasks,
+    shell.hasBlockingRemoteQuestion,
+  );
 }
 
 function listItemFromShell(
@@ -1086,9 +1094,12 @@ function threadDetail(
     link: threadLinkFor(scope, projection.thread.id, projection.thread.title),
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
-    status: remoteQuestions.some((question) => question.blocking)
-      ? "waiting"
-      : threadStatus(active?.status, latest?.status ?? "idle", shell.pendingBackgroundTasks),
+    status: threadStatus(
+      active?.status,
+      latest?.status ?? "idle",
+      shell.pendingBackgroundTasks,
+      remoteQuestions.some((question) => question.blocking),
+    ),
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,
@@ -1121,9 +1132,10 @@ function threadDetail(
       : { delegatedFrom: projection.thread.delegatedFrom }),
     runCount,
     itemCount,
-    pendingRequestCount:
-      projection.runtimeRequests.filter((request) => request.status === "pending").length +
-      remoteQuestions.length,
+    pendingRequestCount: projection.runtimeRequests.filter(
+      (request) => request.status === "pending",
+    ).length,
+    pendingRemoteChildQuestionCount: remoteQuestions.length,
     archived: projection.thread.archivedAt !== null,
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
@@ -2283,7 +2295,9 @@ const make = Effect.gen(function* () {
         : null,
       latestTerminalSummary: terminal ? task.result : null,
       latestTerminalResultContextTransferId: null,
-      hasPendingQuestion: !terminal && (task.remoteChild?.pendingQuestions?.length ?? 0) > 0,
+      hasPendingQuestion:
+        !terminal &&
+        (task.remoteChild?.pendingQuestions?.some((question) => question.blocking) ?? false),
       pendingApproval: null,
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
@@ -3656,7 +3670,11 @@ const make = Effect.gen(function* () {
         threads.length === 0
           ? Effect.succeed([])
           : threadManagement
-              .getShellSnapshot({ location: "active", threadIds: threads.map(({ id }) => id) })
+              .getShellSnapshot({
+                location: "active",
+                threadIds: threads.map(({ id }) => id),
+                includeBlockingRemoteQuestions: true,
+              })
               .pipe(
                 Effect.map((snapshot) => {
                   const shellsById = new Map(snapshot.threads.map((shell) => [shell.id, shell]));

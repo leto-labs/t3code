@@ -24,6 +24,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import * as ServerConfig from "../config.ts";
@@ -541,7 +542,11 @@ it.effect("keeps a forwarded wait short and its retries scoped to the caller", (
 it.effect("an older peer can still settle a wait that asked for question updates", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const { knownPendingQuestions: _, ...legacyFields } = OrchestratorMcpThreadWaitInput.fields;
+      const {
+        knownPendingQuestions: _questions,
+        untilDelegatedWorkSettled: _settlement,
+        ...legacyFields
+      } = OrchestratorMcpThreadWaitInput.fields;
       const toolkit = Toolkit.make(
         Tool.make("t3_thread_wait", {
           parameters: Schema.Struct(legacyFields),
@@ -567,12 +572,30 @@ it.effect("an older peer can still settle a wait that asked for question updates
       );
       const a = yield* makeLaptop;
       yield* linkTo(a.links, b, "auto");
-      const waited = yield* a.call("thread:laptop-full", "t3_thread_wait", {
-        environmentId: box.environmentId,
-        threadId: boxThread,
-        knownPendingQuestions: [],
-      });
-      expect(waited.structuredContent).toEqual(settled);
+      const nativeFetch = yield* FetchHttpClient.Fetch;
+      const requests: string[] = [];
+      const fetch: typeof globalThis.fetch = (input, init) => {
+        if (init?.body instanceof Uint8Array) {
+          const body = new TextDecoder().decode(init.body);
+          if (body.includes('"name":"t3_thread_wait"')) requests.push(body);
+        }
+        return nativeFetch(input, init);
+      };
+      const wait = a
+        .call("thread:laptop-full", "t3_thread_wait", {
+          environmentId: box.environmentId,
+          threadId: boxThread,
+          knownPendingQuestions: [],
+          untilDelegatedWorkSettled: true,
+        })
+        .pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
+      expect((yield* wait).structuredContent).toEqual(settled);
+      expect((yield* wait).structuredContent).toEqual(settled);
+      expect(requests.map((body) => body.includes('"knownPendingQuestions"'))).toEqual([
+        true,
+        false,
+        false,
+      ]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

@@ -1007,11 +1007,17 @@ export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWork
  */
 const DedupedBodyMarker = Schema.optionalKey(Schema.Literal(true));
 
-export const OrchestrationV2DelegatedTaskQuestion = Schema.Struct({
-  id: RuntimeRequestId,
+export const MAX_REMOTE_DELEGATED_TASK_QUESTIONS = 20;
+export const MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH = 256;
+
+const OrchestrationV2DelegatedTaskQuestion = Schema.Struct({
+  id: RuntimeRequestId.check(Schema.isMaxLength(MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH)),
   blocking: Schema.Boolean,
 });
 export type OrchestrationV2DelegatedTaskQuestion = typeof OrchestrationV2DelegatedTaskQuestion.Type;
+export const OrchestrationV2DelegatedTaskQuestions = Schema.Array(
+  OrchestrationV2DelegatedTaskQuestion,
+).check(Schema.isMaxLength(MAX_REMOTE_DELEGATED_TASK_QUESTIONS));
 
 /**
  * Where an app-owned task runs when it runs in a linked environment instead
@@ -1026,7 +1032,7 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
   title: Schema.optional(Schema.String),
   /** The run there that carries the task; absent on tasks recorded before it was kept. */
   runId: Schema.optional(RunId),
-  pendingQuestions: Schema.optional(Schema.Array(OrchestrationV2DelegatedTaskQuestion)),
+  pendingQuestions: Schema.optional(OrchestrationV2DelegatedTaskQuestions),
   /**
    * Nothing is left to stop there: a stop reached it, was refused for good, or the thread
    * or link is gone. A run ending there by itself sets it too, unless the task here was
@@ -2460,6 +2466,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
     Schema.NullOr(Schema.Literals(["preparing", "starting", "running", "waiting"])),
   ),
   blockedOnThreadWait: Schema.optional(Schema.Boolean),
+  hasBlockingRemoteQuestion: Schema.optional(Schema.Boolean),
   status: OrchestrationV2ShellThreadStatus,
   lastError: Schema.optional(Schema.NullOr(Schema.String)),
   lastErrorClass: Schema.optional(Schema.NullOr(OrchestrationV2ProviderFailureClass)),
@@ -3996,7 +4003,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
     commandId: CommandId,
     parentThreadId: ThreadId,
     taskId: NodeId,
-    pendingQuestions: Schema.Array(OrchestrationV2DelegatedTaskQuestion),
+    pendingQuestions: OrchestrationV2DelegatedTaskQuestions,
   }),
   /**
    * Owes a stop to the thread there of a remote task that already has its result, as Stop on
