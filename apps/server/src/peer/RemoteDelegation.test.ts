@@ -8,6 +8,7 @@ import {
   MessageId,
   type ModelSelection,
   NodeId,
+  type OrchestrationV2DelegatedTaskQuestion,
   type OrchestrationV2Run,
   type OrchestratorMcpThreadReadInput,
   ProjectId,
@@ -17,6 +18,7 @@ import {
   type Project,
   type RepositoryIdentity,
   RunId,
+  RuntimeRequestId,
   type ServerProvider,
   ThreadId,
   TurnItemId,
@@ -47,6 +49,7 @@ import { idleThreadProjection, liveThreadShell } from "../mcp/McpToolAccess.test
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -98,6 +101,10 @@ interface TimelineEntry {
 }
 
 interface BoxThread {
+  readonly questions: SubscriptionRef.SubscriptionRef<
+    ReadonlyArray<OrchestrationV2DelegatedTaskQuestion>
+  >;
+  readonly questionWatch: Deferred.Deferred<ThreadManagement.ThreadManagementWaitInput>;
   readonly timeline: Ref.Ref<ReadonlyArray<TimelineEntry> | null>;
   readonly pageSize: Ref.Ref<number>;
   readonly holdRefill: Ref.Ref<boolean>;
@@ -158,6 +165,8 @@ interface BoxThread {
 
 const makeBoxThread = Effect.gen(function* () {
   return {
+    questions: yield* SubscriptionRef.make<BoxThread["questions"]["value"]>([]),
+    questionWatch: yield* Deferred.make<ThreadManagement.ThreadManagementWaitInput>(),
     timeline: yield* Ref.make<ReadonlyArray<TimelineEntry> | null>(null),
     pageSize: yield* Ref.make(1),
     holdRefill: yield* Ref.make(false),
@@ -299,8 +308,9 @@ const boxToolkitLayer = (thread: BoxThread) => {
     getThreadRecords: (threadId) => projectionOf(threadId),
     getRunCount: (threadId) =>
       projectionOf(threadId).pipe(Effect.map((projection) => projection.runs.length)),
-    waitForThread: (input) =>
-      Effect.gen(function* () {
+    waitForThread: (input) => {
+      const wait = Effect.gen(function* () {
+        yield* Deferred.succeed(thread.questionWatch, input);
         yield* Ref.update(thread.waitedFor, (seen) => [...seen, input.runId]);
         // A thread with no run has nothing to wait for.
         if (yield* Ref.get(thread.runless)) {
@@ -375,7 +385,30 @@ const boxToolkitLayer = (thread: BoxThread) => {
           } as OrchestrationV2Run,
           timedOut: Option.isNone(done),
         };
-      }),
+      });
+      if (input.knownPendingQuestions === undefined) return wait;
+      const known = input.knownPendingQuestions;
+      const questionChange = SubscriptionRef.changes(thread.questions).pipe(
+        Stream.filter(
+          (questions) =>
+            questions.length !== known.length ||
+            questions.some(
+              (question, index) =>
+                question.id !== known[index]?.id || question.blocking !== known[index]?.blocking,
+            ),
+        ),
+        Stream.runHead,
+        Effect.flatMap(Effect.fromOption),
+        Effect.map((pendingQuestions) => ({
+          threadId: input.threadId,
+          run: runOf("waiting"),
+          timedOut: false,
+          pendingQuestions,
+        })),
+        Effect.catch(() => Effect.never),
+      );
+      return Effect.raceFirst(wait, questionChange);
+    },
     getTimelinePage: (threadId, options) =>
       Effect.gen(function* () {
         if (options.afterPosition === 299 && options.itemId === undefined) {
@@ -785,6 +818,7 @@ const makeLaptop = (
       threads: Context.get(here, ThreadManagement.ThreadManagementService),
       projections: Context.get(here, ProjectionStore.ProjectionStoreV2),
       sink: Context.get(here, EventSink.EventSinkV2),
+      worker: Context.get(here, EffectWorker.OrchestrationEffectWorkerV2),
       call: (name: string, args: Record<string, unknown>, scope = parentScope) =>
         server
           .callTool({ name, arguments: args })
@@ -1123,6 +1157,85 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
       });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each(["answer", "finish"] as const)(
+  "a remote question wakes the parent and clears on %s",
+  (clearedBy) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const thread = yield* makeBoxThread;
+        const b = yield* serveBox(thread);
+        const offers = yield* SubscriptionRef.make<
+          ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+        >([]);
+        const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+        const a = yield* makeLaptop(database, offers);
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const task = yield* delegateToBox(a);
+        expect(yield* Deferred.await(thread.questionWatch)).toMatchObject({
+          knownPendingQuestions: [],
+        });
+
+        const requestId = RuntimeRequestId.make("request:box-question");
+        const afterSequence = yield* a.threads.getThreadEventSequence(parentThreadId);
+        yield* SubscriptionRef.set(thread.questions, [{ id: requestId, blocking: true }]);
+        const wake = yield* a.orchestrator
+          .streamStoredEventsFrom({
+            threadId: parentThreadId,
+            afterSequence,
+            eventType: "message.updated",
+          })
+          .pipe(
+            Stream.filter(
+              ({ event }) =>
+                event.type === "message.updated" &&
+                event.payload.notification?.source.kind === "delegated_task",
+            ),
+            Stream.runHead,
+            Effect.flatMap(Effect.fromOption),
+          );
+        yield* a.worker.drain();
+        expect(wake.event.payload).toMatchObject({
+          text: expect.stringContaining(`environmentId ${box.environmentId}`),
+          notification: { outcome: "updated", source: { taskIds: [task.taskId] } },
+        });
+        const assertQuestion = (pending: boolean) =>
+          Effect.gen(function* () {
+            const status = yield* a.call("task_status", { taskId: task.taskId });
+            expect(status.structuredContent).toMatchObject({ hasPendingQuestion: pending });
+            const summary = yield* a.call("t3_thread_read", { threadId: parentThreadId });
+            expect(summary.structuredContent).toMatchObject({
+              thread: { status: pending ? "waiting" : "running", pendingRequestCount: +pending },
+            });
+          });
+        yield* assertQuestion(true);
+
+        const beforeClear = yield* a.threads.getThreadEventSequence(parentThreadId);
+        if (clearedBy === "answer") {
+          yield* SubscriptionRef.set(thread.questions, []);
+          yield* a.orchestrator
+            .streamStoredEventsFrom({
+              threadId: parentThreadId,
+              afterSequence: beforeClear,
+              eventType: "subagent.updated",
+            })
+            .pipe(Stream.runHead);
+        } else {
+          yield* Ref.set(thread.status, "completed");
+          yield* Deferred.succeed(thread.finished, undefined);
+          yield* taskResult(a, task.taskId);
+        }
+        yield* a.worker.drain();
+        yield* assertQuestion(false);
+        const parent = yield* a.projections.getThreadRecords(parentThreadId, ["runs", "messages"]);
+        const message = parent.messages.find((message) => message.text.includes(requestId));
+        expect(parent.runs.find((run) => run.userMessageId === message?.id)?.status).toBe(
+          "cancelled",
+        );
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect.each(["no active parent run", "a newer run owned by another provider"] as const)(

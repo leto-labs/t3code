@@ -9,6 +9,8 @@ import {
   type SourceControlCloneRepositoryInput,
   ProjectId,
   OrchestratorMcpFailure,
+  OrchestratorMcpThreadWaitInput,
+  OrchestratorMcpThreadWaitResult,
   ProviderInstanceId,
   RunId,
   ThreadId,
@@ -20,8 +22,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
-import { McpSchema, McpServer } from "effect/ai";
+import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 
 import * as ServerConfig from "../config.ts";
 import type { ProjectionTimelinePageOptions } from "../orchestration-v2/ProjectionStore.ts";
@@ -41,6 +44,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as RemoteDelegation from "./RemoteDelegation.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as McpToolAccess from "../mcp/McpToolAccess.ts";
 import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as PeerForwarding from "./PeerForwarding.ts";
 import * as PeerLinks from "./PeerLinks.ts";
@@ -104,7 +108,13 @@ const boxThreads = (seen: Ref.Ref<Seen>, linkSession: Ref.Ref<string>) => {
     shellOf(threadId).pipe(
       Effect.map(
         (thread) =>
-          ({ thread, runs: [run("running")], runtimeRequests: [], providerTurns: [] }) as never,
+          ({
+            thread,
+            runs: [run("running")],
+            runtimeRequests: [],
+            providerTurns: [],
+            subagents: [],
+          }) as never,
       ),
     );
   return Layer.mock(ThreadManagement.ThreadManagementService)({
@@ -524,6 +534,45 @@ it.effect("keeps a forwarded wait short and its retries scoped to the caller", (
       expect(retried).toBe(first);
       expect(other).not.toBe(first);
       expect(first).not.toContain("same-key");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("an older peer can still settle a wait that asked for question updates", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { knownPendingQuestions: _, ...legacyFields } = OrchestratorMcpThreadWaitInput.fields;
+      const toolkit = Toolkit.make(
+        Tool.make("t3_thread_wait", {
+          parameters: Schema.Struct(legacyFields),
+          success: OrchestratorMcpThreadWaitResult,
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        }),
+      );
+      const settled = {
+        threadId: boxThread,
+        runId: boxRun,
+        status: "completed",
+        timedOut: false,
+      } as const;
+      const b = yield* servePeer(
+        box,
+        McpHttpServer.toolkitRegistration(
+          toolkit,
+          McpToolAccess.toLayer(toolkit, {
+            t3_thread_wait: McpToolAccess.reads(() => Effect.succeed(settled)),
+          }),
+        ),
+      );
+      const a = yield* makeLaptop;
+      yield* linkTo(a.links, b, "auto");
+      const waited = yield* a.call("thread:laptop-full", "t3_thread_wait", {
+        environmentId: box.environmentId,
+        threadId: boxThread,
+        knownPendingQuestions: [],
+      });
+      expect(waited.structuredContent).toEqual(settled);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

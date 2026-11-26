@@ -148,6 +148,10 @@ import {
 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
 import {
+  delegatedTaskQuestionMessageId,
+  delegatedTaskQuestionWake,
+} from "./delegatedTaskQuestionWake.ts";
+import {
   cancelledBeforeStart,
   continuationFailedBeforePrompt,
   continuationStartRetryDelayMs,
@@ -715,6 +719,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "delegated_task.request":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
+    case "delegated_task.remote.questions":
     case "delegated_task.remote.stop":
     case "delegated_task.wake-policy":
     case "delegated_task.completion-delivery.acknowledge":
@@ -2492,6 +2497,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         .subagents[0];
     // An unknown task gives no evidence the question is obsolete.
     if (task === undefined) return false;
+    if (task.remoteChild !== undefined) {
+      return (
+        task.result !== null ||
+        !task.remoteChild.pendingQuestions?.some(
+          (question) => messageId === delegatedTaskQuestionMessageId(task, question.id),
+        )
+      );
+    }
     const childThreadId = task.childThreadId;
     if (
       childThreadId === null ||
@@ -2509,7 +2522,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (request) =>
         request.kind === "user_input" &&
         request.status === "pending" &&
-        messageId === `message:delegated-task-question:${threadId}:${request.id}`,
+        messageId === delegatedTaskQuestionMessageId(task, request.id),
     );
   });
 
@@ -10748,6 +10761,93 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
   });
 
+  const cancelRemoteQuestionWakes = Effect.fn("Orchestrator.cancelRemoteQuestionWakes")(function* (
+    command: OrchestrationV2ServerCommand,
+    task: OrchestrationV2Subagent,
+    messageIds: ReadonlyArray<MessageId>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    now: DateTime.Utc,
+  ) {
+    if (messageIds.length === 0) return;
+    const { messages } = yield* projectionStore
+      .getThreadRecords(task.threadId, ["messages"], { messageIds })
+      .pipe(mapDispatchError(command));
+    const { runs } = yield* projectionStore
+      .getThreadRecords(task.threadId, ["runs"], {
+        runIds: messages.flatMap((message) => message.runId ?? []),
+      })
+      .pipe(mapDispatchError(command));
+    const queued = runs.filter((run) => run.status === "queued");
+    if (queued.length === 0) return;
+    const projection = yield* projectionStore
+      .getThreadRecords(
+        task.threadId,
+        queued.some((run) => run.activeAttemptId !== null) ? ["nodes", "attempts"] : ["nodes"],
+        { nodeIds: queued.flatMap((run) => run.rootNodeId ?? []) },
+      )
+      .pipe(mapDispatchError(command));
+    for (const run of queued) {
+      yield* emitQueuedRunCancellation({
+        command,
+        events,
+        projection,
+        run,
+        now,
+      });
+    }
+  });
+
+  const dispatchRemoteDelegatedTaskQuestions = Effect.fn(
+    "Orchestrator.dispatchRemoteDelegatedTaskQuestions",
+  )(function* (
+    command: Extract<
+      OrchestrationV2InternalCommand,
+      { readonly type: "delegated_task.remote.questions" }
+    >,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) {
+    const { thread, subagents } = yield* projectionStore
+      .getThreadRecords(command.parentThreadId, ["subagents"], { subagentIds: [command.taskId] })
+      .pipe(mapDispatchError(command));
+    const task = subagents[0];
+    if (task?.remoteChild === undefined || task.result !== null) return;
+    const previous = task.remoteChild.pendingQuestions ?? [];
+    const { pendingQuestions } = command;
+    const now = yield* DateTime.now;
+    const updatedTask = {
+      ...task,
+      remoteChild: { ...task.remoteChild, pendingQuestions },
+      updatedAt: now,
+    };
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "subagent.updated",
+      threadId: task.threadId,
+      ...(task.runId === null ? {} : { runId: task.runId }),
+      nodeId: task.id,
+      occurredAt: now,
+      payload: updatedTask,
+    });
+    yield* cancelRemoteQuestionWakes(
+      command,
+      task,
+      previous
+        .filter((question) => !pendingQuestions.some(({ id }) => id === question.id))
+        .map((question) => delegatedTaskQuestionMessageId(task, question.id)),
+      events,
+      now,
+    );
+    if (thread.archivedAt !== null || thread.deletedAt !== null) return;
+    for (const question of pendingQuestions) {
+      if (previous.some(({ id }) => id === question.id)) continue;
+      const wake = delegatedTaskQuestionWake(updatedTask, question);
+      yield* dispatchMessage({ ...wake, commandId: command.commandId }, events, effects);
+    }
+  });
+
   /**
    * Completes a task that ran in a linked environment: the parent half of
    * `finalizeAppOwnedSubagent`, with the result its thread there ended with.
@@ -10788,7 +10888,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         candidate.origin === "app_owned" &&
         candidate.remoteChild !== undefined,
     );
-    if (task === undefined) {
+    if (task?.remoteChild === undefined) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -10797,30 +10897,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     if (
       command.stoppedThere === "stopped" &&
-      (command.stopCount ?? 0) !== (task.remoteChild?.stopCount ?? 0)
+      (command.stopCount ?? 0) !== (task.remoteChild.stopCount ?? 0)
     )
       return;
+    const { pendingQuestions, ...child } = task.remoteChild;
     const remoteChild =
-      command.stoppedThere === undefined
-        ? task.remoteChild
-        : { ...task.remoteChild!, stoppedThere: true };
+      command.stoppedThere === undefined ? child : { ...child, stoppedThere: true };
     // The first result stands; a repeated follower report records nothing, which
     // the dispatcher refuses. A stop there after the result is still recorded, but
     // a run that ended by itself does not settle a stop the task here still owes.
     if (task.result !== null) {
       // A Stop or cancel here that lost the race to the result still owes its stop.
       if (command.stoppedThere === undefined) {
-        return yield* emitRemoteStopOwed(events, command, task, task.remoteChild!);
+        return yield* emitRemoteStopOwed(events, command, task, child);
       }
       const owesStop =
         task.status === "cancelled" ||
         task.status === "interrupted" ||
-        task.remoteChild?.stoppedThere === false;
-      if (
-        task.remoteChild?.stoppedThere === true ||
-        (owesStop && command.stoppedThere !== "stopped")
-      )
-        return;
+        child.stoppedThere === false;
+      if (child.stoppedThere === true || (owesStop && command.stoppedThere !== "stopped")) return;
       const now = yield* DateTime.now;
       yield* emit(
         events,
@@ -10837,6 +10932,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
     const now = yield* DateTime.now;
+    yield* cancelRemoteQuestionWakes(
+      command,
+      task,
+      (pendingQuestions ?? []).map((question) => delegatedTaskQuestionMessageId(task, question.id)),
+      events,
+      now,
+    );
     const updatedTask: OrchestrationV2Subagent = {
       ...task,
       remoteChild,
@@ -16525,6 +16627,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "delegated_task.remote.complete":
         yield* dispatchRemoteDelegatedTaskComplete(command, events);
         break;
+      case "delegated_task.remote.questions":
+        yield* dispatchRemoteDelegatedTaskQuestions(command, events, effects);
+        break;
       case "delegated_task.remote.stop":
         yield* dispatchRemoteDelegatedTaskStop(command, events);
         break;
@@ -16676,6 +16781,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           planned.events.length > 0 ||
           isUnobservedAcknowledgement(command) ||
           command.type === "thread.background-work.settle" ||
+          command.type === "delegated_task.remote.questions" ||
           // A stale visit changes no read state.
           command.type === "thread.visit" ||
           // A read can answer a watch again before a push's reopen lands; nothing is left to clear.

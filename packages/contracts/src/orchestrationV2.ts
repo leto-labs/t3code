@@ -1002,6 +1002,12 @@ export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWork
  */
 const DedupedBodyMarker = Schema.optionalKey(Schema.Literal(true));
 
+export const OrchestrationV2DelegatedTaskQuestion = Schema.Struct({
+  id: RuntimeRequestId,
+  blocking: Schema.Boolean,
+});
+export type OrchestrationV2DelegatedTaskQuestion = typeof OrchestrationV2DelegatedTaskQuestion.Type;
+
 /**
  * Where an app-owned task runs when it runs in a linked environment instead
  * of in a child thread here: that environment and the ordinary thread it runs
@@ -1015,6 +1021,7 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
   title: Schema.optional(Schema.String),
   /** The run there that carries the task; absent on tasks recorded before it was kept. */
   runId: Schema.optional(RunId),
+  pendingQuestions: Schema.optional(Schema.Array(OrchestrationV2DelegatedTaskQuestion)),
   /**
    * Nothing is left to stop there: a stop reached it, was refused for good, or the thread
    * or link is gone. A run ending there by itself sets it too, unless the task here was
@@ -3973,6 +3980,13 @@ const OrchestrationV2InternalCommand = Schema.Union([
     stoppedThere: Schema.optional(Schema.Literals(["ran-out", "stopped"])),
     /** The stop generation this report acknowledges; absent for the original unnumbered stop. */
     stopCount: Schema.optional(NonNegativeInt),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("delegated_task.remote.questions"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+    pendingQuestions: Schema.Array(OrchestrationV2DelegatedTaskQuestion),
   }),
   /**
    * Owes a stop to the thread there of a remote task that already has its result, as Stop on

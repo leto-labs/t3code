@@ -1063,7 +1063,10 @@ function listItemFromShell(
 
 function threadDetail(
   scope: McpInvocationScope,
-  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "runtimeRequests">,
+  projection: Pick<
+    OrchestrationV2ThreadProjection,
+    "thread" | "runs" | "runtimeRequests" | "subagents"
+  >,
   runCount: number,
   itemCount: number,
   shell: OrchestrationV2ThreadShell,
@@ -1072,6 +1075,9 @@ function threadDetail(
 ): OrchestratorMcpThreadDetail {
   const latest = ThreadManagementService.latestRun(projection);
   const active = ThreadManagementService.latestActiveRun(projection);
+  const remoteQuestions = projection.subagents.flatMap((task) =>
+    task.result === null ? (task.remoteChild?.pendingQuestions ?? []) : [],
+  );
   return {
     threadId: projection.thread.id,
     projectId: projection.thread.projectId,
@@ -1079,7 +1085,9 @@ function threadDetail(
     link: threadLinkFor(scope, projection.thread.id, projection.thread.title),
     createdBy: projection.thread.createdBy,
     creationSource: projection.thread.creationSource,
-    status: threadStatus(active?.status, latest?.status ?? "idle", shell.pendingBackgroundTasks),
+    status: remoteQuestions.some((question) => question.blocking)
+      ? "waiting"
+      : threadStatus(active?.status, latest?.status ?? "idle", shell.pendingBackgroundTasks),
     latestRunId: latest?.id ?? null,
     activeRunId: active?.id ?? null,
     providerInstanceId: projection.thread.modelSelection.instanceId,
@@ -1112,9 +1120,9 @@ function threadDetail(
       : { delegatedFrom: projection.thread.delegatedFrom }),
     runCount,
     itemCount,
-    pendingRequestCount: projection.runtimeRequests.filter(
-      (request) => request.status === "pending",
-    ).length,
+    pendingRequestCount:
+      projection.runtimeRequests.filter((request) => request.status === "pending").length +
+      remoteQuestions.length,
     archived: projection.thread.archivedAt !== null,
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
@@ -1620,21 +1628,21 @@ const make = Effect.gen(function* () {
       shell.lineage.relationshipToParent === "subagent"
     ) {
       const target = yield* threadManagement
-        .getProjectThreadRecords(input, [
-          "runs",
-          "providerTurns",
-          "runtimeRequests",
-          "contextTransfers",
-        ])
+        .getProjectThreadRecords(
+          input,
+          ["runs", "providerTurns", "runtimeRequests", "contextTransfers", "subagents"],
+          { pendingRemoteQuestionsOnly: true },
+        )
         .pipe(Effect.mapError(threadManagementFailure));
       return { parent, target, shell, runCount: target.runs.length } as const;
     }
     // Long threads hold thousands of runs; the read shows only the recent and active ones.
     const [records, runCount] = yield* Effect.all([
-      threadManagement.getProjectThreadRecords(input, ["runs", "runtimeRequests"], {
+      threadManagement.getProjectThreadRecords(input, ["runs", "runtimeRequests", "subagents"], {
         latestRunLimit: runLimit,
         runStatuses: ThreadManagementService.ACTIVE_RUN_STATUSES,
         runtimeRequestStatuses: ["pending"],
+        pendingRemoteQuestionsOnly: true,
       }),
       threadManagement.getRunCount(threadId),
     ]).pipe(Effect.mapError(threadManagementFailure));
@@ -2261,8 +2269,7 @@ const make = Effect.gen(function* () {
         : null,
       latestTerminalSummary: terminal ? task.result : null,
       latestTerminalResultContextTransferId: null,
-      // Its questions and approvals are answered in the environment it runs in.
-      hasPendingQuestion: false,
+      hasPendingQuestion: !terminal && (task.remoteChild?.pendingQuestions?.length ?? 0) > 0,
       pendingApproval: null,
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
@@ -3859,6 +3866,9 @@ const make = Effect.gen(function* () {
           ),
           ...(input.untilDelegatedWorkSettled === true ? { untilDelegatedWorkSettled: true } : {}),
           ...(input.untilOutput === true ? { untilOutput: true } : {}),
+          ...(input.knownPendingQuestions === undefined
+            ? {}
+            : { knownPendingQuestions: input.knownPendingQuestions }),
         })
         .pipe(Effect.mapError(threadManagementFailure));
       const status = result.run === null ? "idle" : runOutcome(result.run);
@@ -3897,6 +3907,9 @@ const make = Effect.gen(function* () {
         runId: result.run?.id ?? null,
         status,
         timedOut: result.timedOut,
+        ...(result.pendingQuestions === undefined
+          ? {}
+          : { pendingQuestions: result.pendingQuestions }),
         ...(wakesCaller ? { next: ORCHESTRATOR_MCP_RUNNING_TASK_NEXT } : {}),
         ...(result.resultRun === undefined
           ? {}
