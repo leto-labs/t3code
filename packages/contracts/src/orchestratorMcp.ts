@@ -179,9 +179,17 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   isolation: Schema.optional(
     Schema.Literals(["shared", "worktree"]).annotate({
       description:
-        "'shared' (default): parent checkout. 'worktree': new prepared checkout from the parent commit, for a separate checkout or PR per child. Uncommitted edits stay out.",
+        "'shared' (default): parent checkout locally, project checkout on a linked host. 'worktree': separate checkout. Uncommitted edits stay out.",
     }),
   ),
+  baseRef: Schema.optional(TrimmedNonEmptyString).annotate({
+    description:
+      "Worktree base branch, tag, or commit. Required on a linked host. Locally defaults to the parent commit.",
+  }),
+  startFromOrigin: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "With baseRef, true fetches a remote branch (e.g. origin/main). False uses the ref on the host. Defaults to the linked project's setting or false locally.",
+  }),
   mode: Schema.optional(
     Schema.Literals(["async", "wait"]).annotate({
       description:
