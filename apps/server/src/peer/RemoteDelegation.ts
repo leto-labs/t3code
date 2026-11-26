@@ -287,14 +287,18 @@ const make = Effect.gen(function* () {
         });
       }
       const parentNodeId = parentRun.rootNodeId;
-      const { target } = input;
-      // A worktree there would branch from a commit this checkout has and the
-      // other may not, so a remote task runs in that project's checkout.
-      if (input.isolation === "worktree") {
+      const { target, baseRef, startFromOrigin } = input;
+      if (baseRef !== undefined && input.isolation !== "worktree") {
+        return yield* new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "baseRef needs isolation 'worktree'",
+        });
+      }
+      if (input.isolation === "worktree" && baseRef === undefined) {
         return yield* new OrchestratorMcpFailure({
           code: "invalid_request",
           message:
-            'A task in a linked environment runs in that project\'s checkout; isolation "worktree" is not supported there. Omit isolation, or use t3_thread_launch with environmentId and a worktree workspaceStrategy.',
+            "Worktree isolation in a linked environment requires baseRef because that host may lack this checkout's commit. Pass a branch, tag, or commit it can resolve.",
         });
       }
       // The provider and model inherit as they do for a task here. Another
@@ -344,16 +348,22 @@ const make = Effect.gen(function* () {
       const key = input.clientRequestId ?? (yield* random.uuidV4());
       const task = taskPrompt(input);
       const title = input.title ?? parent.thread.title;
-      const launched = yield* forwarding.call(
-        scope,
-        ProjectToolkit.tools.t3_thread_launch,
-        target.environmentId,
-        {
+      const launched = yield* forwarding
+        .call(scope, ProjectToolkit.tools.t3_thread_launch, target.environmentId, {
           projectId,
           title,
           modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
           ...(runtimeMode === undefined ? {} : { runtimeMode }),
           ...(interactionMode === undefined ? {} : { interactionMode }),
+          ...(baseRef === undefined
+            ? {}
+            : {
+                workspaceStrategy: {
+                  type: "worktree",
+                  baseRef,
+                  ...(startFromOrigin === undefined ? {} : { startFromOrigin }),
+                },
+              }),
           message: task,
           clientRequestId: `delegate:${scope.thread.threadId}:${key}`,
           // The thread there shows it is this thread's subagent, with a way back.
@@ -362,8 +372,25 @@ const make = Effect.gen(function* () {
             threadId: parent.thread.id,
             title: parent.thread.title,
           },
-        },
-      );
+        })
+        .pipe(
+          Effect.mapError((error) => {
+            if (baseRef === undefined || error.code !== "invalid_request") return error;
+            // The peer returns direct-launch hints as plain text.
+            const message = error.message
+              .replace(
+                "Pass a branch, tag, or commit that exists there, or set startFromOrigin:true if it exists only on a remote.",
+                "Pass a baseRef that exists on the linked host, or pass a pushed remote/branch with startFromOrigin set to true.",
+              )
+              .replace(
+                'Use workspaceStrategy: {type: "root"}, or pass the projectId of a Git repository.',
+                'Use isolation "shared", or pass the target.projectId of a Git repository.',
+              );
+            return message === error.message
+              ? error
+              : new OrchestratorMcpFailure({ code: error.code, message });
+          }),
+        );
       const link = yield* links.get(target.environmentId).pipe(
         Effect.map(Option.getOrUndefined),
         Effect.orElseSucceed(() => undefined),

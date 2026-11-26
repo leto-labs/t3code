@@ -86,7 +86,7 @@ const modelSelection = { instanceId, model: "gpt-5.4" };
 
 type LaunchedWith = Pick<
   ThreadLaunch.ThreadLaunchInput,
-  "modelSelection" | "runtimeMode" | "interactionMode"
+  "modelSelection" | "runtimeMode" | "interactionMode" | "workspaceStrategy"
 >;
 
 /** The thread the box launches for the task, which the test finishes. */
@@ -528,6 +528,28 @@ const boxToolkitLayer = (thread: BoxThread) => {
       ),
   });
   const layerBoxLaunches = Layer.mock(ThreadLaunch.ThreadLaunchService)({
+    checkWorktreeBase: ({ projectId, workspaceStrategy }) => {
+      if (projectId !== boxProject) {
+        return Effect.fail(
+          new ThreadLaunch.ThreadLaunchNotRepositoryError({
+            projectId,
+            projectTitle: "Other project",
+            workspaceRoot: "/srv/other-0",
+          }),
+        );
+      }
+      if (workspaceStrategy.type === "worktree" && workspaceStrategy.baseRef === "missing") {
+        return Effect.fail(
+          new ThreadLaunch.ThreadLaunchBaseRefError({
+            projectId,
+            projectTitle: "Box",
+            workspaceRoot: "/srv/app",
+            baseRef: workspaceStrategy.baseRef,
+          }),
+        );
+      }
+      return Effect.void;
+    },
     launch: (input) =>
       Ref.get(thread.runless).pipe(
         Effect.flatMap((runless) =>
@@ -540,6 +562,7 @@ const boxToolkitLayer = (thread: BoxThread) => {
                 modelSelection: input.modelSelection,
                 runtimeMode: input.runtimeMode,
                 interactionMode: input.interactionMode,
+                workspaceStrategy: input.workspaceStrategy,
               }),
             ),
             Effect.andThen(Effect.flatten(Ref.get(thread.afterLaunch))),
@@ -1290,16 +1313,20 @@ it.effect("a task named only by environment inherits the parent's model, within 
         modelSelection: parentModelSelection,
         runtimeMode: "auto-accept-edits",
         interactionMode: "default",
+        workspaceStrategy: { type: "root" },
       });
 
       // Asking for more than the link allows is still refused there.
       const broader = yield* a.call("delegate_task", {
         task: "Run the suite on the box.",
         target: { environmentId: box.environmentId },
+        isolation: "worktree",
+        baseRef: "origin/main",
         runtimeMode: "full-access",
         clientRequestId: "broader",
       });
       expect(broader.isError).toBe(true);
+      expect(JSON.stringify(broader.content)).toContain("linked with auto-accept-edits access");
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -1333,7 +1360,18 @@ it.effect("a task naming another driver there never runs its model on the parent
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("refuses worktree isolation for a task there before launching anything", () =>
+it.effect.each([
+  {
+    name: "worktree isolation without a baseRef",
+    input: { isolation: "worktree" },
+    message: "requires baseRef",
+  },
+  {
+    name: "a baseRef without worktree isolation",
+    input: { baseRef: "w02-main" },
+    message: "baseRef needs isolation 'worktree'",
+  },
+])("refuses $name before launching there", ({ input, message }) =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;
@@ -1349,11 +1387,111 @@ it.effect("refuses worktree isolation for a task there before launching anything
       const result = yield* a.call("delegate_task", {
         task: "Run the suite on the box.",
         target: { environmentId: box.environmentId },
-        isolation: "worktree",
+        ...input,
       });
       expect(result.isError).toBe(true);
-      expect(JSON.stringify(result.content)).toContain("isolation");
+      const detail = JSON.stringify(result.content);
+      expect(detail).toContain("invalid_request");
+      expect(detail).toContain(message);
+      expect(detail).not.toContain("t3_thread_launch");
       expect(yield* Ref.get(thread.launched)).toBeNull();
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each([
+  { baseRef: "w02-main", startFromOrigin: undefined, hostSetting: true },
+  { baseRef: "origin/main", startFromOrigin: true, hostSetting: false },
+  { baseRef: "fork/v0.1.12", startFromOrigin: undefined, hostSetting: false },
+  { baseRef: "release/1.0", startFromOrigin: false, hostSetting: true },
+])("tracks a linked worktree task based on $baseRef", ({ baseRef, startFromOrigin, hostSetting }) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      yield* b.settings.updateSettings({ newWorktreesStartFromOrigin: hostSetting });
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const a = yield* makeLaptop(database, offers);
+      yield* linkTo(a.links, b, "auto-accept-edits");
+      yield* seedParent(a);
+
+      const result = yield* a.call("delegate_task", {
+        task: "Run the suite on the box.",
+        target: { environmentId: box.environmentId },
+        isolation: "worktree",
+        baseRef: ` ${baseRef} `,
+        ...(startFromOrigin === undefined ? {} : { startFromOrigin }),
+        clientRequestId: "suite-in-worktree",
+      });
+      expect(result.isError, JSON.stringify(result.content)).toBe(false);
+      expect(yield* Ref.get(thread.launchedWith)).toMatchObject({
+        runtimeMode: "auto-accept-edits",
+        workspaceStrategy: {
+          type: "worktree",
+          baseRef,
+          startFromOrigin: startFromOrigin ?? hostSetting,
+        },
+      });
+      const threadId = yield* Ref.get(thread.launched);
+      expect(threadId).not.toBeNull();
+      const remoteChild = { environmentId: box.environmentId, threadId };
+      const { taskId } = result.structuredContent as { taskId: NodeId };
+      const status = yield* a.call("task_status", { taskId });
+      expect(status.isError, JSON.stringify(status.content)).toBe(false);
+      expect(status.structuredContent).toMatchObject({ taskId, status: "running", remoteChild });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect.each([
+  {
+    name: "an unresolved linked worktree base",
+    projectId: boxProject,
+    message: 'Base ref "missing" does not resolve to a commit',
+    hint: "Pass a baseRef that exists on the linked host",
+  },
+  {
+    name: "a linked worktree in a non-Git project",
+    projectId: ProjectId.make("project:box-other-0"),
+    message: "is not a Git repository",
+    hint: "Use isolation",
+  },
+])("reports $name without recording a task", ({ projectId, message, hint }) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const a = yield* makeLaptop(database, offers);
+      yield* linkTo(a.links, b, "auto");
+      yield* seedParent(a);
+
+      const result = yield* a.call("delegate_task", {
+        task: "Run the suite on the box.",
+        target: { environmentId: box.environmentId, projectId },
+        isolation: "worktree",
+        baseRef: "missing",
+        startFromOrigin: false,
+      });
+      expect(result.isError).toBe(true);
+      const detail = result.content.find((item) => item.type === "text");
+      const error = JSON.parse(detail?.text ?? "{}");
+      expect(error).toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining(message),
+      });
+      expect(error.message).toContain(hint);
+      expect(error.message).not.toContain("t3_thread_launch");
+      expect(error.message).not.toContain("workspaceStrategy");
+      expect(error.message).not.toContain("startFromOrigin:true");
+      expect(yield* Ref.get(thread.launched)).toBeNull();
+      expect((yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(0);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

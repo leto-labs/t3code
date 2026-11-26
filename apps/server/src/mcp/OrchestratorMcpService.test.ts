@@ -2819,9 +2819,26 @@ describe("OrchestratorMcpService provider resolution", () => {
 
   // docs/user/multi-repo-projects.md: each repository starts from the thread's base branch
   // where it has one, so the child's launch has to carry the parent's branch, not only its commit.
-  it.live(
-    "names the parent's branch as a worktree child's base so other repositories can match it",
-    () =>
+  it.live.each([
+    { name: "uses the parent branch", input: { isolation: "worktree" }, expectedBase: "release" },
+    {
+      name: "uses the explicit base and fetch setting",
+      input: { isolation: "worktree", baseRef: "main", startFromOrigin: true },
+      expectedBase: "main",
+    },
+    {
+      name: "refuses a base without worktree isolation",
+      input: { baseRef: "main" },
+      expectedError: "baseRef needs isolation 'worktree'",
+    },
+    {
+      name: "refuses an unresolved base",
+      input: { isolation: "worktree", baseRef: "missing" },
+      expectedError: 'Base ref "missing" does not resolve to a commit',
+    },
+  ] as const)(
+    "$name when delegating locally with worktree checkout options",
+    ({ input, expectedBase, expectedError }) =>
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
         const git = yield* GitVcsDriver.GitVcsDriver;
@@ -2891,24 +2908,46 @@ describe("OrchestratorMcpService provider resolution", () => {
           Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
           Layer.mock(ThreadLaunchService.ThreadLaunchService)({
             isNonGitProject: () => Effect.succeed(false),
+            checkWorktreeBase: ({ workspaceStrategy }) =>
+              workspaceStrategy.type === "worktree" && workspaceStrategy.baseRef === "missing"
+                ? Effect.fail(
+                    new ThreadLaunchService.ThreadLaunchBaseRefError({
+                      projectId,
+                      projectTitle: "parent",
+                      workspaceRoot,
+                      baseRef: workspaceStrategy.baseRef,
+                    }),
+                  )
+                : Effect.void,
           }),
           Layer.succeed(GitVcsDriver.GitVcsDriver, git),
         );
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-          yield* service.delegateTask(scope, {
-            task: "Change a and b together.",
-            isolation: "worktree",
-            mode: "async",
-            clientRequestId: "worktree-parent-branch",
+          const result = yield* service
+            .delegateTask(scope, {
+              task: "Change a and b together.",
+              ...input,
+              mode: "async",
+              clientRequestId: "worktree-parent-branch",
+            })
+            .pipe(Effect.result);
+          if (expectedError !== undefined) {
+            const error = Result.getFailure(result);
+            assert.isTrue(Option.isSome(error));
+            if (Option.isSome(error)) {
+              assert.equal(error.value.code, "invalid_request");
+              assert.include(error.value.message, expectedError);
+            }
+            assert.isEmpty(commands);
+            return;
+          }
+          assert.isTrue(Result.isSuccess(result));
+          assert.deepEqual((commands[0] as { workspaceStrategy?: unknown }).workspaceStrategy, {
+            type: "worktree",
+            baseRef: expectedBase,
+            startFromOrigin: input.startFromOrigin ?? false,
           });
-          const workspaceStrategy = (commands[0] as { workspaceStrategy?: unknown })
-            .workspaceStrategy;
-          assert.include(
-            JSON.stringify(workspaceStrategy),
-            "release",
-            "the child's workspace names only the parent's commit, so other repositories fall back to their default branch",
-          );
         }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
       }).pipe(
         Effect.provide(

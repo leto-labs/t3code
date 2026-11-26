@@ -2958,6 +2958,9 @@ const make = Effect.gen(function* () {
           : readTask(scope, taskId, false, true);
       }
       const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
+      if (input.baseRef !== undefined && input.isolation !== "worktree") {
+        return yield* failure("invalid_request", "baseRef needs isolation 'worktree'");
+      }
       if (
         input.target?.projectId !== undefined &&
         input.target.projectId !== parent.thread.projectId
@@ -3006,6 +3009,19 @@ const make = Effect.gen(function* () {
       );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (
+        input.isolation === "worktree" &&
+        !isRetryOfAcceptedDelegation &&
+        input.baseRef !== undefined
+      ) {
+        workspaceStrategy = {
+          type: "worktree",
+          baseRef: input.baseRef,
+          startFromOrigin: input.startFromOrigin ?? false,
+        };
+        yield* threadLaunch
+          .checkWorktreeBase({ projectId: parent.thread.projectId, workspaceStrategy })
+          .pipe(Effect.mapError((error) => failure("invalid_request", error.message)));
+      } else if (
         input.isolation === "worktree" &&
         !isRetryOfAcceptedDelegation &&
         (yield* threadLaunch.isNonGitProject(parent.thread.projectId))
