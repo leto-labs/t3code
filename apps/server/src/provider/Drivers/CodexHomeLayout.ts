@@ -45,6 +45,12 @@ const REPLACEABLE_SHARED_RUNTIME_ENTRIES = new Set([
   ".sqlite-maintenance.lock",
 ]);
 
+// Codex adds lock files beside shared state over time (session_index.jsonl.lock). A shadow home
+// that ran before the shared one existed keeps a local copy, which would split the lock.
+const isReplaceableSharedRuntimeEntry = (entryName: string) =>
+  REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(entryName) ||
+  (entryName.endsWith(".lock") && !PRIVATE_ENTRY_NAMES.has(entryName));
+
 function resolveHomePath(path: Path.Path, home: string, value: string | undefined): string {
   const expanded =
     value && value.trim().length > 0 ? expandHomePath(value, home) : path.join(home, ".codex");
@@ -270,7 +276,7 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
   );
 
   if (state._tag === "NotSymlink") {
-    if (!REPLACEABLE_SHARED_RUNTIME_ENTRIES.has(input.entryName)) {
+    if (!isReplaceableSharedRuntimeEntry(input.entryName)) {
       return yield* new CodexShadowHomeEntryConflictError({
         sharedHomePath: input.sharedHomePath,
         effectiveHomePath: input.effectiveHomePath,
