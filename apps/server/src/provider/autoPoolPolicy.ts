@@ -290,7 +290,7 @@ interface AutoPoolCandidate {
  * binding window resets first goes first. Percentages from different plans are not
  * capacities, so accounts without reset data fall back to remaining percentage.
  */
-export function autoPoolCompare(maxRunningTurns: number) {
+function autoPoolCompare(maxRunningTurns: number) {
   return (a: AutoPoolCandidate, b: AutoPoolCandidate): number => {
     const full = Number(a.running >= maxRunningTurns) - Number(b.running >= maxRunningTurns);
     if (full !== 0) return full;
@@ -315,6 +315,18 @@ const belowFloor = (candidate: AutoPoolCandidate) =>
   candidate.headroom.binding.remaining < AUTO_POOL_FLOOR_PERCENT;
 
 /**
+ * The order for new threads: reset order, but accounts below the floor go last. A thread started
+ * on one would move at its next turn and lose its prompt cache.
+ */
+export function autoPoolRank<C extends AutoPoolCandidate>(
+  candidates: readonly C[],
+  maxRunningTurns: number,
+): C[] {
+  const ranked = candidates.toSorted(autoPoolCompare(maxRunningTurns));
+  return [...ranked.filter((candidate) => !belowFloor(candidate)), ...ranked.filter(belowFloor)];
+}
+
+/**
  * Switching accounts loses the prompt cache, so a thread keeps its current account until
  * that account falls below the floor and another account is above it.
  */
@@ -322,7 +334,7 @@ export function autoPoolChoose<C extends AutoPoolCandidate>(
   candidates: readonly C[],
   input: { readonly current?: C | undefined; readonly maxRunningTurns: number },
 ): C | undefined {
-  const ranked = candidates.toSorted(autoPoolCompare(input.maxRunningTurns));
+  const ranked = autoPoolRank(candidates, input.maxRunningTurns);
   const current = input.current;
   if (current === undefined) return ranked[0];
   if (!belowFloor(current)) return current;

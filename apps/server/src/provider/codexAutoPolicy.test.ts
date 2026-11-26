@@ -353,6 +353,22 @@ describe("Auto pool order", () => {
       expected: "known",
     },
     {
+      name: "starts a new thread above the floor, past an earlier reset below it",
+      accounts: [
+        candidate(account("soon", [{ used: 96, inHours: 32 }])),
+        candidate(account("late", [{ used: 40, inHours: 144 }])),
+      ],
+      expected: "late",
+    },
+    {
+      name: "starts a new thread below the floor only when every account is",
+      accounts: [
+        candidate(account("late", [{ used: 96, inHours: 144 }])),
+        candidate(account("soon", [{ used: 97, inHours: 32 }])),
+      ],
+      expected: "soon",
+    },
+    {
       name: "keeps a thread on its account above the floor",
       accounts: [
         candidate(account("current", [{ used: 90, inHours: 144 }])),
@@ -422,6 +438,20 @@ describe("Auto pool order", () => {
         instanceId: "open",
         runningTurns: 2,
         note: expect.stringMatching(/^First choice for new threads; weekly window 60% left/),
+      }),
+    ]);
+    const low = account("low", [{ used: 97, inHours: 1 }]);
+    const floored = providerUsageReport([auto, low, open], CODEX_AUTO_NOW, {
+      pools: [{ ...pools[0]!, memberIds: [low.instanceId, open.instanceId] }],
+    });
+    expect(floored.instances[0]!.members).toEqual([
+      expect.objectContaining({
+        instanceId: "low",
+        note: expect.stringMatching(/^Choice 2 for new threads; .*below 5%/),
+      }),
+      expect.objectContaining({
+        instanceId: "open",
+        note: expect.stringMatching(/^First choice for new threads/),
       }),
     ]);
     const exhausted = providerUsageReport([auto, spent], CODEX_AUTO_NOW, {

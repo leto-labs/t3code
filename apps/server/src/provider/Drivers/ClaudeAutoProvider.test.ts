@@ -188,6 +188,21 @@ it.layer(NodeServices.layer)("Claude Auto routing policy", (it) => {
     ).toBeUndefined();
   });
 
+  it("starts a new thread on an account above the floor before an earlier reset below it", () => {
+    const low = claudeMember("low", [window("seven_day", "weekly", 96, 24)]).read();
+    const open = claudeMember("open", [window("seven_day", "weekly", 3, 72)]).read();
+    const choose = (members: ReadonlyArray<typeof low>) =>
+      autoPoolChoose(
+        members.flatMap((snapshot, order) => {
+          const headroom = claudeAutoHeadroom(snapshot, { instanceId: poolId, model: OPUS }, NOW);
+          return headroom === undefined ? [] : [{ snapshot, headroom, running: 0, order }];
+        }),
+        { maxRunningTurns: 3 },
+      )?.snapshot.instanceId;
+    expect(choose([low, open])).toBe("open");
+    expect(choose([low])).toBe("low");
+  });
+
   it("reports the pool's account and Fable weekly windows as separate rows", () => {
     const members = [
       claudeMember("alice", [
