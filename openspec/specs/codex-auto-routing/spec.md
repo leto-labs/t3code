@@ -104,12 +104,21 @@ only when a usage read taken after it shows the allowance is spent.
 
 At a turn start, a thread MUST move off its account when that account has less
 than 5% of its binding window left and another eligible account has at least 5%.
+For the same reason, a new thread MUST NOT start on an account below 5% while
+another eligible account is at or above it.
 
 #### Scenario: a nearly spent account releases its threads
 
 - **WHEN** a thread's account has 4% of its binding weekly window left
 - **AND** another eligible account has 40% left
 - **THEN** the thread's next turn runs on the other account
+
+#### Scenario: a new thread skips a nearly spent account
+
+- **WHEN** account A has 4% of its binding weekly window left and resets first
+- **AND** account B has 40% left
+- **THEN** a new thread starts on B, and the usage report ranks B first
+- **AND** a new thread starts on A only when every eligible account is below 5%
 
 ### Requirement: pool members are not directly selectable
 

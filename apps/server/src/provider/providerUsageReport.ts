@@ -9,12 +9,12 @@ import * as Duration from "effect/Duration";
 import {
   AUTO_POOL_USAGE_REFRESH_INTERVAL_MS,
   autoPoolAccountKey,
-  autoPoolCompare,
   autoPoolCurrentWindow,
   autoPoolSubscriptionEligible,
   autoPoolUsageIsStale,
   autoPoolHeadroom,
   autoPoolNote,
+  autoPoolRank,
   autoPoolWindowGroup,
 } from "./autoPoolPolicy.ts";
 
@@ -74,12 +74,13 @@ function poolEntry(
     const key = autoPoolAccountKey(member);
     return key === undefined ? 0 : runningTurns(key);
   };
-  const ranked = eligible
-    .flatMap((member, order) => {
+  const ranked = autoPoolRank(
+    eligible.flatMap((member, order) => {
       const headroom = autoPoolHeadroom(member, undefined, nowMs);
       return headroom === undefined ? [] : [{ member, headroom, running: running(member), order }];
-    })
-    .toSorted(autoPoolCompare(pool.maxRunningTurns));
+    }),
+    pool.maxRunningTurns,
+  );
   const groups = new Map<string, PoolGroup>();
   for (const member of eligible) {
     const limits = member.usageLimits;
