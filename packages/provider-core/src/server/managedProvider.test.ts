@@ -785,6 +785,7 @@ describe("makeManagedServerProvider", () => {
               label: "Weekly",
               usedPercent: 25,
               resetsAt: "2026-04-17T00:00:00.000Z",
+              observedAt: "2026-04-10T00:05:00.000Z",
             },
           ],
         });
@@ -872,12 +873,16 @@ describe("makeManagedServerProvider", () => {
           Effect.map((chunk) => Array.from(chunk)[0]!),
         );
         assert.deepStrictEqual(enriched.models, enrichedSnapshot.models);
-        assert.deepStrictEqual(enriched.usageLimits?.windows, [liveWindow]);
+        // A partial reading stamps the windows it saw; a complete one replaces them as given.
+        const observedLiveWindow = clearPlan
+          ? liveWindow
+          : { ...liveWindow, observedAt: "2026-04-10T00:00:02.000Z" };
+        assert.deepStrictEqual(enriched.usageLimits?.windows, [observedLiveWindow]);
         assert.strictEqual(enriched.auth.label, clearPlan ? undefined : "tier-2");
 
         const refreshed = yield* provider.refresh;
         assert.strictEqual(refreshed.message, refreshedSnapshotSecond.message);
-        assert.deepStrictEqual(refreshed.usageLimits?.windows, [liveWindow]);
+        assert.deepStrictEqual(refreshed.usageLimits?.windows, [observedLiveWindow]);
         assert.strictEqual(refreshed.auth.workspaceId, "ws-a");
         assert.strictEqual(refreshed.auth.label, clearPlan ? undefined : "tier-2");
 
@@ -1009,14 +1014,19 @@ describe("makeManagedServerProvider", () => {
         const partial = yield* provider.getSnapshot;
         assert.deepStrictEqual(partial.usageLimits, {
           checkedAt: "2026-04-10T00:00:02.000Z",
-          windows: [weekly],
+          windows: [{ ...weekly, observedAt: "2026-04-10T00:00:02.000Z" }],
           unavailable: failedLimits.unavailable,
         });
         yield* provider.applyUsageLimits({
           checkedAt: "2026-04-10T00:00:03.000Z",
           windows: [{ ...weekly }],
         });
-        assert.strictEqual(yield* provider.getSnapshot, partial);
+        // An unchanged window keeps the time it was first observed; only checkedAt advances.
+        assert.deepStrictEqual((yield* provider.getSnapshot).usageLimits, {
+          checkedAt: "2026-04-10T00:00:03.000Z",
+          windows: [{ ...weekly, observedAt: "2026-04-10T00:00:02.000Z" }],
+          unavailable: failedLimits.unavailable,
+        });
         assert.deepStrictEqual((yield* provider.refresh).usageLimits, failedLimits);
 
         const completeLimits = {
