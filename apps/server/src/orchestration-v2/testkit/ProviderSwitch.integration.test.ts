@@ -1875,6 +1875,155 @@ describe("orchestration v2 provider switching", () => {
     ),
   );
 
+  it.live.each(["renewed", "refused-again", "other-error"] as const)(
+    "renews a session refused by safeguards on the next prompt: %s",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const cwd = yield* checkpointWorkspace("claude-refused-session");
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const injectedHistory = yield* Ref.make<ReadonlyArray<unknown>>([]);
+          const generation = yield* Ref.make(0);
+          const rejectedNativeThreads = yield* Ref.make<ReadonlySet<string>>(new Set());
+          const refusal = "API Error: Claude's safeguards flagged this session. FLAGGED_REPLY";
+          const registry = ProviderAdapterRegistry.layerFromAdapters([
+            makeTestAdapter({
+              instanceId: CLAUDE_MODEL_SELECTION.instanceId,
+              driver: CLAUDE_DRIVER,
+              capabilities: ClaudeProviderCapabilitiesV2,
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              capturedTurns,
+              injectedHistory,
+              nativeThreadGeneration: generation,
+              rejectedNativeThreads,
+              failedRunOrdinals: new Set(scenario === "refused-again" ? [2, 3] : [2]),
+              failure: makeProviderFailure(
+                scenario === "other-error"
+                  ? { code: "other", message: "Internal server error", class: "provider_error" }
+                  : {
+                      code: "model_refusal",
+                      message: refusal,
+                      class: "provider_error",
+                      retryable: false,
+                    },
+              ),
+              responseByRunOrdinal: { 1: "BASELINE_OK", 3: "RENEWED_OK", 4: "FOLLOWUP_OK" },
+            }),
+          ]);
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const dispatch = Effect.fn("refusedSession.dispatch")(function* (
+              ordinal: number,
+              text: string,
+            ) {
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make(`refused:${ordinal}`),
+                threadId,
+                messageId: MessageId.make(`refused:${ordinal}`),
+                createdBy: "user",
+                creationSource: "web",
+                text,
+                attachments: [],
+                modelSelection: CLAUDE_MODEL_SELECTION,
+                dispatchMode: { type: "start_immediately" },
+              });
+              yield* orchestrator.streamStoredEvents.pipe(
+                Stream.filter(
+                  ({ event }) =>
+                    event.type === "run.updated" &&
+                    event.payload.ordinal === ordinal &&
+                    (event.payload.status === "completed" || event.payload.status === "failed"),
+                ),
+                Stream.runHead,
+              );
+              yield* worker.drain();
+              return yield* orchestrator.getThreadProjection(threadId);
+            });
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("refused:create"),
+              threadId,
+              projectId,
+              createdBy: "user",
+              creationSource: "web",
+              title: "Refused Claude session",
+              modelSelection: CLAUDE_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+            });
+            assert.equal(
+              (yield* dispatch(1, "Reply BASELINE_OK; remember the constraint")).runs.at(-1)
+                ?.status,
+              "completed",
+            );
+            assert.equal((yield* dispatch(2, "FLAGGED_PROMPT")).runs.at(-1)?.status, "failed");
+            const renewed = yield* dispatch(3, "carry on");
+            const turns = yield* Ref.get(capturedTurns);
+            if (scenario === "other-error") {
+              assert.equal(yield* Ref.get(generation), 1);
+              assert.equal(turns[2]!.nativeThreadId, turns[1]!.nativeThreadId);
+              assert.lengthOf(renewed.contextHandoffs, 0);
+              return;
+            }
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.notEqual(turns[2]!.nativeThreadId, turns[1]!.nativeThreadId);
+            assert.equal(turns[2]!.providerThreadId, turns[1]!.providerThreadId);
+            assert.equal(renewed.thread.title, "Refused Claude session");
+            assert.isTrue(
+              renewed.turnItems.some(
+                (item) =>
+                  item.type === "handoff" &&
+                  item.title === "Session renewed after a safeguards refusal",
+              ),
+            );
+            const delivered = `${yield* encodeJson(yield* Ref.get(injectedHistory))}\n${turns[2]!.text}`;
+            assert.include(delivered, "remember the constraint");
+            assert.include(delivered, "BASELINE_OK");
+            assert.notInclude(delivered, "FLAGGED_PROMPT");
+            assert.notInclude(delivered, "FLAGGED_REPLY");
+            if (scenario === "renewed") {
+              assert.equal(renewed.runs.at(-1)?.status, "completed");
+              const next = yield* dispatch(4, "ok");
+              assert.equal(next.runs.at(-1)?.status, "completed");
+              assert.equal(yield* Ref.get(generation), 2);
+              return;
+            }
+            assert.equal(renewed.runs.at(-1)?.status, "failed");
+            const blocked = yield* dispatch(4, "try once more");
+            assert.equal(blocked.runs.at(-1)?.status, "failed");
+            assert.equal(yield* Ref.get(generation), 2);
+            assert.lengthOf(yield* Ref.get(capturedTurns), 3);
+            assert.isTrue(
+              blocked.turnItems.some(
+                (item) =>
+                  item.type === "error" &&
+                  item.title === "Session blocked by safeguards" &&
+                  item.failure.message.includes("Continue the work in a new thread"),
+              ),
+            );
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                {
+                  name: "claude-refused-session",
+                  runtimePolicyOverride: {
+                    cwd,
+                    approvalPolicy: "never",
+                    sandboxPolicy: { type: "readOnly" },
+                  },
+                },
+                registry,
+              ),
+            ),
+          );
+        }),
+      ),
+  );
+
   it.live.each(["native", "legacy"] as const)(
     "starts a replacement native thread as new after the resume fallback with %s attempts",
     (attempts) =>

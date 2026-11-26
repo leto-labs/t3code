@@ -255,6 +255,9 @@ export const isProviderTurnStartRunStateMissingError = Schema.is(
 );
 
 const RESUME_PROMPT = "Continue where you left off.";
+const SAFEGUARDS_RENEWAL_SIGNAL = "safeguards-renewal-handoff";
+const SAFEGUARDS_RENEWAL_LIMIT_MESSAGE =
+  "The provider's safeguards refused this conversation again after T3 renewed its session. Continue the work in a new thread.";
 
 const START_GAVE_UP_MESSAGE =
   "T3 Code could not start this turn. Send the message again; if it keeps failing, check the server logs.";
@@ -1386,6 +1389,14 @@ export const layer: Layer.Layer<
           const createdAt = yield* DateTime.now;
           const history = yield* projectionStore.getTurnStartHistory(input.threadId);
           const boundary = contextBoundaryOrdinal({ runs: projection.runs, turnItems: history });
+          // Replaying a refused request would hand the flagged content to the renewed session.
+          const refusedRunIds = new Set(
+            history.flatMap((item) =>
+              item.type === "error" && item.failure.code === "model_refusal" && item.runId !== null
+                ? [item.runId]
+                : [],
+            ),
+          );
           const from = Math.max(1, boundary);
           const handoff = yield* contextHandoffService.prepareProviderHandoff({
             threadId: projection.thread.id,
@@ -1408,7 +1419,8 @@ export const layer: Layer.Layer<
               ...history.filter((item) =>
                 item.runId === null
                   ? boundary === 0
-                  : projection.runs.some(
+                  : !refusedRunIds.has(item.runId) &&
+                    projection.runs.some(
                       (source) =>
                         source.id === item.runId &&
                         source.ordinal >= boundary &&
@@ -1657,8 +1669,7 @@ export const layer: Layer.Layer<
             handoff.delivery?.nativeThreadId === providerThread.nativeThreadRef?.nativeId &&
             handoff.delivery?.status === "pending",
         );
-        const rejectedHistory = yield* Effect.gen(function* () {
-          if (session.driver !== "codex") return false;
+        const rejection = yield* Effect.gen(function* () {
           const acceptedAttemptIds = new Set(
             projection.providerTurns
               .filter(isDeliveredProviderTurn)
@@ -1695,16 +1706,46 @@ export const layer: Layer.Layer<
             )
           )
             return false;
-          // The native resume RPC can succeed while persisted input still rejects every turn.
-          return (yield* projectionStore.getTurnStartHistory(input.threadId, [previous.id])).some(
-            (item) =>
-              item.type === "error" &&
-              item.nodeId === previous.rootNodeId &&
-              (item.failure.code === "invalid_encrypted_content" ||
-                classifyCodexManagedError(item.failure.message)?.code ===
-                  "invalid_encrypted_content"),
+          const previousItems = yield* projectionStore.getTurnStartHistory(input.threadId, [
+            previous.id,
+          ]);
+          const previousFailures = previousItems.flatMap((item) =>
+            item.type === "error" && item.nodeId === previous.rootNodeId ? [item.failure] : [],
           );
+          // A flagged native session refuses every later turn, so the next turn renews it once.
+          if (previousFailures.some((failure) => failure.code === "model_refusal")) {
+            // Refused again on the session a summary just opened: renewing again cannot help.
+            return projection.contextHandoffs.some(
+              (handoff) =>
+                handoff.targetRunId === previous.id && handoff.strategy === "full_thread_summary",
+            )
+              ? ("refusal_after_renewal" as const)
+              : ("refusal" as const);
+          }
+          if (session.driver !== "codex") return false;
+          // The native resume RPC can succeed while persisted input still rejects every turn.
+          return previousFailures.some(
+            (failure) =>
+              failure.code === "invalid_encrypted_content" ||
+              classifyCodexManagedError(failure.message)?.code === "invalid_encrypted_content",
+          )
+            ? ("encrypted_content" as const)
+            : false;
         });
+        if (rejection === "refusal_after_renewal") {
+          yield* settleStartFailure({
+            signal: "safeguards-renewal-limit",
+            title: "Session blocked by safeguards",
+            error: new ProviderAdapter.ProviderAdapterProtocolError({
+              driver: session.driver,
+              detail: SAFEGUARDS_RENEWAL_LIMIT_MESSAGE,
+            }),
+            message: SAFEGUARDS_RENEWAL_LIMIT_MESSAGE,
+          });
+          return undefined;
+        }
+        const renewsRefusedSession = rejection === "refusal";
+        const rejectedHistory = rejection !== false;
         // A fresh session would orphan background work still running on the native thread.
         const hasPendingWork = (thread: OrchestrationV2ProviderThread) =>
           session.hasPendingBackgroundWorkForThread?.(thread, { includeSubagents: true }) ??
@@ -1831,11 +1872,13 @@ export const layer: Layer.Layer<
             ? "uncertain_history_delivery"
             : nativeSessionLacksKeptTurns
               ? "native_session_lacks_kept_turns"
-              : rejectedHistory
-                ? "rejected_native_history"
-                : resumed._tag === "Success"
-                  ? "handoff_budget_exhausted"
-                  : "resume_failed",
+              : renewsRefusedSession
+                ? "safeguards_refusal"
+                : rejectedHistory
+                  ? "rejected_native_history"
+                  : resumed._tag === "Success"
+                    ? "handoff_budget_exhausted"
+                    : "resume_failed",
           errorTag: resumed._tag === "Failure" ? resumed.failure._tag : "ContextHandoffBudgetError",
         });
         const replacement = yield* loadFromProvider(
@@ -1889,7 +1932,7 @@ export const layer: Layer.Layer<
         // Stable per run so a retried start reuses the reserved run-start position.
         const handoffTurnItemId = idAllocator.derive.runSignalTurnItem({
           runId,
-          signal: "resume-fallback-handoff",
+          signal: renewsRefusedSession ? SAFEGUARDS_RENEWAL_SIGNAL : "resume-fallback-handoff",
         });
         const handoffTurnItem: OrchestrationV2TurnItem = {
           id: handoffTurnItemId,
@@ -1909,7 +1952,9 @@ export const layer: Layer.Layer<
             placement: "run_start",
           }),
           status: "completed",
-          title: "Recovered context",
+          title: renewsRefusedSession
+            ? "Session renewed after a safeguards refusal"
+            : "Recovered context",
           startedAt: createdAt,
           completedAt: createdAt,
           updatedAt: createdAt,
