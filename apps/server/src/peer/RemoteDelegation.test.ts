@@ -1159,9 +1159,13 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect.each(["answer", "finish"] as const)(
-  "a remote question wakes the parent and clears on %s",
-  (clearedBy) =>
+it.effect.each([
+  { clearedBy: "answer", blocking: false, count: 1 },
+  { clearedBy: "finish", blocking: true, count: 1 },
+  { clearedBy: "cancel", blocking: true, count: 2 },
+] as const)(
+  "remote question updates reach the parent and clear on $clearedBy",
+  ({ clearedBy, blocking, count }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const thread = yield* makeBoxThread;
@@ -1178,10 +1182,13 @@ it.effect.each(["answer", "finish"] as const)(
           knownPendingQuestions: [],
         });
 
-        const requestId = RuntimeRequestId.make("request:box-question");
+        const questions = Array.from({ length: count }, (_, index) => ({
+          id: RuntimeRequestId.make(`request:box-question:${index}`),
+          blocking,
+        }));
         const afterSequence = yield* a.threads.getThreadEventSequence(parentThreadId);
-        yield* SubscriptionRef.set(thread.questions, [{ id: requestId, blocking: true }]);
-        const wake = yield* a.orchestrator
+        yield* SubscriptionRef.set(thread.questions, questions);
+        yield* a.orchestrator
           .streamStoredEventsFrom({
             threadId: parentThreadId,
             afterSequence,
@@ -1193,25 +1200,103 @@ it.effect.each(["answer", "finish"] as const)(
                 event.type === "message.updated" &&
                 event.payload.notification?.source.kind === "delegated_task",
             ),
-            Stream.runHead,
-            Effect.flatMap(Effect.fromOption),
+            Stream.take(count),
+            Stream.runDrain,
           );
         yield* a.worker.drain();
-        expect(wake.event.payload).toMatchObject({
-          text: expect.stringContaining(`environmentId ${box.environmentId}`),
-          notification: { outcome: "updated", source: { taskIds: [task.taskId] } },
-        });
-        const assertQuestion = (pending: boolean) =>
+        const readWakes = a.projections
+          .getThreadRecords(parentThreadId, ["runs", "messages"])
+          .pipe(
+            Effect.map(({ runs, messages }) =>
+              messages.flatMap((message) =>
+                message.notification?.source.kind === "delegated_task" &&
+                message.notification.outcome === "updated"
+                  ? [{ message, run: runs.find((run) => run.userMessageId === message.id) }]
+                  : [],
+              ),
+            ),
+          );
+        for (const { message } of yield* readWakes) {
+          expect(message).toMatchObject({
+            text: expect.stringContaining(`environmentId ${box.environmentId}`),
+            notification: { outcome: "updated", source: { taskIds: [task.taskId] } },
+          });
+        }
+        const assertSummary = (pending: boolean, status = "running") =>
           Effect.gen(function* () {
-            const status = yield* a.call("task_status", { taskId: task.taskId });
-            expect(status.structuredContent).toMatchObject({ hasPendingQuestion: pending });
             const summary = yield* a.call("t3_thread_read", { threadId: parentThreadId });
             expect(summary.structuredContent).toMatchObject({
-              thread: { status: pending ? "waiting" : "running", pendingRequestCount: +pending },
+              thread: {
+                status,
+                pendingRequestCount: 0,
+                pendingRemoteChildQuestionCount: pending ? count : 0,
+              },
             });
+            const listed = yield* a.call("t3_thread_list", { statuses: [status] });
+            expect(listed.structuredContent).toMatchObject({
+              threads: [expect.objectContaining({ threadId: parentThreadId, status })],
+            });
+          });
+        const assertQuestion = (pending: boolean) =>
+          Effect.gen(function* () {
+            const taskStatus = yield* a.call("task_status", { taskId: task.taskId });
+            expect(taskStatus.structuredContent).toMatchObject({
+              hasPendingQuestion: pending && blocking,
+            });
+            yield* assertSummary(pending);
           });
         yield* assertQuestion(true);
 
+        const reportAgain = (suffix: string) =>
+          a.threads.dispatch({
+            type: "delegated_task.remote.questions",
+            commandId: CommandId.make(`command:remote-question-repeat:${suffix}`),
+            parentThreadId,
+            taskId: task.taskId,
+            pendingQuestions: questions,
+          });
+        if (clearedBy === "cancel") {
+          yield* reportAgain("duplicate");
+          const wakes = yield* readWakes;
+          expect(wakes).toHaveLength(count);
+          for (const { run } of wakes) {
+            expect(run?.status).toBe("queued");
+            yield* a.threads.dispatch({
+              type: "queued-run.cancel",
+              commandId: CommandId.make(`command:clear-queue-to-test-idle:${run!.id}`),
+              threadId: parentThreadId,
+              runId: run!.id,
+            });
+          }
+          const parent = yield* a.projections.getThreadRecords(parentThreadId, ["runs"]);
+          const run = parent.runs.find(({ id }) => id === parentRunId)!;
+          const now = yield* DateTime.now;
+          yield* a.sink.write({
+            events: [
+              {
+                type: "run.updated",
+                id: EventId.make("event:parent-idle-with-remote-questions"),
+                threadId: parentThreadId,
+                runId: parentRunId,
+                occurredAt: now,
+                payload: { ...run, status: "completed", completedAt: now },
+              },
+            ],
+          });
+          yield* assertSummary(true, "waiting");
+          yield* a.sink.write({
+            events: [
+              {
+                type: "run.updated",
+                id: EventId.make("event:parent-runs-again-with-remote-questions"),
+                threadId: parentThreadId,
+                runId: parentRunId,
+                occurredAt: now,
+                payload: run,
+              },
+            ],
+          });
+        }
         const beforeClear = yield* a.threads.getThreadEventSequence(parentThreadId);
         if (clearedBy === "answer") {
           yield* SubscriptionRef.set(thread.questions, []);
@@ -1222,18 +1307,23 @@ it.effect.each(["answer", "finish"] as const)(
               eventType: "subagent.updated",
             })
             .pipe(Stream.runHead);
-        } else {
+        } else if (clearedBy === "finish") {
           yield* Ref.set(thread.status, "completed");
           yield* Deferred.succeed(thread.finished, undefined);
           yield* taskResult(a, task.taskId);
+        } else {
+          const cancelled = yield* a.call("task_cancel", { taskId: task.taskId });
+          expect(cancelled.structuredContent).toMatchObject({ status: "cancel_requested" });
+          yield* taskResult(a, task.taskId);
+          yield* reportAgain("late");
         }
         yield* a.worker.drain();
         yield* assertQuestion(false);
-        const parent = yield* a.projections.getThreadRecords(parentThreadId, ["runs", "messages"]);
-        const message = parent.messages.find((message) => message.text.includes(requestId));
-        expect(parent.runs.find((run) => run.userMessageId === message?.id)?.status).toBe(
-          "cancelled",
-        );
+        const wakes = yield* readWakes;
+        expect(wakes.map(({ run }) => run?.status)).toEqual(questions.map(() => "cancelled"));
+        expect(
+          questions.every(({ id }) => wakes.some(({ message }) => message.text.includes(id))),
+        ).toBe(true);
       }),
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

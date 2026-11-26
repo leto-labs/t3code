@@ -15,6 +15,8 @@ import {
   isDelegatedAppThread,
   isListedThreadLineage,
   isOrchestrationV2WorkActive,
+  MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH,
+  MAX_REMOTE_DELEGATED_TASK_QUESTIONS,
   MessageId,
   OrchestrationV2StopWorkflowError,
   type OrchestrationV2StopWorkflowInput,
@@ -470,7 +472,12 @@ export interface ThreadManagementServiceShape {
   readonly getShellSnapshot: (
     options?: Pick<
       ShellSnapshotOptions,
-      "location" | "projectId" | "unsettledOnly" | "worktreePath" | "threadIds"
+      | "location"
+      | "projectId"
+      | "unsettledOnly"
+      | "worktreePath"
+      | "threadIds"
+      | "includeBlockingRemoteQuestions"
     >,
   ) => Effect.Effect<OrchestrationV2ThreadShellSnapshot, Orchestrator.OrchestratorV2Error>;
   readonly listActiveSubagentThreadIds: Orchestrator.OrchestratorV2["Service"]["listActiveSubagentThreadIds"];
@@ -1216,7 +1223,8 @@ const make = Effect.gen(function* () {
     });
     const knownQuestions = input.knownPendingQuestions;
     const changedQuestions = Effect.fn("ThreadManagementService.changedQuestions")(function* (
-      run: OrchestrationV2Run,
+      currentRun: OrchestrationV2Run,
+      laterRuns: ReadonlyArray<OrchestrationV2Run>,
     ) {
       if (knownQuestions === undefined) return undefined;
       const { runtimeRequests } = yield* getProjectThreadRecords(input, ["runtimeRequests"], {
@@ -1226,21 +1234,32 @@ const make = Effect.gen(function* () {
         (request) =>
           request.kind === "user_input" &&
           request.status === "pending" &&
+          request.id.length <= MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH &&
           request.responseCapability.type !== "not_resumable",
       );
       if (requests.length === 0) return knownQuestions.length === 0 ? undefined : [];
+      const runIds = new Set([currentRun.id]);
+      for (const run of laterRuns) {
+        if (run.ordinal > currentRun.ordinal && !isTerminalRunStatus(run.status)) {
+          runIds.add(run.id);
+        }
+      }
       const { nodes } = yield* getProjectThreadRecords(input, ["nodes"], {
         nodeIds: requests.map((request) => request.nodeId),
       });
       const runNodes = new Set(
-        nodes.filter((node) => node.runId === run.id).map((node) => node.id),
+        nodes
+          .filter((node) => node.runId !== null && runIds.has(node.runId))
+          .map((node) => node.id),
       );
       const questions = requests
         .filter((request) => runNodes.has(request.nodeId))
         .map((request) => ({
           id: request.id,
           blocking: request.responseCapability.type === "live",
-        }));
+        }))
+        .sort((left, right) => Number(right.blocking) - Number(left.blocking))
+        .slice(0, MAX_REMOTE_DELEGATED_TASK_QUESTIONS);
       return questions.length === knownQuestions.length &&
         questions.every(
           (question, index) =>
@@ -1257,7 +1276,9 @@ const make = Effect.gen(function* () {
       const resultRun =
         current.settled && untilDelegatedWorkSettled ? yield* delegatedWorkResult : undefined;
       const settled = current.settled && (!untilDelegatedWorkSettled || resultRun !== undefined);
-      const pendingQuestions = settled ? undefined : yield* changedQuestions(current.run);
+      const pendingQuestions = settled
+        ? undefined
+        : yield* changedQuestions(current.run, current.settled ? runs : []);
       return { ...current, settled, resultRun, pendingQuestions };
     });
     const ready = (current: Effect.Success<ReturnType<typeof evaluate>>) =>

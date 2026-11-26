@@ -39,7 +39,7 @@ import {
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2DelegatedFrom,
-  OrchestrationV2DelegatedTaskQuestion,
+  OrchestrationV2DelegatedTaskQuestions,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
 } from "./orchestrationV2.ts";
@@ -252,7 +252,7 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   resultContextTransferId: Schema.NullOr(ContextTransferId),
   hasPendingQuestion: Schema.Boolean.annotate({
     description:
-      "The child has a pending question. Answer with `t3_pending_request` using `childThreadId` or the environment and thread IDs in `remoteChild`.",
+      "A question blocks the child. Answer with `t3_pending_request` using `childThreadId` or the environment and thread IDs in `remoteChild`.",
   }),
   pendingApproval: Schema.NullOr(
     Schema.Struct({ requestId: RuntimeRequestId, kind: ProviderRequestKind, runId: RunId }),
@@ -498,6 +498,7 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   runCount: NonNegativeInt,
   itemCount: NonNegativeInt,
   pendingRequestCount: NonNegativeInt,
+  pendingRemoteChildQuestionCount: Schema.optional(NonNegativeInt),
   archived: Schema.Boolean,
   settled: Schema.Boolean,
   settledAt: Schema.NullOr(IsoDateTime),
@@ -597,7 +598,7 @@ export const OrchestratorMcpThreadWaitInput = Schema.Struct({
   runId: Schema.optional(RunId),
   timeoutMs: Schema.optional(Schema.Finite),
   /** Remote delegation passes its last snapshot to wait for a change. */
-  knownPendingQuestions: Schema.optional(Schema.Array(OrchestrationV2DelegatedTaskQuestion)),
+  knownPendingQuestions: Schema.optional(OrchestrationV2DelegatedTaskQuestions),
   untilDelegatedWorkSettled: Schema.optional(
     Schema.Boolean.annotate({
       description:
@@ -618,7 +619,7 @@ export const OrchestratorMcpThreadWaitResult = Schema.Struct({
   runId: Schema.NullOr(RunId),
   status: OrchestratorMcpThreadStatus,
   timedOut: Schema.Boolean,
-  pendingQuestions: Schema.optional(Schema.Array(OrchestrationV2DelegatedTaskQuestion)),
+  pendingQuestions: Schema.optional(OrchestrationV2DelegatedTaskQuestions),
   next: Schema.optional(OrchestratorMcpRunningTaskNext),
   /** With untilDelegatedWorkSettled, once settled: the run whose reply is the thread's result. */
   resultRun: Schema.optional(Schema.Struct({ runId: RunId, status: OrchestrationV2RunStatus })),

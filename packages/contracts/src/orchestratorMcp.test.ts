@@ -1,5 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
+import {
+  MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH,
+  MAX_REMOTE_DELEGATED_TASK_QUESTIONS,
+} from "./orchestrationV2.ts";
 
 import {
   OrchestratorMcpDelegateTaskInput,
@@ -80,5 +84,35 @@ describe("orchestrator MCP contracts", () => {
         next,
       }).next,
     ).toBe(next);
+  });
+
+  it("rejects oversized remote question updates", () => {
+    const result = {
+      threadId: "thread-child-1",
+      runId: "run-child-1",
+      status: "waiting",
+      timedOut: false,
+    };
+    const questions = Array.from({ length: MAX_REMOTE_DELEGATED_TASK_QUESTIONS }, (_, index) => ({
+      id: `request-${index}`,
+      blocking: true,
+    }));
+    expect(
+      decodeThreadWaitResult({ ...result, pendingQuestions: questions }).pendingQuestions,
+    ).toEqual(questions);
+    expect(() =>
+      decodeThreadWaitResult({
+        ...result,
+        pendingQuestions: [...questions, { id: "extra", blocking: true }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeThreadWaitResult({
+        ...result,
+        pendingQuestions: [
+          { id: "x".repeat(MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH + 1), blocking: true },
+        ],
+      }),
+    ).toThrow();
   });
 });

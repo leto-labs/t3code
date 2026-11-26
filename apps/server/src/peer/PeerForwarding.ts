@@ -98,6 +98,9 @@ export const remoteTarget = (scope: Scope, environmentId: EnvironmentId | undefi
 // Older peers reject beforePosition during parameter validation.
 const BEFORE_POSITION_REFUSAL =
   /^Invalid parameters for tool 't3_thread_read': Unknown arguments? (?:"[^"]+", )*"beforePosition"(?:, "[^"]+")*\. Accepted arguments: /;
+const THREAD_WAIT_ARGUMENT_REFUSAL =
+  /^Invalid parameters for tool 't3_thread_wait': Unknown arguments? ((?:"[^"]+", )*"[^"]+")\. Accepted arguments: /;
+const THREAD_WAIT_COMPAT_OPTIONS = ["knownPendingQuestions", "untilDelegatedWorkSettled"] as const;
 export const refusesBeforePosition = (failure: {
   readonly code: string;
   readonly message: string;
@@ -117,6 +120,10 @@ const make = Effect.gen(function* () {
   const links = yield* PeerLinks.PeerLinks;
   const crypto = yield* Digest.Digest;
   const threads = yield* ThreadManagement.ThreadManagementService;
+  const legacyThreadWaitOptions = new Map<
+    EnvironmentId,
+    Set<(typeof THREAD_WAIT_COMPAT_OPTIONS)[number]>
+  >();
 
   /**
    * The caller's own limits and thread, which travel with every forwarded call: the peer sees only the
@@ -232,14 +239,13 @@ const make = Effect.gen(function* () {
       input,
     );
 
-  const waitForThread: PeerForwarding["Service"]["waitForThread"] = (
-    scope,
-    environmentId,
-    input,
-  ) => {
-    const { knownPendingQuestions, ...params } = input;
-    const wait = (questions: typeof knownPendingQuestions) =>
-      forward<OrchestratorMcpThreadWaitResult>(
+  const waitForThread: PeerForwarding["Service"]["waitForThread"] = Effect.fn(
+    "PeerForwarding.waitForThread",
+  )(function* (scope, environmentId, input) {
+    const { knownPendingQuestions, untilDelegatedWorkSettled, ...params } = input;
+    const wait = () => {
+      const unsupported = legacyThreadWaitOptions.get(environmentId);
+      return forward<OrchestratorMcpThreadWaitResult>(
         scope,
         "t3_thread_wait",
         OrchestratorMcpThreadWaitInput,
@@ -251,21 +257,37 @@ const make = Effect.gen(function* () {
             MAX_WAIT_TIMEOUT_MS,
             Math.max(1, params.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
           ),
-          ...(questions === undefined ? {} : { knownPendingQuestions: questions }),
+          ...(knownPendingQuestions === undefined || unsupported?.has("knownPendingQuestions")
+            ? {}
+            : { knownPendingQuestions }),
+          ...(untilDelegatedWorkSettled === undefined ||
+          unsupported?.has("untilDelegatedWorkSettled")
+            ? {}
+            : { untilDelegatedWorkSettled }),
         },
       );
-    return wait(knownPendingQuestions).pipe(
+    };
+    const refusedOptions = (error: OrchestratorMcpFailure) => {
+      const args =
+        error.code === "invalid_request"
+          ? THREAD_WAIT_ARGUMENT_REFUSAL.exec(error.message)?.[1]
+          : undefined;
+      return THREAD_WAIT_COMPAT_OPTIONS.filter(
+        (option) => input[option] !== undefined && args?.includes(`"${option}"`),
+      );
+    };
+    return yield* wait().pipe(
       Effect.catchIf(
-        (error) =>
-          knownPendingQuestions !== undefined &&
-          error.code === "invalid_request" &&
-          error.message.startsWith(
-            "Invalid parameters for tool 't3_thread_wait': Unknown argument \"knownPendingQuestions\".",
-          ),
-        () => wait(undefined),
+        (error) => refusedOptions(error).length > 0,
+        (error) => {
+          const unsupported = legacyThreadWaitOptions.get(environmentId) ?? new Set();
+          for (const option of refusedOptions(error)) unsupported.add(option);
+          legacyThreadWaitOptions.set(environmentId, unsupported);
+          return wait();
+        },
       ),
     );
-  };
+  });
 
   // While the beta is off, agents start nothing over links. Tasks already running there keep
   // following through readThread, waitForThread and interruptThread, so they still finish.

@@ -512,6 +512,7 @@ export interface ShellSnapshotOptions {
   readonly familyOf?: ThreadId;
   readonly worktreePath?: string;
   readonly threadIds?: ReadonlyArray<ThreadId>;
+  readonly includeBlockingRemoteQuestions?: boolean;
 }
 
 /** What a shell subscriber's trims read from an active thread, without building its shell. */
@@ -1291,6 +1292,7 @@ type ShellThreadRow = {
   readonly active_run_id: string | null;
   readonly active_run_status: string | null;
   readonly activity_run_status: string | null;
+  readonly has_blocking_remote_question: number;
   readonly activity_run_started_at: string | null;
   readonly last_error: string | null;
   readonly terminal_failure_payload_json: string | null;
@@ -2149,6 +2151,7 @@ type ShellThreadState = {
   readonly latestRunBackgroundWake: boolean;
   readonly activeRunId: RunId | null;
   readonly blockedOnThreadWait: boolean;
+  readonly hasBlockingRemoteQuestion?: boolean;
   readonly activityRunStatus: ShellActivityRunStatus | null;
   readonly activityRunStartedAt: DateTime.Utc | null;
   readonly lastError: string | null;
@@ -2327,6 +2330,7 @@ function shellFromState(input: {
     latestRunBackgroundWake: input.state.latestRunBackgroundWake,
     activeRunId: input.state.activeRunId,
     blockedOnThreadWait: input.state.blockedOnThreadWait,
+    ...(input.state.hasBlockingRemoteQuestion ? { hasBlockingRemoteQuestion: true } : {}),
     activityRunStatus: input.state.activityRunStatus,
     activityRunStartedAt: input.state.activityRunStartedAt,
     status: input.state.latestRunStatus,
@@ -8590,6 +8594,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         familyOf,
         worktreePath,
         threadIds,
+        includeBlockingRemoteQuestions = false,
         listedOnly = false,
         includeDeleted = false,
       }: ShellSnapshotOptions & {
@@ -8623,6 +8628,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ${isBackgroundWakeShellRun("presented")} AS latest_run_background_wake,
               active.run_id AS active_run_id,
               active.status AS active_run_status,
+              ${
+                includeBlockingRemoteQuestions
+                  ? sql`EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_subagents task
+                    CROSS JOIN json_each(task.payload_json, '$.remoteChild.pendingQuestions') question
+                    WHERE task.thread_id = t.thread_id AND task.origin = 'app_owned'
+                      AND task.child_thread_id IS NULL
+                      AND task.status IN ('pending','starting','running','waiting')
+                      AND json_extract(question.value, '$.blocking') IS 1
+                  )`
+                  : sql`0`
+              } AS has_blocking_remote_question,
               (
                 SELECT r.status
                 -- Read active runs by status. Walking the ordinal index to skip this sort
@@ -9398,6 +9415,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           latestRunStopRequested,
           latestRunBackgroundWake,
           activeRunId: row.active_run_id === null ? null : RunId.make(row.active_run_id),
+          ...(row.has_blocking_remote_question === 1 ? { hasBlockingRemoteQuestion: true } : {}),
           blockedOnThreadWait: deriveBlockedOnThreadWait({
             activeRun:
               row.active_run_id === null || row.active_run_status !== "running"
