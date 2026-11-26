@@ -14,6 +14,7 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as ThreadViewers from "./ThreadViewers.ts";
 import * as Context from "effect/Context";
@@ -211,6 +212,7 @@ export interface EventSinkV2Shape {
     readonly acceptedAt: DateTime.Utc;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
+    readonly existingWorktreeHandoff?: { readonly path: string; readonly projectId: ProjectId };
     readonly cancelUnsettledEffects?: {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
@@ -805,6 +807,81 @@ const layerBase: Layer.Layer<
             return { ...existing, committed: false as const, cancelledEffectIds: [] };
           }
 
+          const reject = Effect.fn("orchestrationV2.EventSink.rejectCommandCommit")(function* (
+            error: string,
+          ) {
+            const receipt: CommandReceiptStore.CommandReceiptV2 = {
+              commandId: input.commandId,
+              threadId: input.threadId,
+              commandType: input.commandType,
+              acceptedAt: input.acceptedAt,
+              resultSequence: yield* eventStore.latestSequence({ threadId: input.threadId }),
+              status: "rejected",
+              error,
+            };
+            yield* commandReceipts.upsert(receipt);
+            return { receipt, storedEvents: [], committed: false as const, cancelledEffectIds: [] };
+          });
+
+          if (input.existingWorktreeHandoff !== undefined) {
+            const { path, projectId } = input.existingWorktreeHandoff;
+            const [liveThread] = yield* sql`
+              SELECT 1 FROM orchestration_v2_projection_threads
+              WHERE thread_id = ${input.threadId} AND project_id = ${projectId}
+                AND deleted_at IS NULL AND archived_at IS NULL
+            `;
+            if (liveThread === undefined) {
+              return yield* reject(
+                "The thread was archived, deleted, or moved to another project during the handoff.",
+              );
+            }
+            const [activeChild] = yield* sql`
+              SELECT 1 FROM orchestration_v2_projection_subagents AS task
+              WHERE task.thread_id = ${input.threadId}
+                AND task.status IN ('pending', 'running', 'waiting')
+                AND (
+                  (task.origin = 'app_owned' AND (
+                    task.child_thread_id IS NOT NULL
+                    OR json_type(task.payload_json, '$.remoteChild') = 'object'
+                  ))
+                  OR (task.origin = 'provider_native' AND task.subagent_id IN (
+                    SELECT json_extract(item.payload_json, '$.subagentId')
+                    FROM orchestration_v2_projection_turn_items AS item
+                    WHERE item.thread_id = ${input.threadId} AND item.type = 'subagent'
+                      AND item.status IN ('pending', 'running', 'waiting')
+                  ))
+                )
+              LIMIT 1
+            `;
+            if (activeChild !== undefined) {
+              return yield* reject(
+                "This thread has active delegated tasks or subagents. Finish them before switching worktrees.",
+              );
+            }
+            // Use the worktree path index, then compare with the platform's path rules.
+            const candidates = yield* sql<{
+              readonly thread_id: string;
+              readonly worktree_path: string;
+            }>`
+              SELECT thread_id, json_extract(payload_json, '$.worktreePath') AS worktree_path
+              FROM orchestration_v2_projection_threads
+              WHERE deleted_at IS NULL AND archived_at IS NULL AND thread_id <> ${input.threadId}
+                AND json_extract(payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent'
+                AND CASE WHEN json_valid(payload_json)
+                  THEN lower(rtrim(replace(trim(json_extract(payload_json, '$.worktreePath')), '\\', '/'), '/'))
+                END = lower(rtrim(replace(trim(${path}), '\\', '/'), '/'))
+            `;
+            const target = normalizeProjectPathForComparison(path);
+            const occupant = candidates.find(
+              (row) => normalizeProjectPathForComparison(row.worktree_path) === target,
+            );
+            if (occupant !== undefined) {
+              return yield* reject(
+                `Worktree '${path}' is already bound to thread '${occupant.thread_id}'. Choose an unused worktree.`,
+              );
+            }
+          }
+
           // Planning does not lock the source. Once deletion commits, maintenance
           // can remove its checkpoints, so a new fork must not revive that history.
           if (input.commandType === "thread.fork") {
@@ -817,22 +894,7 @@ const layerBase: Layer.Layer<
                 WHERE thread_id = ${sourceId} AND deleted_at IS NULL
               `;
               if (source.length === 0) {
-                const receipt: CommandReceiptStore.CommandReceiptV2 = {
-                  commandId: input.commandId,
-                  threadId: input.threadId,
-                  commandType: input.commandType,
-                  acceptedAt: input.acceptedAt,
-                  resultSequence: yield* eventStore.latestSequence({ threadId: input.threadId }),
-                  status: "rejected",
-                  error: "Cannot fork a missing or deleted thread.",
-                };
-                yield* commandReceipts.upsert(receipt);
-                return {
-                  receipt,
-                  storedEvents: [],
-                  committed: false as const,
-                  cancelledEffectIds: [],
-                };
+                return yield* reject("Cannot fork a missing or deleted thread.");
               }
             }
           }

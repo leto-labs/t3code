@@ -2858,3 +2858,17 @@ export const make = Effect.gen(function* () {
 
 export const layerVcs = Layer.effect(VcsDriver.VcsDriver, makeVcsDriver);
 export const layer = Layer.effect(GitVcsDriver, make).pipe(Layer.provide(CheckoutCloner.layer));
+
+export const findRegisteredWorktreePath = Effect.fn("GitVcsDriver.findRegisteredWorktreePath")(
+  function* (workspaceRoot: string, requestedPath: string) {
+    const git = yield* GitVcsDriver;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const real = (path: string) => fileSystem.realPath(path).pipe(Effect.orElseSucceed(() => path));
+    const registered = yield* git.listWorktreePaths(workspaceRoot);
+    const requested = yield* real(requestedPath);
+    for (const candidate of registered) {
+      if ((yield* real(candidate)) === requested) return candidate;
+    }
+    return null;
+  },
+);

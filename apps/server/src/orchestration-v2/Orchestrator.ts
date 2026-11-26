@@ -16940,6 +16940,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       } satisfies OrchestratorV2DispatchResult;
     }
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
+    const existingWorktreeHandoff =
+      command.type === "thread.metadata.update" && command.exclusiveWorktree !== undefined
+        ? { path: command.worktreePath, projectId: command.exclusiveWorktree.projectId }
+        : undefined;
     const committed = yield* eventSink
       .commitCommand({
         commandId: command.commandId,
@@ -16960,6 +16964,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 }).pipe(mapDispatchError(command)),
               ],
         effects: plan.effects,
+        ...(existingWorktreeHandoff === undefined ? {} : { existingWorktreeHandoff }),
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),

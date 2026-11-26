@@ -2,23 +2,29 @@ import * as Schema from "effect/Schema";
 
 import { GitRefName, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
-/** Uses the managed worktree folder; handoff detaches the provider, ending this turn and resuming there next run. */
 export const WorktreeMcpHandoffInput = Schema.Struct({
-  branch: GitRefName,
+  branch: Schema.optional(
+    GitRefName.annotate({ description: "New branch name. Required to create a worktree." }),
+  ),
+  existingWorktreePath: Schema.optional(
+    TrimmedNonEmptyString.annotate({
+      description: "Path to a clean worktree of this project with a local branch checked out.",
+    }),
+  ),
   baseRef: Schema.optional(
     GitRefName.annotate({
-      description: "Default: checked-out branch.",
+      description: "New worktrees only. Defaults to the checked-out branch.",
     }),
   ),
   startFromOrigin: Schema.optional(
     Schema.Boolean.annotate({
       description:
-        "True: fetch, start from the remote ref; check `startedFromOrigin`. Default: server setting.",
+        "New worktrees only. Set true to fetch and start from the remote ref. Defaults to the server setting.",
     }),
   ),
   runSetupScript: Schema.optional(
     Schema.Boolean.annotate({
-      description: "Default true.",
+      description: "New worktrees only. Defaults to true.",
     }),
   ),
   continuationPrompt: Schema.optional(
@@ -66,7 +72,7 @@ export type WorktreeMcpContinuationStatus = typeof WorktreeMcpContinuationStatus
 export const WorktreeMcpHandoffResult = Schema.Struct({
   worktreePath: TrimmedNonEmptyString,
   branch: GitRefName,
-  baseRef: GitRefName,
+  baseRef: Schema.NullOr(GitRefName),
   startedFromOrigin: Schema.Boolean,
   setupScript: WorktreeMcpSetupScriptStatus,
   continuation: WorktreeMcpContinuationStatus,

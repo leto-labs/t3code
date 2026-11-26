@@ -452,6 +452,7 @@ it.live.each(["pooled", "exclusive"] as const)(
       const cwd = yield* checkpointWorkspace(`workspace-handoff-${mode}`);
       const handoffCwd = yield* checkpointWorkspace(`workspace-handoff-${mode}-target`);
       const threadId = ThreadId.make(`thread:workspace-handoff:${mode}`);
+      const projectId = ProjectId.make("project:workspace-handoff");
       const state = yield* Ref.make<RestartAdapterState>({
         activeTurn: null,
         opened: [],
@@ -525,7 +526,7 @@ it.live.each(["pooled", "exclusive"] as const)(
           creationSource: "web",
           commandId: CommandId.make("command:workspace-handoff:create"),
           threadId,
-          projectId: ProjectId.make("project:workspace-handoff"),
+          projectId,
           title: "Workspace handoff",
           modelSelection: initialSelection,
           runtimeMode: "full-access",
@@ -604,6 +605,8 @@ it.live.each(["pooled", "exclusive"] as const)(
           threadId,
           branch: "repro-handoff",
           worktreePath: handoffCwd,
+          exclusiveWorktree: { projectId },
+          expectedWorktreePath: cwd,
           continuation: {
             messageId: MessageId.make("message:workspace-handoff:continuation"),
             text: "continue in the worktree",
