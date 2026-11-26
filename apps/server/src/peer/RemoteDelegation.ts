@@ -895,10 +895,23 @@ const make = Effect.gen(function* () {
         // tasks to wake it for the answer, which a task here waits for too.
         // An older peer ignores this and reports the run alone.
         untilDelegatedWorkSettled: true,
+        knownPendingQuestions: remote.pendingQuestions ?? [],
       })
       .pipe(Effect.raceFirst(endedHere));
     // The next look reads the result and stops it there.
     if ("endedHere" in waited) return false;
+    if (waited.pendingQuestions !== undefined) {
+      yield* threads.dispatch({
+        type: "delegated_task.remote.questions",
+        commandId: CommandId.make(
+          `command:remote-task-questions:${taskId}:${yield* random.uuidV4()}`,
+        ),
+        parentThreadId,
+        taskId,
+        pendingQuestions: waited.pendingQuestions,
+      });
+      return false;
+    }
     if (waited.timedOut) return false;
     // A task recorded without its run waits on the thread's latest; a
     // thread there with none has nothing left to wait for.

@@ -422,6 +422,7 @@ export interface ProjectionRecordFilter {
   readonly subagentIds?: ReadonlyArray<NodeId>;
   readonly subagentRunIds?: ReadonlyArray<RunId>;
   readonly subagentChildThreadIds?: ReadonlyArray<ThreadId>;
+  readonly pendingRemoteQuestionsOnly?: true;
   readonly nodeIds?: ReadonlyArray<NodeId>;
   readonly turnItemRequestIds?: ReadonlyArray<RuntimeRequestId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
@@ -4422,6 +4423,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             WHERE ${threadColumn(filter?.subagentIds ?? filter?.subagentChildThreadIds)} = ${threadId}
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentChildThreadIds === undefined ? sql`` : sql`AND child_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentChildThreadIds)}))`}
+              ${filter?.pendingRemoteQuestionsOnly === true ? sql`AND status IN ('pending','starting','running','waiting') AND json_array_length(payload_json, '$.remoteChild.pendingQuestions') > 0` : sql``}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
               ${
                 filter?.omitSettledSubagents === true

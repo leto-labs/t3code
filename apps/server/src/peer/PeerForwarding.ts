@@ -232,21 +232,40 @@ const make = Effect.gen(function* () {
       input,
     );
 
-  const waitForThread: PeerForwarding["Service"]["waitForThread"] = (scope, environmentId, input) =>
-    forward<OrchestratorMcpThreadWaitResult>(
-      scope,
-      "t3_thread_wait",
-      OrchestratorMcpThreadWaitInput,
-      OrchestratorMcpThreadWaitResult,
-      environmentId,
-      {
-        ...input,
-        timeoutMs: Math.min(
-          MAX_WAIT_TIMEOUT_MS,
-          Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
-        ),
-      },
+  const waitForThread: PeerForwarding["Service"]["waitForThread"] = (
+    scope,
+    environmentId,
+    input,
+  ) => {
+    const { knownPendingQuestions, ...params } = input;
+    const wait = (questions: typeof knownPendingQuestions) =>
+      forward<OrchestratorMcpThreadWaitResult>(
+        scope,
+        "t3_thread_wait",
+        OrchestratorMcpThreadWaitInput,
+        OrchestratorMcpThreadWaitResult,
+        environmentId,
+        {
+          ...params,
+          timeoutMs: Math.min(
+            MAX_WAIT_TIMEOUT_MS,
+            Math.max(1, params.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+          ),
+          ...(questions === undefined ? {} : { knownPendingQuestions: questions }),
+        },
+      );
+    return wait(knownPendingQuestions).pipe(
+      Effect.catchIf(
+        (error) =>
+          knownPendingQuestions !== undefined &&
+          error.code === "invalid_request" &&
+          error.message.startsWith(
+            "Invalid parameters for tool 't3_thread_wait': Unknown argument \"knownPendingQuestions\".",
+          ),
+        () => wait(undefined),
+      ),
     );
+  };
 
   // While the beta is off, agents start nothing over links. Tasks already running there keep
   // following through readThread, waitForThread and interruptThread, so they still finish.
