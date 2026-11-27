@@ -19,14 +19,6 @@
       "types": "./src/zip/zipDirectory.ts",
       "default": "./src/zip/zipDirectory.ts"
     },
-    "./live-voice": {
-      "types": "./src/liveVoice/registry.ts",
-      "default": "./src/liveVoice/registry.ts"
-    },
-    "./state/live-voice": {
-      "types": "./src/state/liveVoice.ts",
-      "default": "./src/state/liveVoice.ts"
-    },
     "./zip/error": {
       "types": "./src/zip/zipError.ts",
       "default": "./src/zip/zipError.ts"

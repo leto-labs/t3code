@@ -117,7 +117,6 @@ function layerExecutorFor(input: {
       ProviderSessionManager.ProviderSessionManagerV2.of({
         validateModelSelection: () => Effect.void,
         shutdown: Effect.void,
-        keepAlive: () => Effect.void,
         open: () => Effect.die("unused open"),
         get: () => Effect.succeedNone,
         isLive: () => Effect.succeed(false),

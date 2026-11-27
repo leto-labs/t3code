@@ -31,7 +31,6 @@ import {
   resolveGuestMessage,
   cancelQueuedRun,
   createThread,
-  launchThread,
   deleteThread,
   editQueuedRun,
   interruptThreadTurn,
@@ -244,12 +243,6 @@ export function createThreadEnvironmentAtoms<R, E>(
     create: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:create",
       execute: createThread,
-      scheduler,
-      concurrency,
-    }),
-    launch: createEnvironmentCommand(runtime, {
-      label: "environment-data:commands:thread:launch",
-      execute: launchThread,
       scheduler,
       concurrency,
     }),

@@ -75,8 +75,6 @@ Enable automatic cleanup or run **Delete now** in **Settings → Worktrees → C
 
 Yes—on-device speech on iOS, Android, and macOS 26+ desktop, or via a paired environment on web/desktop/mobile. See [Voice input](./voice-input.md).
 
-On web and desktop you can instead talk to Codex in a voice call on a thread. [Voice calls with Codex](./composer.md#voice-calls-with-codex)
-
 ## Does it work on Windows, Mac, and Linux?
 
 Yes, all three (desktop app and CLI). Note: there is no standalone `t3` binary for Intel Macs (use the desktop app there), and Windows users can also run agents inside WSL. See [Install](./install.md).
