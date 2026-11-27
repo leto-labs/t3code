@@ -14,7 +14,6 @@ const state = vi.hoisted(() => ({
   relatedShells: [] as unknown[],
   threadTitles: {} as Record<string, string>,
   archivedThreads: [] as unknown[],
-  delegatedChildren: [] as unknown[],
 }));
 
 vi.mock(import("../../state/query"), async (original) => ({
@@ -38,7 +37,6 @@ vi.mock(import("../../state/entities"), () => ({
     state.projection === null
       ? []
       : [(state.projection as { thread: unknown }).thread, ...state.relatedShells]) as never,
-  useDelegatedChildren: (() => state.delegatedChildren) as never,
   useProjects: (() => []) as never,
   useHiddenThreadKeys: (() => new Set()) as never,
   useAnyEnvironmentHiding: (() => false) as never,
@@ -85,7 +83,6 @@ function setup() {
   state.relatedShells = [];
   state.threadTitles = { source: "Source" };
   state.archivedThreads = [];
-  state.delegatedChildren = [];
   state.projection = {
     thread: {
       id: threadId,
@@ -458,73 +455,6 @@ it("shows how long a running remote subagent has been running, as a local one do
   // Assert synchronously: expect.element polls on timers this test fakes.
   const row = screen.getByRole("button", { name: new RegExp(remoteTitle) });
   expect(row.element().textContent).toContain("12m");
-});
-
-it.each([
-  ["launched there with t3_thread_launch", false],
-  ["delegated there with delegate_task", true],
-])("lists a running child %s once", async (_source, recordedOnParent) => {
-  setup();
-  const title = "Child running on a linked machine";
-  const remoteEnvironmentId = EnvironmentId.make("remote-env");
-  const remoteThreadId = ThreadId.make("remote-thread");
-  state.delegatedChildren = [
-    {
-      environmentId: remoteEnvironmentId,
-      id: remoteThreadId,
-      title,
-      runtime: null,
-      modelSelection: { instanceId: "provider", model: "model" },
-      source: { status: "running", activityRunStatus: "running" },
-    },
-  ];
-  if (recordedOnParent) {
-    const now = DateTime.makeUnsafe("2026-11-23T12:00:00.000Z");
-    state.projection = {
-      ...(state.projection as Record<string, unknown>),
-      subagents: [
-        {
-          id: NodeId.make("remote-agent"),
-          threadId,
-          runId: null,
-          parentNodeId: NodeId.make("parent"),
-          origin: "app_owned",
-          createdBy: "agent",
-          driver: "remote",
-          providerInstanceId: "provider",
-          providerThreadId: null,
-          childThreadId: null,
-          nativeTaskRef: null,
-          prompt: "Run remote task",
-          title,
-          model: null,
-          status: "running",
-          result: null,
-          startedAt: null,
-          completedAt: null,
-          updatedAt: now,
-          remoteChild: {
-            environmentId: remoteEnvironmentId,
-            threadId: remoteThreadId,
-            label: "VM",
-          },
-        },
-      ],
-    };
-  }
-  await using screen = await render(
-    <ThreadRelationshipsPanel
-      environmentId={environmentId}
-      threadId={threadId}
-      showLineage
-      showSideChats={false}
-    />,
-    { router: "/environment/fork" },
-  );
-
-  await expect.element(screen.getByRole("button", { name: new RegExp(title) })).toBeVisible();
-  expect(screen.getByRole("button", { name: new RegExp(title) }).elements()).toHaveLength(1);
-  await expect.element(screen.getByText("Lineage · 1 running")).toBeVisible();
 });
 
 it("explains why Merge back is unavailable before the fork completes a run", async () => {

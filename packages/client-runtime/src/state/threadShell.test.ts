@@ -15,7 +15,6 @@ import { describe, expect, it } from "vite-plus/test";
 import { PrimaryConnectionTarget } from "../connection/model.ts";
 import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
-import { launchedDelegatedChildren } from "./threadRelationships.ts";
 import { isThreadWorking } from "./threadInbox.ts";
 import {
   childThreadInputsTitle,
@@ -483,56 +482,6 @@ describe("v2 thread shell lists", () => {
     disposeNavigation();
     registry.dispose();
   });
-
-  it.each([
-    ["launched with t3_thread_launch", false],
-    ["delegated with delegate_task", true],
-  ])(
-    "lists a child %s on another environment once, under its parent",
-    (_source, recordedOnParent) => {
-      const { registry, threads, snapshotAtom } = makeHarness([environmentId, remoteEnvironmentId]);
-      const parent = v2ThreadShell;
-      const child = {
-        ...v2ThreadShell,
-        id: ThreadId.make("launched-child"),
-        creationSource: "mcp" as const,
-        delegatedFrom: { environmentId, threadId: parent.id, title: parent.title },
-      };
-      registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: [parent] });
-      registry.set(snapshotAtom(remoteEnvironmentId), { ...v2ShellSnapshot, threads: [child] });
-      const parentRef = { environmentId, threadId: parent.id };
-      const children = threads.delegatedChildrenAtom(parentRef);
-      const disposeNavigation = registry.mount(threads.navigationThreadShellsAtom);
-      const disposeChildren = registry.mount(children);
-
-      // Hidden from the top level, since it shows under its parent.
-      expect(
-        registry
-          .get(threads.navigationThreadShellsAtom)
-          .map((thread) => `${thread.environmentId}/${thread.id}`),
-      ).toEqual([`${environmentId}/${parent.id}`]);
-      // A delegate_task child also has a subagent record on the parent, whose row it keeps.
-      const subagents = recordedOnParent
-        ? [{ remoteChild: { environmentId: remoteEnvironmentId, threadId: child.id, label: "VM" } }]
-        : [];
-      const underParent = [
-        ...launchedDelegatedChildren(registry.get(children), subagents).map(
-          (thread) => `${thread.environmentId}/${thread.id}`,
-        ),
-        ...subagents.map(
-          ({ remoteChild }) => `${remoteChild.environmentId}/${remoteChild.threadId}`,
-        ),
-      ];
-      expect(underParent).toEqual([`${remoteEnvironmentId}/${child.id}`]);
-      // Other parents list nothing.
-      expect(
-        registry.get(threads.delegatedChildrenAtom({ environmentId, threadId: child.id })),
-      ).toEqual([]);
-      disposeChildren();
-      disposeNavigation();
-      registry.dispose();
-    },
-  );
 
   it("brings an approval up a chain of tasks across three environments to its root", () => {
     const thirdEnvironmentId = EnvironmentId.make("third-environment-v2");

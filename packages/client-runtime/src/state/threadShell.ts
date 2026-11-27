@@ -38,7 +38,6 @@ const EMPTY_SIDE_CHATS_BY_PARENT: ReadonlyMap<
   ReadonlyArray<OrchestrationV2ThreadShell>
 > = new Map();
 const EMPTY_THREAD_SHELLS: ReadonlyArray<EnvironmentThreadShell> = Object.freeze([]);
-const EMPTY_DELEGATED_CHILDREN: ReadonlyMap<string, ReadonlyArray<ScopedThreadRef>> = new Map();
 const EMPTY_THREAD_REFS_BY_PROJECT: ReadonlyMap<
   ProjectId,
   ReadonlyArray<ScopedThreadRef>
@@ -769,38 +768,6 @@ export function createEnvironmentThreadShellAtoms(input: {
     return next;
   }).pipe(Atom.withLabel("environment-delegated-under-parent"));
 
-  // Threads linked environments run for a parent (`delegatedFrom`), by the parent's key.
-  // A task launched there has no subagent record on the parent, so its panel reads these.
-  const delegatedChildRefsByParentAtom = Atom.make((get) => {
-    let byParent: Map<string, ScopedThreadRef[]> | undefined;
-    for (const environmentId of enabledEnvironmentIds(get(input.catalogValueAtom))) {
-      for (const thread of get(environmentThreadsAtom(environmentId))) {
-        const parent = thread.delegatedFrom;
-        if (parent === undefined) continue;
-        byParent ??= new Map();
-        const ref = { environmentId, threadId: thread.id };
-        const siblings = byParent.get(threadKey(parent));
-        if (siblings) siblings.push(ref);
-        else byParent.set(threadKey(parent), [ref]);
-      }
-    }
-    return byParent ?? EMPTY_DELEGATED_CHILDREN;
-  }).pipe(Atom.withLabel("environment-delegated-child-refs-by-parent"));
-
-  const delegatedChildrenAtomFamily = Atom.family((key: string) => {
-    let previous = EMPTY_THREAD_SHELLS;
-    return Atom.make((get) => {
-      const refs = get(delegatedChildRefsByParentAtom).get(key);
-      const next =
-        refs === undefined
-          ? EMPTY_THREAD_SHELLS
-          : refs.flatMap((ref) => get(quietThreadShellAtomFamily(threadKey(ref))) ?? []);
-      if (arrayElementsEqual(previous, next)) return previous;
-      previous = next;
-      return next;
-    }).pipe(Atom.withLabel(`environment-delegated-children:${key}`));
-  });
-
   let previousNavigationShells: ReadonlyArray<EnvironmentThreadShell> = [];
   const navigationThreadShellsAtom = Atom.make((get) => {
     const next: EnvironmentThreadShell[] = [];
@@ -844,7 +811,5 @@ export function createEnvironmentThreadShellAtoms(input: {
     quietThreadShellAtom: (ref: ScopedThreadRef) => quietThreadShellAtomFamily(threadKey(ref)),
     childThreadInputsAtom: (ref: ScopedThreadRef) => childThreadInputsAtomFamily(threadKey(ref)),
     sideChatsAtom: (ref: ScopedThreadRef) => sideChatsAtomFamily(threadKey(ref)),
-    /** Threads linked environments run for this one, launched or delegated there. */
-    delegatedChildrenAtom: (ref: ScopedThreadRef) => delegatedChildrenAtomFamily(threadKey(ref)),
   };
 }
