@@ -112,6 +112,17 @@ Most code changes do not need an internal documentation change. Agents can read 
 - Do not commit implementation plans, research notes, or agent scratch files (keep temporary material outside the worktree).
 - Track active maintainer work in its GitHub issue or project item; external proposals belong in Ideas discussions. A merged PR is the implementation record.
 
+## Fork: models and delegation
+
+This fork runs agents through pooled provider instances. Pick by the job:
+
+- **Main thread, hard problems:** Gemini 4 Neon at high effort through `antigravity`.
+- **Second opinion, or fallback when Neon is unavailable:** Claude Opus through `claude_auto`.
+- **Implementation lanes and independent reviews:** GPT Sol through `codex_auto`. Codex work in this fork may use the `ultrafast` service tier.
+- **Deep, open-ended problems:** Fable.
+
+Route Codex through `codex_auto`, Claude through `claude_auto` and Gemini through `antigravity`, never a single account instance, so the pools can balance quota.
+
 ## Where code lives
 
 - `apps/server` - WebSocket, event-sourced orchestration (`Orchestrator` → `EventSink` → `EffectWorker`), providers, checkpointing. Read [02_effect-services.md](docs/internals/02_effect-services.md) and `.repos/effect/LLMS.md`.
