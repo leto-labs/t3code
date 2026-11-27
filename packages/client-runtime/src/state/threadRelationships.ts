@@ -1,5 +1,7 @@
 import {
   isOrchestrationV2WorkActive,
+  type EnvironmentId,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadShell,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -157,6 +159,26 @@ export function isParentThreadRelationship(
   currentThreadId: ThreadId,
 ): boolean {
   return edge.kind !== "transfer" && edge.targetThreadId === currentThreadId;
+}
+
+/**
+ * Threads linked environments run for a parent that no subagent record on it names: tasks
+ * launched there with `delegatedFrom`. A `delegate_task` child keeps its record's row.
+ */
+export function launchedDelegatedChildren<
+  Child extends { readonly environmentId: EnvironmentId; readonly id: ThreadId },
+>(
+  children: ReadonlyArray<Child>,
+  subagents: ReadonlyArray<Pick<OrchestrationV2Subagent, "remoteChild">>,
+): ReadonlyArray<Child> {
+  if (children.length === 0) return children;
+  return children.filter(
+    (child) =>
+      !subagents.some(
+        ({ remoteChild }) =>
+          remoteChild?.environmentId === child.environmentId && remoteChild.threadId === child.id,
+      ),
+  );
 }
 
 export function threadRelationshipRowStatus(

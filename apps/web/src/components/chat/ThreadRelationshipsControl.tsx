@@ -14,10 +14,12 @@ import {
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 import { deriveProviderSubagentStatus } from "@t3tools/client-runtime/state/thread-execution";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import {
   deriveThreadRelationshipGraph,
   immediateThreadRelationships,
   isParentThreadRelationship,
+  launchedDelegatedChildren,
   threadRelationshipRowStatus,
   orderWebThreadLineageRows,
   resolveMergeBackTargetThreadId,
@@ -66,6 +68,7 @@ import { buildThreadRouteParams } from "../../threadRoutes";
 import type { SideThreadOpenIntent } from "@t3tools/client-runtime/side-thread";
 import { useLinkedThreadOpener } from "../../state/linkedThreadView";
 import {
+  useDelegatedChildren,
   useProjects,
   useQuietThreadProjection,
   useQuietThreadShell,
@@ -160,11 +163,24 @@ type RemoteSubagent = OrchestrationV2Subagent & {
   readonly remoteChild: OrchestrationV2RemoteTaskChild;
 };
 
-/** A task delegated to a linked environment has no thread here, so it gets its own row kind. */
-type LineageRow = ThreadRelationshipWalkRow | { readonly remote: RemoteSubagent };
+/**
+ * A task delegated to a linked environment has no thread here, so it gets its own row kind,
+ * as does a thread launched there for this one, which has no task record here either.
+ */
+type LineageRow =
+  | ThreadRelationshipWalkRow
+  | { readonly remote: RemoteSubagent }
+  | { readonly launched: EnvironmentThreadShell };
+
+const launchedChildStatus = (thread: EnvironmentThreadShell) =>
+  thread.source.activityRunStatus ?? thread.source.status;
 
 const lineageRowStatus = (row: LineageRow) =>
-  "remote" in row ? row.remote.status : row.edge.status;
+  "remote" in row
+    ? row.remote.status
+    : "launched" in row
+      ? launchedChildStatus(row.launched)
+      : row.edge.status;
 
 const isFinishedAgentStatus = (status: string | null | undefined) =>
   ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
@@ -304,21 +320,72 @@ function RemoteSubagentRow(props: {
   readonly anyInstanceBadge: boolean;
 }) {
   const gt = useGT();
-  const m = useMessages();
-  const { remoteChild } = props.agent;
-  const status = props.agent.status;
-  const failed = status === "failed";
   const timing = {
-    status,
+    status: props.agent.status,
     startedAt: props.agent.startedAt ? DateTime.formatIso(props.agent.startedAt) : null,
     completedAt: props.agent.completedAt ? DateTime.formatIso(props.agent.completedAt) : null,
   };
-  const showElapsed = !failed && deriveSubagentElapsedMs(timing, 0) !== null;
-  const title = relationshipThreadTitle({
-    title: props.agent.title ?? gt("Subagent"),
-    isSubagent: true,
-  });
-  const opener = useLinkedThreadOpener(props.parentRef, remoteChild, title);
+  return (
+    <RemoteThreadRow
+      title={relationshipThreadTitle({
+        title: props.agent.title ?? gt("Subagent"),
+        isSubagent: true,
+      })}
+      status={props.agent.status}
+      timing={deriveSubagentElapsedMs(timing, 0) === null ? null : timing}
+      target={props.agent.remoteChild}
+      parentRef={props.parentRef}
+      provider={props.provider}
+      anyInstanceBadge={props.anyInstanceBadge}
+    />
+  );
+}
+
+/** A thread a linked environment launched for this one, which this client lists there. */
+function LaunchedChildRow(props: {
+  readonly thread: EnvironmentThreadShell;
+  readonly parentRef: ScopedThreadRef;
+  readonly provider: ServerProvider | undefined;
+  readonly anyInstanceBadge: boolean;
+}) {
+  const { thread } = props;
+  const environment = useEnvironment(thread.environmentId);
+  return (
+    <RemoteThreadRow
+      title={relationshipThreadTitle({ title: thread.title, isSubagent: true })}
+      status={launchedChildStatus(thread)}
+      timing={null}
+      target={{
+        environmentId: thread.environmentId,
+        threadId: thread.id,
+        label: environment?.label ?? thread.environmentId,
+      }}
+      parentRef={props.parentRef}
+      provider={props.provider}
+      anyInstanceBadge={props.anyInstanceBadge}
+    />
+  );
+}
+
+function RemoteThreadRow(props: {
+  readonly title: string;
+  readonly status: string | null;
+  /** Shown in place of the status label while it has an elapsed time. */
+  readonly timing: Pick<RuntimeSubagent, "status" | "startedAt" | "completedAt"> | null;
+  readonly target: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly label: string;
+  };
+  readonly parentRef: ScopedThreadRef;
+  readonly provider: ServerProvider | undefined;
+  readonly anyInstanceBadge: boolean;
+}) {
+  const gt = useGT();
+  const m = useMessages();
+  const { status, title, target } = props;
+  const failed = status === "failed";
+  const opener = useLinkedThreadOpener(props.parentRef, target, title);
   const trigger = useSideThreadTrigger();
   return (
     <li className="group relative flex h-8 items-center rounded-lg">
@@ -352,13 +419,13 @@ function RemoteSubagentRow(props: {
           >
             <span className="truncate">
               <T>
-                on <Var>{remoteChild.label}</Var>
+                on <Var>{target.label}</Var>
               </T>
             </span>
             <span className="shrink-0 tabular-nums">
               ·{" "}
-              {showElapsed ? (
-                <AgentElapsed agent={timing} compact />
+              {!failed && props.timing !== null ? (
+                <AgentElapsed agent={props.timing} compact />
               ) : (
                 threadRelationshipStatusLabel(status, m)
               )}
@@ -370,8 +437,8 @@ function RemoteSubagentRow(props: {
             title={title}
             hint={
               opener?.mode === "linked"
-                ? gt("Read the thread on {label}", { label: remoteChild.label })
-                : gt("Open on {label}", { label: remoteChild.label })
+                ? gt("Read the thread on {label}", { label: target.label })
+                : gt("Open on {label}", { label: target.label })
             }
           />
         </TooltipPopup>
@@ -498,6 +565,7 @@ export function ThreadRelationshipsPanel(props: {
   const providersByEnvironment = useEnvironmentProviders();
   const settings = useAtomValue(serverEnvironment.settingsValueAtom(props.environmentId));
   const relationshipShells = useThreadRelationshipShells(ref);
+  const delegatedChildren = useDelegatedChildren(ref);
   const hiddenKeys = useHiddenThreadKeys();
   const hidingAnywhere = useAnyEnvironmentHiding();
   const allProjects = useProjects();
@@ -654,6 +722,16 @@ export function ThreadRelationshipsPanel(props: {
       .map((remote) => ({ remote })),
     ({ remote }) => (isFinishedAgentStatus(remote.status) ? "remotePrevious" : "remoteActive"),
   );
+  const { launchedActive = [], launchedPrevious = [] } = groupBy(
+    launchedDelegatedChildren(delegatedChildren, projection?.subagents ?? [])
+      .filter(
+        (thread) =>
+          !hiddenKeys.has(threadKey({ environmentId: thread.environmentId, threadId: thread.id })),
+      )
+      .map((launched) => ({ launched })),
+    ({ launched }) =>
+      isFinishedAgentStatus(launchedChildStatus(launched)) ? "launchedPrevious" : "launchedActive",
+  );
   const groups: ReadonlyArray<{
     id: string;
     label: string | null;
@@ -661,18 +739,25 @@ export function ThreadRelationshipsPanel(props: {
     expanded: boolean;
   }> = [
     { id: "related", label: null, rows: related, expanded: true },
-    { id: "active", label: null, rows: [...active, ...remoteActive], expanded: true },
+    {
+      id: "active",
+      label: null,
+      rows: [...active, ...remoteActive, ...launchedActive],
+      expanded: true,
+    },
     {
       id: "previous",
       label: gt("Previous agents"),
-      rows: [...previous, ...remotePrevious],
+      rows: [...previous, ...remotePrevious, ...launchedPrevious],
       expanded: false,
     },
   ];
   const runningCount =
     (projection?.subagents.filter(
       (agent) => agent.childThreadId === null && agent.status === "running",
-    ).length ?? 0) + active.filter(({ edge }) => edge.status === "running").length;
+    ).length ?? 0) +
+    active.filter(({ edge }) => edge.status === "running").length +
+    launchedActive.filter(({ launched }) => launchedChildStatus(launched) === "running").length;
 
   // A linked environment's agent may have delegated this thread from there.
   const delegatedFrom = currentThread?.delegatedFrom;
@@ -685,6 +770,8 @@ export function ThreadRelationshipsPanel(props: {
       runningCount > 0 ||
       remoteActive.length > 0 ||
       remotePrevious.length > 0 ||
+      launchedActive.length > 0 ||
+      launchedPrevious.length > 0 ||
       delegatedFrom !== undefined ||
       // Disconnect lives in this heading, so a thread with only side chats still shows it.
       (canDetach && sideChats.length > 0));
@@ -1075,6 +1162,7 @@ export function ThreadRelationshipsPanel(props: {
             related.length > 0 ||
             active.length > 0 ||
             remoteActive.length > 0 ||
+            launchedActive.length > 0 ||
             delegatedFrom !== undefined
           }
           data-thread-relationships-panel
@@ -1126,6 +1214,23 @@ export function ThreadRelationshipsPanel(props: {
                       provider={providersByEnvironment
                         .get(row.remote.remoteChild.environmentId)
                         ?.find((entry) => entry.instanceId === row.remote.providerInstanceId)}
+                      anyInstanceBadge={hasInstanceBadge(providerEntries)}
+                    />
+                  ) : "launched" in row ? (
+                    <LaunchedChildRow
+                      key={scopedThreadKey(
+                        scopeThreadRef(row.launched.environmentId, row.launched.id),
+                      )}
+                      thread={row.launched}
+                      parentRef={ref}
+                      provider={providersByEnvironment
+                        .get(row.launched.environmentId)
+                        ?.find(
+                          (entry) =>
+                            entry.instanceId ===
+                            (row.launched.runtime?.providerInstanceId ??
+                              row.launched.modelSelection.instanceId),
+                        )}
                       anyInstanceBadge={hasInstanceBadge(providerEntries)}
                     />
                   ) : (

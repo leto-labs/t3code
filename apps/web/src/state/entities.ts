@@ -145,6 +145,11 @@ export function useDelegatedUnderParent(): ReadonlySet<string> {
   return useAtomValue(environmentThreadShells.delegatedUnderParentAtom);
 }
 
+/** Threads linked environments run for this one, whether launched or delegated there. */
+export function useDelegatedChildren(ref: ScopedThreadRef): ReadonlyArray<EnvironmentThreadShell> {
+  return useAtomValue(environmentThreadShells.delegatedChildrenAtom(ref));
+}
+
 export function useThreadShellsForProjectRefs(
   refs: ReadonlyArray<ScopedProjectRef>,
 ): ReadonlyArray<EnvironmentThreadShell> {
