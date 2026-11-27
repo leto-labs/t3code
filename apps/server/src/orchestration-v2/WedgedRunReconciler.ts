@@ -26,6 +26,7 @@ import type * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessions from "./ProviderSessionManager.ts";
+import * as RunStateLog from "./RunStateLog.ts";
 
 /** RunExecutionService ends an attempt and its run in one transaction, so a gap only means a lost write. */
 const REPAIR_GRACE_MS = 30_000;
@@ -115,6 +116,7 @@ const make = Effect.gen(function* () {
   const ids = yield* IdAllocator.IdAllocatorV2;
   const sessions = yield* ProviderSessions.ProviderSessionManagerV2;
   const continuations = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+  const runStateLog = yield* RunStateLog.RunStateLog;
   const backoff = yield* Ref.make(
     new Map<RunId, { readonly failures: number; readonly retryAtMs: number }>(),
   );
@@ -354,7 +356,19 @@ const make = Effect.gen(function* () {
       observed: input.observedState,
       action: input.action,
       ageMs: input.ageMs,
-    });
+    }).pipe(
+      Effect.andThen(
+        runStateLog.record({
+          threadId: input.row.threadId,
+          runId: input.row.runId,
+          attemptId: input.row.activeAttemptId,
+          kind: "reconciler",
+          from: input.observedState,
+          to: input.action,
+          cause: `reconciler:age-ms:${input.ageMs}`,
+        }),
+      ),
+    );
 
   const reconcile = Effect.fn("WedgedRunReconciler.reconcile", { attributes: routineSpan })(
     function* () {
