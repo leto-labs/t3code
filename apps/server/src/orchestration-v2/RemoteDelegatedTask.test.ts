@@ -52,6 +52,10 @@ const layerOffers = Layer.effect(
   Offers,
   Ref.make<ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>>([]),
 );
+/** Runs once, right after the next remote result's read of its parent, before its commit. */
+let afterRemoteCompleteRead:
+  | { readonly threadId: ThreadId; readonly run: Effect.Effect<void> }
+  | undefined;
 const layerDatabase = SqlitePersistence.layerMemory;
 const layerTest = Layer.mergeAll(
   layerDatabase,
@@ -59,7 +63,23 @@ const layerTest = Layer.mergeAll(
   ProviderReplayHarness.layerWithRegistry(
     { name: "remote-delegated-task" },
     ProviderAdapterRegistry.layerFromAdapters([adapter]),
-    { databaseLayer: layerDatabase, runEffectWorker: false },
+    {
+      databaseLayer: layerDatabase,
+      runEffectWorker: false,
+      wrapProjectionStore: (store) => ({
+        ...store,
+        getThreadRecords: (threadId, fields, filter) =>
+          Effect.gen(function* () {
+            const records = yield* store.getThreadRecords(threadId, fields, filter);
+            const hook = afterRemoteCompleteRead;
+            if (hook?.threadId === threadId && filter?.omitSettledSubagents !== undefined) {
+              afterRemoteCompleteRead = undefined;
+              yield* hook.run;
+            }
+            return records;
+          }),
+      }),
+    },
   ),
 ).pipe(
   Layer.provide(
@@ -418,6 +438,99 @@ it.layer(layerTest)("a delegated task in a linked environment", (it) => {
       const offered = yield* Ref.get(offers);
       assert.equal(offered.length, 1);
       assert.equal(offered[0]?.threadId, parent.threadId);
+    }),
+  );
+
+  it.effect("keeps a parent run's finalization that lands while its result is being recorded", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const parent = yield* seedLiveParent("finalizes-meanwhile");
+      yield* orchestrator.dispatch({
+        type: "delegated_task.remote.request",
+        commandId: CommandId.make("command:remote-delegate:finalizes-meanwhile"),
+        parentThreadId: parent.threadId,
+        parentRunId: parent.runId,
+        parentNodeId: parent.rootNodeId,
+        task: "Run the suite there.",
+        driver: ProviderDriverKind.make("remote"),
+        modelSelection,
+        remoteChild,
+        completionWake: "always",
+      });
+      const before = yield* orchestrator.getThreadProjection(parent.threadId);
+      const taskId = before.subagents[0]!.id;
+      const { delegatedCompletion: _cohort, ...liveRun } = before.runs.find(
+        (run) => run.id === parent.runId,
+      )!;
+      // The parent's only turn ends after the result read its run as live but before it commits.
+      afterRemoteCompleteRead = {
+        threadId: parent.threadId,
+        run: Effect.gen(function* () {
+          const completedAt = yield* DateTime.now;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("event:finalize:finalizes-meanwhile"),
+                type: "run.updated",
+                threadId: parent.threadId,
+                runId: parent.runId,
+                nodeId: parent.rootNodeId,
+                providerInstanceId: instanceId,
+                occurredAt: completedAt,
+                payload: { ...liveRun, status: "completed", completedAt },
+              },
+            ],
+          });
+        }).pipe(Effect.orDie),
+      };
+      const offers = yield* Offers;
+      yield* Ref.set(offers, []);
+      yield* orchestrator.dispatch({
+        type: "delegated_task.remote.complete",
+        commandId: CommandId.make("command:remote-complete:finalizes-meanwhile"),
+        parentThreadId: parent.threadId,
+        taskId,
+        status: "completed",
+        result: "Done there.",
+        stoppedThere: "ran-out",
+      });
+      assert.isUndefined(afterRemoteCompleteRead);
+
+      const settled = yield* orchestrator.getThreadProjection(parent.threadId);
+      const parentRun = settled.runs.find((run) => run.id === parent.runId)!;
+      // The result must not put the finished run back to running.
+      assert.equal(parentRun.status, "completed");
+      assert.isNotNull(parentRun.completedAt);
+      const delivery = parentRun.delegatedCompletion?.delivery;
+      assert.equal(parentRun.delegatedCompletion?.disposition, "open");
+      assert.deepEqual(delivery?.taskIds, [taskId]);
+      const [offer] = yield* Ref.get(offers);
+      assert.equal(offer?.delegatedCompletion?.messageId, delivery?.messageId);
+      // The wake the continuation dispatches starts a turn instead of queueing behind the parent.
+      const dispatched = yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("command:wake:finalizes-meanwhile"),
+        threadId: parent.threadId,
+        messageId: delivery!.messageId,
+        text: "Delegated task completed.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "server",
+        delegatedCompletion: {
+          parentRunId: parent.runId,
+          generation: delivery!.generation,
+          taskIds: delivery!.taskIds,
+        },
+      });
+      const wake = dispatched.storedEvents.flatMap(({ event }) =>
+        event.type === "run.created" && event.payload.userMessageId === delivery!.messageId
+          ? [event.payload]
+          : [],
+      )[0];
+      assert.isDefined(wake);
+      assert.notEqual(wake?.status, "queued");
     }),
   );
 });

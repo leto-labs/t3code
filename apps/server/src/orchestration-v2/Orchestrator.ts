@@ -10959,7 +10959,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (task.result !== null) {
       // A Stop or cancel here that lost the race to the result still owes its stop.
       if (command.stoppedThere === undefined) {
-        return yield* emitRemoteStopOwed(events, command, task, child);
+        yield* emitRemoteStopOwed(events, command, task, child);
+        return;
       }
       const owesStop =
         task.status === "cancelled" ||
@@ -11059,6 +11060,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         } as OrchestrationV2TurnItem,
       });
     }
+    // The parent's turn can end after the read above; commit only the cohort onto its stored run.
+    return plan.parentRun?.id;
   });
 
   /**
@@ -16676,7 +16679,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* dispatchRemoteDelegatedTaskRequest(command, events);
         break;
       case "delegated_task.remote.complete":
-        yield* dispatchRemoteDelegatedTaskComplete(command, events);
+        updateDelegatedCompletionOnlyRunId = yield* dispatchRemoteDelegatedTaskComplete(
+          command,
+          events,
+        );
         break;
       case "delegated_task.remote.questions":
         yield* dispatchRemoteDelegatedTaskQuestions(command, events, effects);
