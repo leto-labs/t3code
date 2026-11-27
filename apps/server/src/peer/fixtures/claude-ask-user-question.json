@@ -1,0 +1,42 @@
+{
+  "source": "Captured from the Claude adapter canUseTool callback for AskUserQuestion using a synthetic MCP-launched run attempt.",
+  "node": {
+    "id": "node:runtime-request:runtime-request%3Aprovider%3AclaudeAgent%3Aprovider-turn%3Aprovider-turn%253Aprovider%253AclaudeAgent%253Anative-turn%253Aturn%25253Arun-attempt%25253Arun%25253Arun%2525253Athread%2525253Amcp%252525253Alaunch%252525253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%2525253Aordinal%2525253A1%25253Aattempt%25253A1%3Anative-request%3Atoolu_01WithdrawnApproval%3Ad7bdefaf-c5a8-4599-98ed-ccf1a61f7a6e",
+    "threadId": "thread-claude-wake",
+    "runId": "run:thread:mcp%3Alaunch%3Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:ordinal:1",
+    "parentNodeId": "node:provider:claudeAgent:native-item:toolu_01WithdrawnApproval",
+    "rootNodeId": "node:run:run%3Athread%3Amcp%253Alaunch%253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%3Aordinal%3A1:attempt:1:root",
+    "kind": "user_input_request",
+    "status": "waiting",
+    "countsForRun": false,
+    "providerThreadId": "provider-thread:provider:claudeAgent:native-thread:native-thread-claude-wake",
+    "providerTurnId": "provider-turn:provider:claudeAgent:native-turn:turn%3Arun-attempt%3Arun%3Arun%253Athread%253Amcp%25253Alaunch%25253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%253Aordinal%253A1%3Aattempt%3A1",
+    "nativeItemRef": {
+      "driver": "claudeAgent",
+      "nativeId": "toolu_01WithdrawnApproval",
+      "strength": "strong"
+    },
+    "runtimeRequestId": "runtime-request:provider:claudeAgent:provider-turn:provider-turn%3Aprovider%3AclaudeAgent%3Anative-turn%3Aturn%253Arun-attempt%253Arun%253Arun%25253Athread%25253Amcp%2525253Alaunch%2525253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%25253Aordinal%25253A1%253Aattempt%253A1:native-request:toolu_01WithdrawnApproval:d7bdefaf-c5a8-4599-98ed-ccf1a61f7a6e",
+    "checkpointScopeId": null,
+    "startedAt": "1970-01-01T00:00:00.000Z",
+    "completedAt": null
+  },
+  "request": {
+    "id": "runtime-request:provider:claudeAgent:provider-turn:provider-turn%3Aprovider%3AclaudeAgent%3Anative-turn%3Aturn%253Arun-attempt%253Arun%253Arun%25253Athread%25253Amcp%2525253Alaunch%2525253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%25253Aordinal%25253A1%253Aattempt%253A1:native-request:toolu_01WithdrawnApproval:d7bdefaf-c5a8-4599-98ed-ccf1a61f7a6e",
+    "nodeId": "node:runtime-request:runtime-request%3Aprovider%3AclaudeAgent%3Aprovider-turn%3Aprovider-turn%253Aprovider%253AclaudeAgent%253Anative-turn%253Aturn%25253Arun-attempt%25253Arun%25253Arun%2525253Athread%2525253Amcp%252525253Alaunch%252525253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%2525253Aordinal%2525253A1%25253Aattempt%25253A1%3Anative-request%3Atoolu_01WithdrawnApproval%3Ad7bdefaf-c5a8-4599-98ed-ccf1a61f7a6e",
+    "providerTurnId": "provider-turn:provider:claudeAgent:native-turn:turn%3Arun-attempt%3Arun%3Arun%253Athread%253Amcp%25253Alaunch%25253Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%253Aordinal%253A1%3Aattempt%3A1",
+    "nativeRequestRef": {
+      "driver": "claudeAgent",
+      "nativeId": "toolu_01WithdrawnApproval",
+      "strength": "strong"
+    },
+    "kind": "user_input",
+    "status": "pending",
+    "responseCapability": {
+      "type": "live",
+      "providerSessionId": "provider-session-claude-wake"
+    },
+    "createdAt": "1970-01-01T00:00:00.000Z",
+    "resolvedAt": null
+  }
+}

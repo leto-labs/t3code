@@ -1003,7 +1003,8 @@ export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWork
 const DedupedBodyMarker = Schema.optionalKey(Schema.Literal(true));
 
 export const MAX_REMOTE_DELEGATED_TASK_QUESTIONS = 20;
-export const MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH = 256;
+// Claude request IDs embed the percent-encoded provider turn, run attempt, and launched thread ID.
+export const MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH = 1_024;
 
 const OrchestrationV2DelegatedTaskQuestion = Schema.Struct({
   id: RuntimeRequestId.check(Schema.isMaxLength(MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH)),
