@@ -11,14 +11,12 @@ import * as ServerConfig from "../config.ts";
 import * as EventSink from "./EventSink.ts";
 
 const MEBIBYTE = 1024 * 1024;
-// A line is ~450 B with real ids. At 40 runs/h/thread x 600 threads and ~7 status lines a run,
-// that is ~76 MB/h, ~12.7 GB a week; 140 x 100 MiB keeps a week at that load.
 const MAX_BYTES = 100 * MEBIBYTE;
-const MAX_FILES = 140;
+// The sink counts archives separately from the active file, for 1,000 MiB total.
+const MAX_ARCHIVES = 9;
 const FLUSH_INTERVAL = "1 second";
 const MAX_BUFFERED_LINES = 20_000;
 const MAX_TRACKED_RECORDS = 50_000;
-const MAX_CAUSE_CHARS = 200;
 
 /** One status transition. Ids and statuses only: never message text, prompts or paths. */
 export interface RunStateLogEntry {
@@ -28,12 +26,13 @@ export interface RunStateLogEntry {
   readonly kind: "run" | "attempt" | "delivery";
   readonly from: string | null;
   readonly to: string;
-  readonly cause: string;
+  readonly cause: "command" | "event";
 }
 
 /** A reconciler record: ids, statuses, counts and times only. */
 export interface RunStateLogEvent {
   readonly event: string;
+  readonly cause?: never;
   readonly [field: string]: unknown;
 }
 
@@ -66,7 +65,7 @@ const makeLastStates = () => {
 export const makeTransitionTracker = () => {
   const track = makeLastStates();
   return (stored: OrchestrationV2StoredEvent): ReadonlyArray<RunStateLogEntry> => {
-    const cause = (stored.commandId ?? stored.event.type).slice(0, MAX_CAUSE_CHARS);
+    const cause = stored.commandId === null ? "event" : "command";
     const event = stored.event;
     if (event.type === "run.created" || event.type === "run.updated") {
       const run = event.payload;
@@ -132,11 +131,11 @@ const encode = (ts: string, entry: RunStateLogEntry) =>
     kind: entry.kind,
     from: entry.from,
     to: entry.to,
-    cause: entry.cause,
+    cause: entry.cause === "command" ? "command" : "event",
   })}\n`;
 
 const encodeEvent = (ts: string, event: RunStateLogEvent) =>
-  `${JSON.stringify({ ts, ...event })}\n`;
+  `${JSON.stringify({ ts, ...event, cause: undefined })}\n`;
 
 /** Writes `logs/run-state.ndjson`, off the commit path: lines buffer in memory and flush each second. */
 export const layer = Layer.effect(
@@ -149,7 +148,7 @@ export const layer = Layer.effect(
     const sink = yield* makeAsyncRotatingFileSink({
       filePath,
       maxBytes: MAX_BYTES,
-      maxFiles: MAX_FILES,
+      maxFiles: MAX_ARCHIVES,
     }).pipe(
       Effect.catch((cause) =>
         Effect.logWarning("run state log unavailable", { filePath, cause }).pipe(

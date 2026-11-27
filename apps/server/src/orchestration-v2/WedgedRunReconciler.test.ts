@@ -20,6 +20,7 @@ import {
   RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -179,15 +180,22 @@ const layerSessionsWithLiveSession = Layer.effect(
   }),
 );
 
-const layerTest = Layer.mergeAll(
-  ProviderContinuationService.layer,
-  WedgedRunReconciler.layer.pipe(
-    Layer.provide(Layer.merge(layerSessionsWithLiveSession, layerRecordedRunStateLog)),
-  ),
-).pipe(
-  Layer.provide(Layer.merge(ProviderContinuationRequests.layer, IdAllocator.layer)),
-  Layer.provideMerge(layerOrchestration),
-);
+const layerTest = (env: Record<string, string>) =>
+  Layer.mergeAll(
+    ProviderContinuationService.layer,
+    WedgedRunReconciler.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerSessionsWithLiveSession,
+          layerRecordedRunStateLog,
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env })),
+        ),
+      ),
+    ),
+  ).pipe(
+    Layer.provide(Layer.merge(ProviderContinuationRequests.layer, IdAllocator.layer)),
+    Layer.provideMerge(layerOrchestration),
+  );
 
 interface Seed {
   readonly key: string;
@@ -455,7 +463,7 @@ const actionsFor = (summary: WedgedRunReconciler.WedgedRunReconcileSummary, runI
     .filter((action) => action.runId === runId)
     .map((action) => `${action.event}:${action.reason}:${action.action}`);
 
-it.layer(layerTest)("WedgedRunReconciler", (it) => {
+it.layer(layerTest({ T3CODE_RECONCILER_REPAIR: "true" }))("WedgedRunReconciler repair", (it) => {
   it.effect("re-drives the run-5110 state: finalizes, redelivers the wake, starts the queue", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -623,8 +631,124 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
       );
     }),
   );
+});
 
-  it.effect("scans running runs through the recovery index", () =>
+it.layer(layerTest({}))("WedgedRunReconciler by default", (it) => {
+  it.effect("reports a repair candidate without finalizing or redelivering it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const reconciler = yield* WedgedRunReconciler.WedgedRunReconciler;
+      const seeded = yield* seedWedgedRun({
+        key: "observe-by-default",
+        attemptStatus: "completed",
+        ageMs: 11 * 60_000,
+        openDelivery: true,
+      });
+      const beforeSequence = yield* sink.latestSequence();
+      const before = yield* orchestrator.getThreadProjection(seeded.threadId);
+
+      const summary = yield* reconciler.reconcile;
+      assert.deepStrictEqual(actionsFor(summary, seeded.runId), [
+        "reconciler.observe:attempt_terminal_run_running:none",
+      ]);
+      const [record, ...others] = recordedEvents.filter((event) => event.runId === seeded.runId);
+      assert.deepStrictEqual(others, []);
+      assert.deepInclude(record, {
+        event: "reconciler.observe",
+        reason: "attempt_terminal_run_running",
+        wouldRepair: true,
+        action: "none",
+        threadId: seeded.threadId,
+        attemptId: seeded.attemptId,
+        runStatus: "running",
+        attemptStatus: "completed",
+        attemptStatuses: ["completed"],
+        providerTurnStatuses: [],
+        session: "none",
+        deliveryDisposition: "open",
+        deliveryGeneration: 1,
+        queued: 1,
+        queueHeld: 0,
+        ageMs: 11 * 60_000,
+      });
+      assert.isString(record?.rule);
+      assert.isString(record?.wedgedSince);
+      assert.equal(yield* sink.latestSequence(), beforeSequence);
+      assert.deepStrictEqual(yield* orchestrator.getThreadProjection(seeded.threadId), before);
+
+      const again = yield* reconciler.reconcile;
+      assert.deepStrictEqual(actionsFor(again, seeded.runId), []);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("command:observe-by-default:queue-another"),
+        threadId: seeded.threadId,
+        messageId: MessageId.make("message:observe-by-default:queue-another"),
+        text: "Another request",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "queue_after_active" },
+      });
+      const changed = yield* reconciler.reconcile;
+      assert.deepStrictEqual(actionsFor(changed, seeded.runId), [
+        "reconciler.observe:attempt_terminal_run_running:none",
+      ]);
+      assert.deepInclude(
+        recordedEvents.findLast((event) => event.runId === seeded.runId),
+        {
+          queued: 2,
+        },
+      );
+    }),
+  );
+
+  it.effect(
+    "reports every persistent candidate across capped passes and repeats after 30 minutes",
+    () =>
+      Effect.gen(function* () {
+        const reconciler = yield* WedgedRunReconciler.WedgedRunReconciler;
+        const sql = yield* SqlClient.SqlClient;
+        const runs = yield* Effect.forEach(
+          Array.from({ length: 45 }, (_, index) => index),
+          (index) =>
+            seedWedgedRun({
+              key: `batch-${String(index).padStart(2, "0")}`,
+              attemptStatus: "completed",
+              ageMs: 0,
+              pendingQuestion: true,
+            }),
+        );
+        yield* TestClock.adjust("3 minutes");
+        const runIds = new Set(runs.map((run) => run.runId));
+        const batch = reconciler.reconcile.pipe(
+          Effect.map(({ actions }) => actions.filter((action) => runIds.has(action.runId))),
+        );
+
+        const first = yield* batch;
+        yield* sql`
+          UPDATE orchestration_v2_projection_runs
+          SET payload_json = json_set(payload_json, '$.queueHeld', json('true'))
+          WHERE status = 'queued' AND thread_id BETWEEN ${runs[0]!.threadId} AND ${runs[19]!.threadId}
+        `;
+        const passes = [first, yield* batch, yield* batch];
+        assert.deepStrictEqual(
+          passes.map((actions) => actions.length),
+          [20, 20, 5],
+        );
+        assert.deepStrictEqual(new Set(passes.flat().map((action) => action.runId)), runIds);
+        assert.isTrue(passes.flat().every((action) => action.event === "reconciler.observe"));
+        assert.deepStrictEqual(yield* batch, first);
+        assert.deepStrictEqual(yield* batch, []);
+        yield* TestClock.adjust("29 minutes");
+        assert.deepStrictEqual(yield* batch, []);
+        yield* TestClock.adjust("1 minute");
+        assert.lengthOf(yield* batch, 20);
+      }),
+  );
+
+  it.effect("seeks the scan cursor through the recovery index", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
       const plan = yield* sql<{ readonly detail: string }>`
@@ -637,14 +761,19 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
           ON pt.provider_thread_id = r.provider_thread_id
         WHERE r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
           AND r.status = 'running'
+          AND (r.thread_id, r.rowid) > ('thread:cursor', 42)
+        ORDER BY r.thread_id, r.rowid
+        LIMIT 100
       `;
       const details = plan.map((row) => row.detail);
       assert.isTrue(
-        details.some((detail) => detail.includes("orchestration_v2_projection_runs_recovery_idx")),
+        details.some((detail) =>
+          /orchestration_v2_projection_runs_recovery_idx \(status=\? AND .*thread_id/.test(detail),
+        ),
         details.join("\n"),
       );
       assert.isFalse(
-        details.some((detail) => /^SCAN (r|a|pt)\b/.test(detail)),
+        details.some((detail) => /^SCAN (r|a|pt)\b|USE TEMP B-TREE/.test(detail)),
         details.join("\n"),
       );
     }),

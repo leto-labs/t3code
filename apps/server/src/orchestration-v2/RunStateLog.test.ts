@@ -76,7 +76,7 @@ const stored = (
   sequence += 1;
   return {
     sequence,
-    commandId: CommandId.make(`command:${sequence}`),
+    commandId: CommandId.make(`/private/workspace:caller-text:${sequence}`),
     event: {
       id: EventId.make(`event:${sequence}`),
       threadId,
@@ -113,18 +113,21 @@ describe("RunStateLog transitions", () => {
       stored({ type: "run-attempt.updated", payload: attempt("completed") }),
       stored({ type: "run.updated", payload: run("running", delivery(1)) }),
       stored({ type: "run.updated", payload: run("completed") }),
-      stored({ type: "run.updated", payload: run("completed", delivery(null)) }),
+      {
+        ...stored({ type: "run.updated", payload: run("completed", delivery(null)) }),
+        commandId: null,
+      },
     ].flatMap(track);
     assert.deepStrictEqual(
       lines.map(({ kind, from, to, cause }) => ({ kind, from, to, cause })),
       [
-        { kind: "run", from: null, to: "queued", cause: "command:1" },
-        { kind: "run", from: "queued", to: "running", cause: "command:2" },
-        { kind: "attempt", from: null, to: "running", cause: "command:3" },
-        { kind: "attempt", from: "running", to: "completed", cause: "command:5" },
-        { kind: "delivery", from: null, to: "opened:generation:1", cause: "command:6" },
-        { kind: "run", from: "running", to: "completed", cause: "command:7" },
-        { kind: "delivery", from: "generation:1", to: "consumed", cause: "command:8" },
+        { kind: "run", from: null, to: "queued", cause: "command" },
+        { kind: "run", from: "queued", to: "running", cause: "command" },
+        { kind: "attempt", from: null, to: "running", cause: "command" },
+        { kind: "attempt", from: "running", to: "completed", cause: "command" },
+        { kind: "delivery", from: null, to: "opened:generation:1", cause: "command" },
+        { kind: "run", from: "running", to: "completed", cause: "command" },
+        { kind: "delivery", from: "generation:1", to: "consumed", cause: "event" },
       ],
     );
   });
@@ -133,11 +136,17 @@ describe("RunStateLog transitions", () => {
 const layerServerConfig = ServerConfig.layerTest(process.cwd(), { prefix: "t3-run-state-log-" });
 
 describe("RunStateLog file", () => {
-  it.effect("flushes buffered entries as NDJSON next to the server trace", () =>
+  it.effect("flushes buffered NDJSON and prunes archives to the retention limit", () =>
     Effect.gen(function* () {
       const { serverTracePath } = yield* ServerConfig.ServerConfig;
       const path = yield* Path.Path;
       const fs = yield* FileSystem.FileSystem;
+      const logDirectory = path.dirname(serverTracePath);
+      const filePath = path.join(logDirectory, "run-state.ndjson");
+      yield* fs.makeDirectory(logDirectory, { recursive: true });
+      yield* fs.writeFileString(`${filePath}.9`, "retained\n");
+      yield* fs.writeFileString(`${filePath}.10`, "expired\n");
+      yield* fs.writeFileString(`${filePath}.140`, "expired\n");
       yield* Effect.scoped(
         Effect.gen(function* () {
           const log = yield* RunStateLog.RunStateLog;
@@ -148,7 +157,7 @@ describe("RunStateLog file", () => {
             kind: "run",
             from: "running",
             to: "completed",
-            cause: "command:finalize",
+            cause: "command",
           });
           yield* log.recordEvent({
             event: "reconciler.repair",
@@ -169,9 +178,10 @@ describe("RunStateLog file", () => {
           ),
         ),
       );
-      const text = yield* fs.readFileString(
-        path.join(path.dirname(serverTracePath), "run-state.ndjson"),
-      );
+      assert.equal(yield* fs.readFileString(`${filePath}.9`), "retained\n");
+      assert.isFalse(yield* fs.exists(`${filePath}.10`));
+      assert.isFalse(yield* fs.exists(`${filePath}.140`));
+      const text = yield* fs.readFileString(filePath);
       const lines = text.trimEnd().split("\n");
       assert.equal(lines.length, 2);
       const line = JSON.parse(lines[0]!);
@@ -186,6 +196,7 @@ describe("RunStateLog file", () => {
         "cause",
       ]);
       assert.equal(line.to, "completed");
+      assert.equal(line.cause, "command");
       const repair = JSON.parse(lines[1]!);
       assert.deepStrictEqual(Object.keys(repair), ["ts", "event", "reason", "threadId", "runId"]);
       assert.equal(repair.reason, "attempt_terminal_run_running");
