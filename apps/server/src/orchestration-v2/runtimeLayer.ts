@@ -1,6 +1,7 @@
 import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
+import * as WedgedRunReconciler from "./WedgedRunReconciler.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -460,6 +461,22 @@ export const layerProduction = Layer.mergeAll(
     ),
   ),
   layerProviderContinuationWorkerProvided,
+  WedgedRunReconciler.layerWorker.pipe(
+    Layer.provide(
+      WedgedRunReconciler.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ProjectionStore.layer,
+            layerEventSink,
+            IdAllocator.layer,
+            layerProviderSessionManagerProvided,
+            // The same layer reference as the orchestrator's, so offers reach its continuation worker.
+            ProviderContinuationRequests.layer,
+          ),
+        ),
+      ),
+    ),
+  ),
   layerAgentSessionScannerProvided,
   layerAgentSessionImporterProvided,
   LiveVoiceService.layer.pipe(
