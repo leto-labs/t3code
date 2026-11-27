@@ -305,7 +305,10 @@ it.effect("a pending question read keeps option previews", () => {
   );
 });
 
-const approvalTarget = (runtimeMode: OrchestrationV2ThreadShell["runtimeMode"]) => {
+const approvalTarget = (
+  runtimeMode: OrchestrationV2ThreadShell["runtimeMode"],
+  fullAccessOverride?: "ask_rule" | "provider_check",
+) => {
   const shell = McpToolAccessTestkit.liveThreadShell(threadId, { runtimeMode });
   const requestId = RuntimeRequestId.make(`approval:${runtimeMode}`);
   const dispatched: OrchestrationV2ServerCommand[] = [];
@@ -352,6 +355,7 @@ const approvalTarget = (runtimeMode: OrchestrationV2ThreadShell["runtimeMode"]) 
                 requestId,
                 requestKind: "command",
                 prompt: "Run rm -rf build?",
+                ...(fullAccessOverride === undefined ? {} : { fullAccessOverride }),
               },
             ],
           }),
@@ -409,6 +413,33 @@ it.effect("an agent can accept a pending approval only in a full-access thread",
     expect(target.dispatched).toMatchObject([
       { type: "runtime-request.respond", requestId: target.requestId, decision: "accept" },
     ]);
+  }).pipe(Effect.provide(target.layer));
+});
+
+it.effect(
+  "an agent cannot accept an approval the user's ask rule raised in a full-access thread",
+  () => {
+    const target = approvalTarget("full-access", "ask_rule");
+    return Effect.gen(function* () {
+      expect(
+        declaredFailure(yield* target.call({ action: "respond", decision: "accept" })),
+      ).toMatchObject({
+        code: "runtime_mode_escalation_denied",
+        message: expect.stringContaining("ask rule requires the user"),
+      });
+      expect(target.dispatched).toEqual([]);
+      yield* target.call({ action: "respond", decision: "decline" });
+      expect(target.dispatched).toMatchObject([{ decision: "decline" }]);
+    }).pipe(Effect.provide(target.layer));
+  },
+);
+
+it.effect("an agent can accept a provider-check approval in a full-access thread", () => {
+  const target = approvalTarget("full-access", "provider_check");
+  return Effect.gen(function* () {
+    const accepted = yield* target.call({ action: "respond", decision: "accept" });
+    expect(accepted.isError).not.toBe(true);
+    expect(target.dispatched).toMatchObject([{ decision: "accept" }]);
   }).pipe(Effect.provide(target.layer));
 });
 

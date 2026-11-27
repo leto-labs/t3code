@@ -322,6 +322,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
               code: "runtime_mode_escalation_denied",
               message: `Accept works only in a full-access thread; this thread runs ${projection.thread.runtimeMode}. Decline it, or ask the user to approve it.`,
             });
+          if (decision === "accept" && item.fullAccessOverride === "ask_rule")
+            return yield* new OrchestratorMcpFailure({
+              code: "runtime_mode_escalation_denied",
+              message:
+                "The user's own ask rule requires the user to approve this. Decline it, or ask the user to approve it.",
+            });
           response = { decision };
         }
         const result = yield* threads
