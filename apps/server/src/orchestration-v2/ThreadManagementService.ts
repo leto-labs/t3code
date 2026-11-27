@@ -49,8 +49,10 @@ import {
 } from "@t3tools/contracts";
 import { delegatedTaskProgress } from "@t3tools/provider-core/server/subagentProjection";
 import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { hashTelemetryId } from "@t3tools/shared/telemetryId";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -662,6 +664,20 @@ const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
   const worktreeRestore = yield* ThreadWorktreeRestore;
+  const oversizedQuestionWarnings = yield* Cache.make({
+    capacity: 256,
+    lookup: (key: {
+      readonly hash: string;
+      readonly provider: string;
+      readonly threadId: ThreadId;
+      readonly idLength: number;
+    }) =>
+      Effect.logWarning("Oversized delegated task question skipped", {
+        provider: key.provider,
+        threadId: key.threadId,
+        idLength: key.idLength,
+      }),
+  });
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -1237,30 +1253,64 @@ const make = Effect.gen(function* () {
         (request) =>
           request.kind === "user_input" &&
           request.status === "pending" &&
-          request.id.length <= MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH &&
           request.responseCapability.type !== "not_resumable",
       );
       if (requests.length === 0) return knownQuestions.length === 0 ? undefined : [];
-      const runIds = new Set([currentRun.id]);
-      for (const run of laterRuns) {
-        if (run.ordinal > currentRun.ordinal && !isTerminalRunStatus(run.status)) {
-          runIds.add(run.id);
-        }
-      }
-      const { nodes } = yield* getProjectThreadRecords(input, ["nodes"], {
+      const candidates = laterRuns
+        .filter((run) => run.ordinal >= selectedRun.ordinal && run.id !== currentRun.id)
+        .toSorted((left, right) => left.ordinal - right.ordinal);
+      const { nodes, messages } = yield* getProjectThreadRecords(input, ["nodes", "messages"], {
         nodeIds: requests.map((request) => request.nodeId),
+        messageRoles: ["user"],
+        messageIds: candidates.map((run) => run.userMessageId),
       });
-      const runNodes = new Set(
-        nodes
-          .filter((node) => node.runId !== null && runIds.has(node.runId))
-          .map((node) => node.id),
-      );
-      const questions = requests
-        .filter((request) => runNodes.has(request.nodeId))
-        .map((request) => ({
-          id: request.id,
-          blocking: request.responseCapability.type === "live",
-        }))
+      const inputMessages = new Map(messages.map((message) => [message.id, message]));
+      const taskRuns = new Map([[currentRun.id, currentRun]]);
+      for (const run of candidates) {
+        if (run.id !== selectedRun.id) {
+          const message = inputMessages.get(run.userMessageId);
+          const source =
+            run.restartContinuationOfRunId ??
+            run.manualContinuationOfRunId ??
+            run.usageLimitContinuationOfRunId ??
+            message?.delegatedCompletion?.parentRunId;
+          // A linked send can start a separately tracked follow-up without a local task id.
+          const owned =
+            run.delegatedTaskId !== undefined
+              ? run.delegatedTaskId === selectedRun.delegatedTaskId
+              : source !== undefined
+                ? taskRuns.has(source)
+                : message?.linkedSender === undefined &&
+                  (message?.senderThreadId === undefined ||
+                    message.senderThreadId === input.threadId);
+          if (!owned) continue;
+        }
+        taskRuns.set(run.id, run);
+      }
+      const requestNodes = new Map(nodes.map((node) => [node.id, node]));
+      const pendingQuestions: OrchestrationV2DelegatedTaskQuestion[] = [];
+      for (const request of requests) {
+        const node = requestNodes.get(request.nodeId);
+        if (node === undefined || node.runId === null) continue;
+        const run = taskRuns.get(node.runId);
+        if (run === undefined) continue;
+        const blocking = request.responseCapability.type === "live";
+        if (!isActiveRun(run) && (blocking || run.status !== "completed")) continue;
+        if (request.id.length > MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH) {
+          yield* Cache.get(oversizedQuestionWarnings, {
+            hash: hashTelemetryId(request.id),
+            provider:
+              request.nativeRequestRef?.driver ??
+              node.nativeItemRef?.driver ??
+              run.providerInstanceId,
+            threadId: input.threadId,
+            idLength: request.id.length,
+          });
+          continue;
+        }
+        pendingQuestions.push({ id: request.id, blocking });
+      }
+      const questions = pendingQuestions
         .sort((left, right) => Number(right.blocking) - Number(left.blocking))
         .slice(0, MAX_REMOTE_DELEGATED_TASK_QUESTIONS);
       return questions.length === knownQuestions.length &&

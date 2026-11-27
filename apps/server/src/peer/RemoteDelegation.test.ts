@@ -9,9 +9,7 @@ import {
   type ModelSelection,
   NodeId,
   type OrchestrationV2DelegatedTaskQuestion,
-  OrchestrationV2ExecutionNodeJson,
   type OrchestrationV2Run,
-  OrchestrationV2RuntimeRequestJson,
   type OrchestratorMcpThreadReadInput,
   ProjectId,
   ProviderDriverKind,
@@ -36,7 +34,6 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as Tracer from "effect/Tracer";
@@ -54,13 +51,13 @@ import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
-import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import claudeQuestionFixture from "../orchestration-v2/testkit/fixtures/claude-ask-user-question.json" with { type: "json" };
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
@@ -78,14 +75,6 @@ import * as PeerLinks from "./PeerLinks.ts";
 import { descriptorOf, layerLinkingEnvironment, linkTo, servePeer } from "./PeerLinks.testkit.ts";
 import * as RemoteDelegation from "./RemoteDelegation.ts";
 import * as PeerLinkRequests from "./PeerLinkRequests.ts";
-import claudeQuestionFixture from "./fixtures/claude-ask-user-question.json" with { type: "json" };
-
-const decodeClaudeQuestion = Schema.decodeUnknownEffect(
-  Schema.Struct({
-    node: OrchestrationV2ExecutionNodeJson,
-    request: OrchestrationV2RuntimeRequestJson,
-  }),
-);
 
 // The laptop's agent delegates a task to the box through a link. The box is
 // its real /mcp behind real OAuth, with one thread the test finishes; the
@@ -253,23 +242,17 @@ const boxProjects: ReadonlyArray<Project> = [
   },
 ];
 
-const serveBox = (
-  thread: BoxThread,
-  waitForThread?: ThreadManagement.ThreadManagementService["Service"]["waitForThread"],
-) => servePeer(box, boxToolkitLayer(thread, waitForThread));
+const serveBox = (thread: BoxThread) => {
+  return servePeer(box, boxToolkitLayer(thread));
+};
 
 const boxRunId = RunId.make("run:box");
 const boxLaterRunId = RunId.make("run:box-later");
 const boxQueuedRunId = RunId.make("run:box-queued");
 const continuationOf = (runId: RunId) => RunId.make(`${runId}:restarted`);
 
-const boxToolkitLayer = (
-  thread: BoxThread,
-  waitForThread: ThreadManagement.ThreadManagementService["Service"]["waitForThread"] | undefined,
-) => {
+const boxToolkitLayer = (thread: BoxThread) => {
   const runId = boxRunId;
-  const launchedRunId = (threadId: ThreadId) =>
-    waitForThread === undefined ? runId : IdAllocator.derive.run({ threadId, ordinal: 1 });
   const interrupts = new Set<string>();
   const shellOf = (threadId: ThreadId) =>
     Effect.gen(function* () {
@@ -303,7 +286,7 @@ const boxToolkitLayer = (
         ? (null as never)
         : {
             ...idleThreadProjection(shell),
-            runs: runless ? [] : [{ ...runOf(status), id: launchedRunId(threadId), threadId }],
+            runs: runless ? [] : [runOf(status)],
             providerTurns: (model === null
               ? []
               : [{ runAttemptId: "attempt:box", ordinal: 1, model }]) as never,
@@ -327,7 +310,6 @@ const boxToolkitLayer = (
     getRunCount: (threadId) =>
       projectionOf(threadId).pipe(Effect.map((projection) => projection.runs.length)),
     waitForThread: (input) => {
-      if (waitForThread !== undefined) return waitForThread(input);
       const wait = Effect.gen(function* () {
         yield* Deferred.succeed(thread.questionWatch, input);
         yield* Ref.update(thread.waitedFor, (seen) => [...seen, input.runId]);
@@ -633,7 +615,7 @@ const boxToolkitLayer = (
                   input.initialMessage?.messageId && !runless
                     ? [
                         {
-                          id: launchedRunId(input.threadId!),
+                          id: runId,
                           status: "running",
                           userMessageId: input.initialMessage.messageId,
                         },
@@ -1182,124 +1164,6 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("reports a live Claude question from an MCP-launched child through the remote wait", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const thread = yield* makeBoxThread;
-      const offers = yield* SubscriptionRef.make<
-        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
-      >([]);
-      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
-      const boxDatabase = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
-      const boxRuntime = yield* makeLaptop(boxDatabase, offers);
-      const b = yield* serveBox(thread, boxRuntime.threads.waitForThread);
-      const a = yield* makeLaptop(database, offers);
-      yield* linkTo(a.links, b, "full-access");
-      yield* seedParent(a);
-      yield* Ref.set(
-        thread.afterLaunch,
-        Effect.gen(function* () {
-          const threadId = yield* Ref.get(thread.launched).pipe(
-            Effect.flatMap(Effect.fromNullishOr),
-          );
-          yield* boxRuntime.orchestrator.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make("command:create:box-claude-question"),
-            threadId,
-            projectId: boxProject,
-            title: "Claude question",
-            modelSelection,
-            runtimeMode: "auto",
-            interactionMode: "default",
-            branch: null,
-            worktreePath: null,
-            createdBy: "agent",
-            creationSource: "mcp",
-          });
-          yield* boxRuntime.orchestrator.dispatch({
-            type: "message.dispatch",
-            commandId: CommandId.make("command:start:box-claude-question"),
-            threadId,
-            messageId: MessageId.make("message:start:box-claude-question"),
-            text: "Ask which target to use.",
-            attachments: [],
-            dispatchMode: { type: "start_immediately" },
-            createdBy: "agent",
-            creationSource: "mcp",
-          });
-        }).pipe(Effect.orDie),
-      );
-
-      const task = yield* delegateToBox(a);
-      const threadId = task.remoteChild.threadId;
-      const runId = IdAllocator.derive.run({ threadId, ordinal: 1 });
-      const { runs } = yield* boxRuntime.threads.getThreadRecords(threadId, ["runs"]);
-      const run = runs.find((candidate) => candidate.id === runId)!;
-      const { node, request } = yield* decodeClaudeQuestion(claudeQuestionFixture);
-      const afterSequence = yield* a.threads.getThreadEventSequence(parentThreadId);
-      const now = yield* DateTime.now;
-      // Rebind the captured artifacts to this test's launch, keeping the adapter's request and node IDs.
-      yield* boxRuntime.sink.write({
-        events: [
-          {
-            type: "node.updated",
-            id: EventId.make("event:box-claude-question-node"),
-            threadId,
-            runId,
-            nodeId: node.id,
-            occurredAt: now,
-            payload: { ...node, threadId, runId, rootNodeId: run.rootNodeId! },
-          },
-          {
-            type: "runtime-request.updated",
-            id: EventId.make("event:box-claude-question"),
-            threadId,
-            runId,
-            nodeId: request.nodeId,
-            occurredAt: now,
-            payload: request,
-          },
-        ],
-      });
-
-      // A stale snapshot makes the waiter return the current questions without a timeout.
-      const waited = yield* a.call("t3_thread_wait", {
-        environmentId: box.environmentId,
-        threadId,
-        runId,
-        knownPendingQuestions: [{ id: "previous-question", blocking: true }],
-        untilDelegatedWorkSettled: true,
-      });
-      expect(waited.structuredContent).toMatchObject({
-        pendingQuestions: [{ id: request.id, blocking: true }],
-        timedOut: false,
-      });
-      yield* a.orchestrator
-        .streamStoredEventsFrom({
-          threadId: parentThreadId,
-          afterSequence,
-          eventType: "message.updated",
-        })
-        .pipe(
-          Stream.filter(
-            ({ event }) =>
-              event.type === "message.updated" &&
-              event.payload.notification?.source.kind === "delegated_task" &&
-              event.payload.text.includes(request.id),
-          ),
-          Stream.runHead,
-        );
-
-      const status = yield* a.call("task_status", { taskId: task.taskId });
-      expect(status.structuredContent).toMatchObject({ hasPendingQuestion: true });
-      const summary = yield* a.call("t3_thread_read", { threadId: parentThreadId });
-      expect(summary.structuredContent).toMatchObject({
-        thread: { status: "running", pendingRequestCount: 0, pendingRemoteChildQuestionCount: 1 },
-      });
-    }),
-  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
-);
-
 it.effect.each([
   { clearedBy: "answer", blocking: false, count: 1 },
   { clearedBy: "finish", blocking: true, count: 1 },
@@ -1324,7 +1188,11 @@ it.effect.each([
         });
 
         const questions = Array.from({ length: count }, (_, index) => ({
-          id: RuntimeRequestId.make(`request:box-question:${index}`),
+          id: RuntimeRequestId.make(
+            clearedBy === "finish"
+              ? claudeQuestionFixture.request.id
+              : `request:box-question:${index}`,
+          ),
           blocking,
         }));
         const afterSequence = yield* a.threads.getThreadEventSequence(parentThreadId);

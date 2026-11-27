@@ -2,10 +2,13 @@ import { expect, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
+  MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH,
   MessageId,
   NodeId,
   type OrchestrationV2Command,
   type OrchestrationV2RuntimeRequest,
+  OrchestrationV2ExecutionNodeJson,
+  OrchestrationV2RuntimeRequestJson,
   type OrchestrationV2Run,
   type OrchestrationV2ProviderThread,
   ProviderThreadId,
@@ -26,7 +29,9 @@ import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -42,6 +47,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
+import claudeQuestionFixture from "./testkit/fixtures/claude-ask-user-question.json" with { type: "json" };
 import {
   ThreadWorktreeRestore,
   WorktreeRecreateError,
@@ -393,19 +399,44 @@ it.effect("waitForThread follows a restart continuation instead of the cut run",
   }),
 );
 
-it.effect.each(["selected", "later"] as const)(
+const decodeClaudeQuestion = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    node: OrchestrationV2ExecutionNodeJson,
+    request: OrchestrationV2RuntimeRequestJson,
+  }),
+);
+
+it.effect.each(["selected", "captured", "later", "completed-later", "oversize"] as const)(
   "waitForThread reports questions in the %s run and wakes when they clear",
-  (source) =>
-    Effect.gen(function* () {
+  (source) => {
+    const warnings: unknown[] = [];
+    const logger = Logger.make(({ logLevel, message }) => {
+      if (
+        logLevel === "Warn" &&
+        Array.isArray(message) &&
+        message[0] === "Oversized delegated task question skipped"
+      )
+        warnings.push(message[1]);
+    });
+    return Effect.gen(function* () {
       const projectId = ProjectId.make("project:wait-questions");
-      const threadId = ThreadId.make("thread:wait-questions");
-      const runId = RunId.make("run:wait-questions");
+      const captured =
+        source === "captured" ? yield* decodeClaudeQuestion(claudeQuestionFixture) : undefined;
+      const threadId = captured?.node.threadId ?? ThreadId.make("thread:wait-questions");
+      const runId = captured?.node.runId ?? RunId.make("run:wait-questions");
       const laterRunId = RunId.make("run:wait-questions:later");
-      const nodeId = NodeId.make("node:wait-questions");
+      const otherRunId = RunId.make("run:other");
+      const otherMessageId = MessageId.make("message:other");
+      const laterMessageId = MessageId.make("message:later");
+      const nodeId = captured?.node.id ?? NodeId.make("node:wait-questions");
       const approval = RuntimeRequestId.make("request:approval");
-      const question = RuntimeRequestId.make("request:question");
+      const question = captured?.request.id ?? RuntimeRequestId.make("request:question");
       const otherQuestion = RuntimeRequestId.make("request:other-run-question");
       const otherNode = NodeId.make("node:other-run");
+      const leftoverNode = NodeId.make("node:leftover-live");
+      const oversizeNode = NodeId.make("node:oversize-question");
+      const later = source === "later" || source === "completed-later";
+      const blocking = source !== "completed-later";
       const subscribed = yield* Queue.unbounded<void>();
       const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
       const request = (
@@ -427,6 +458,31 @@ it.effect.each(["selected", "later"] as const)(
         request(approval, "command"),
         request(otherQuestion, "user_input", otherNode),
       ];
+      const codex = ProviderDriverKind.make("codex");
+      if (source === "oversize") {
+        requests.push({
+          ...request(
+            RuntimeRequestId.make("x".repeat(MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH + 1)),
+            "user_input",
+            oversizeNode,
+          ),
+          nativeRequestRef: { driver: codex, nativeId: "question", strength: "strong" },
+        });
+      }
+      let runs = later
+        ? [
+            { id: runId, ordinal: 1, status: "completed" },
+            { id: laterRunId, ordinal: 2, status: "waiting", userMessageId: laterMessageId },
+          ]
+        : [{ id: runId, ordinal: 1, status: "waiting" }];
+      const messages = [
+        { id: laterMessageId, runId: laterRunId, delegatedCompletion: { parentRunId: runId } },
+        {
+          id: otherMessageId,
+          runId: otherRunId,
+          linkedSender: { threadId: ThreadId.make("thread:other") },
+        },
+      ];
       const layerTest = ThreadManagementService.layer.pipe(
         Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
         Layer.provide(
@@ -445,19 +501,15 @@ it.effect.each(["selected", "later"] as const)(
                 () =>
                   ({
                     thread: { id: threadId, projectId, deletedAt: null },
-                    runs:
-                      source === "selected"
-                        ? [{ id: runId, ordinal: 1, status: "waiting" }]
-                        : [
-                            { id: runId, ordinal: 1, status: "completed" },
-                            { id: laterRunId, ordinal: 2, status: "waiting" },
-                          ],
+                    runs,
                     nodes: [
-                      { id: nodeId, runId: source === "later" ? laterRunId : runId },
-                      { id: otherNode, runId: RunId.make("other") },
+                      captured?.node ?? { id: nodeId, runId: later ? laterRunId : runId },
+                      { id: otherNode, runId: otherRunId },
+                      { id: leftoverNode, runId: laterRunId },
+                      { id: oversizeNode, runId },
                     ],
                     runtimeRequests: requests,
-                    messages: [],
+                    messages,
                     subagents: [{ status: "running" }],
                     providerThreads: [],
                   }) as unknown as OrchestrationV2ThreadProjection,
@@ -475,7 +527,7 @@ it.effect.each(["selected", "later"] as const)(
         threadId,
         runId,
         timeoutMs: 60_000,
-        untilDelegatedWorkSettled: source === "later",
+        untilDelegatedWorkSettled: later,
       };
       const send = (payload: OrchestrationV2RuntimeRequest) =>
         Queue.offer(events, {
@@ -487,17 +539,43 @@ it.effect.each(["selected", "later"] as const)(
         .waitForThread({ ...wait, knownPendingQuestions: [] })
         .pipe(Effect.forkChild);
       yield* Effect.raceFirst(Queue.take(subscribed), Fiber.await(asked));
-      const pending = request(question, "user_input");
+      const pending = captured?.request ?? {
+        ...request(question, "user_input"),
+        ...(blocking ? {} : { responseCapability: { type: "message" as const } }),
+      };
       requests = [...requests, pending];
       yield* send(pending);
       const result = yield* Fiber.join(asked);
       expect(result).toMatchObject({
         timedOut: false,
-        pendingQuestions: [{ id: question, blocking: true }],
+        pendingQuestions: [{ id: question, blocking }],
       });
+      if (source === "captured") expect(question).toHaveLength(371);
 
+      if (source === "completed-later") {
+        runs = [
+          ...runs.map((run) => ({ ...run, status: "completed" })),
+          { id: otherRunId, ordinal: 3, status: "completed", userMessageId: otherMessageId },
+        ];
+        requests = [
+          {
+            ...request(otherQuestion, "user_input", otherNode),
+            responseCapability: { type: "message" },
+          },
+          request(RuntimeRequestId.make("request:leftover-live"), "user_input", leftoverNode),
+          pending,
+        ];
+        const current = yield* service.waitForThread({
+          ...wait,
+          knownPendingQuestions: [{ id: otherQuestion, blocking: true }],
+        });
+        expect(current).toMatchObject({
+          timedOut: false,
+          pendingQuestions: [{ id: question, blocking: false }],
+        });
+      }
       const answered = yield* service
-        .waitForThread({ ...wait, knownPendingQuestions: [{ id: question, blocking: true }] })
+        .waitForThread({ ...wait, knownPendingQuestions: [{ id: question, blocking }] })
         .pipe(Effect.forkChild);
       yield* Effect.raceFirst(Queue.take(subscribed), Fiber.await(answered));
       const resolved = {
@@ -508,7 +586,19 @@ it.effect.each(["selected", "later"] as const)(
       requests = requests.map((candidate) => (candidate.id === question ? resolved : candidate));
       yield* send(resolved);
       expect(yield* Fiber.join(answered)).toMatchObject({ timedOut: false, pendingQuestions: [] });
-    }),
+      expect(warnings).toEqual(
+        source === "oversize"
+          ? [
+              {
+                provider: codex,
+                threadId,
+                idLength: MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH + 1,
+              },
+            ]
+          : [],
+      );
+    }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  },
 );
 
 it.effect("waitForThread can wait past an ended run for the thread's delegated work", () =>

@@ -18,7 +18,9 @@ import {
 import { expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -600,6 +602,79 @@ it.effect("falls back on an older peer and probes its wait options again after e
         false,
         true,
         false,
+      ]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("keeps omitted wait options when another refusal arrives after cache expiry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const seen: Array<readonly [boolean, boolean]> = [];
+      const toolkit = Toolkit.make(
+        Tool.make("t3_thread_wait", {
+          parameters: OrchestratorMcpThreadWaitInput,
+          success: OrchestratorMcpThreadWaitResult,
+          failure: OrchestratorMcpFailure,
+          failureMode: "return",
+        }),
+      );
+      const settled = {
+        threadId: boxThread,
+        runId: boxRun,
+        status: "completed",
+        timedOut: false,
+      } as const;
+      const b = yield* servePeer(
+        box,
+        McpHttpServer.toolkitRegistration(
+          toolkit,
+          McpToolAccess.toLayer(toolkit, {
+            t3_thread_wait: McpToolAccess.reads((input) =>
+              Effect.gen(function* () {
+                const questions = input.knownPendingQuestions !== undefined;
+                const nested = input.untilDelegatedWorkSettled === true;
+                seen.push([questions, nested]);
+                if (!questions && !nested) return settled;
+                if (nested) {
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }
+                const key = nested ? "untilDelegatedWorkSettled" : "knownPendingQuestions";
+                return yield* new OrchestratorMcpFailure({
+                  code: "invalid_request",
+                  message: `Invalid parameters for tool 't3_thread_wait': Unknown argument "${key}". Accepted arguments: threadId.`,
+                });
+              }),
+            ),
+          }),
+        ),
+      );
+      const a = yield* makeLaptop;
+      yield* linkTo(a.links, b, "auto");
+      const wait = (both: boolean) =>
+        a.call("thread:laptop-full", "t3_thread_wait", {
+          environmentId: box.environmentId,
+          threadId: boxThread,
+          knownPendingQuestions: [],
+          ...(both ? { untilDelegatedWorkSettled: true } : {}),
+        });
+      expect((yield* wait(false)).structuredContent).toEqual(settled);
+      yield* TestClock.adjust(Duration.minutes(4));
+      const crossing = yield* wait(true).pipe(Effect.forkChild);
+      yield* Effect.raceFirst(Deferred.await(entered), Fiber.await(crossing));
+      yield* TestClock.adjust(Duration.minutes(1));
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(crossing)).structuredContent).toEqual(settled);
+      expect((yield* wait(true)).structuredContent).toEqual(settled);
+      expect(seen).toEqual([
+        [true, false],
+        [false, false],
+        [false, true],
+        [false, false],
+        [false, false],
       ]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
