@@ -78,7 +78,9 @@ const readPendingRequest = Effect.fn("mcp.readPendingRequest")(function* (input:
   threadId?: ThreadId | undefined;
   requestId: RuntimeRequestId;
 }) {
-  const context = yield* readThread(input.threadId, ["runtimeRequests", "turnItems"]);
+  const context = yield* readThread(input.threadId, ["runtimeRequests", "turnItems"], {
+    turnItemTypes: ["user_input_request", "approval_request"],
+  });
   const request = context.projection.runtimeRequests.find(
     (request) =>
       request.id === input.requestId &&
@@ -311,25 +313,11 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           threadId: input.threadId,
           requestId,
         });
-        let response: { answers: ProviderUserInputAnswers } | { decision: "accept" | "decline" };
-        if (item.type === "user_input_request") {
-          response = { answers: yield* required(input.answers, "answers") };
-        } else {
-          const decision = yield* required(input.decision, "decision");
-          // Agents may always decline; accepting stays a human call unless the thread runs unsupervised.
-          if (decision === "accept" && projection.thread.runtimeMode !== "full-access")
-            return yield* new OrchestratorMcpFailure({
-              code: "runtime_mode_escalation_denied",
-              message: `Accept works only in a full-access thread; this thread runs ${projection.thread.runtimeMode}. Decline it, or ask the user to approve it.`,
-            });
-          if (decision === "accept" && item.fullAccessOverride === "ask_rule")
-            return yield* new OrchestratorMcpFailure({
-              code: "runtime_mode_escalation_denied",
-              message:
-                "The user's own ask rule requires the user to approve this. Decline it, or ask the user to approve it.",
-            });
-          response = { decision };
-        }
+        // Agents only decline approvals; approving one stays the user's call.
+        const response: { answers: ProviderUserInputAnswers } | { decision: "decline" } =
+          item.type === "user_input_request"
+            ? { answers: yield* required(input.answers, "answers") }
+            : { decision: yield* required(input.decision, "decision") };
         const result = yield* threads
           .dispatch({
             type: "runtime-request.respond",

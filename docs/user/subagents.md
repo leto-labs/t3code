@@ -17,6 +17,6 @@ T3 Code supports running parallel agents—either spawned natively by a provider
 - **Side panel vs. main view**: On web and desktop, subagents open as a tab in the right panel by default (`Cmd`/`Ctrl`-click or middle-click opens in the main view). Change the default in **Settings → Chat → Open subagents and side chats in**.
 - **Stopping & archiving**: Pressing **Stop** on a parent thread also stops its delegated subagents. Wait for or cancel active delegated tasks before archiving the parent thread.
 - **Permissions**: A delegated subagent can never exceed its parent thread's [permission mode](./permission-modes.md).
-- **Approvals**: When a delegated subagent waits on an approval, its parent agent is told. The parent agent can decline it, but can accept it only when the subagent's thread runs in Full access. Otherwise, approve it yourself in the subagent's thread.
+- **Approvals**: When a delegated subagent waits on an approval, its parent agent is told. The parent agent can decline it, but only you can approve it, in the subagent's thread.
 - **PR watching**: Subagents cannot watch pull requests—the parent thread watches PRs instead.
 - **Linked machines**: Delegating to a linked machine runs a regular thread on that host and wakes the parent when done; you can watch it live (read-only) without pairing directly ([Read a linked machine's threads](./remote-access.md#read-a-linked-machines-threads)).

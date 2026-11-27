@@ -305,10 +305,7 @@ it.effect("a pending question read keeps option previews", () => {
   );
 });
 
-const approvalTarget = (
-  runtimeMode: OrchestrationV2ThreadShell["runtimeMode"],
-  fullAccessOverride?: "ask_rule" | "provider_check",
-) => {
+const approvalTarget = (runtimeMode: OrchestrationV2ThreadShell["runtimeMode"]) => {
   const shell = McpToolAccessTestkit.liveThreadShell(threadId, { runtimeMode });
   const requestId = RuntimeRequestId.make(`approval:${runtimeMode}`);
   const dispatched: OrchestrationV2ServerCommand[] = [];
@@ -319,7 +316,8 @@ const approvalTarget = (
     Layer.provide(
       Layer.mock(ThreadManagement.ThreadManagementService)({
         getThreadShell: () => Effect.succeed(shell),
-        getProjectThreadRecords: () =>
+        // Honors the card filter, as the projection store does.
+        getProjectThreadRecords: (_input, _fields, filter) =>
           Effect.succeed({
             ...projection,
             runtimeRequests: [
@@ -355,9 +353,11 @@ const approvalTarget = (
                 requestId,
                 requestKind: "command",
                 prompt: "Run rm -rf build?",
-                ...(fullAccessOverride === undefined ? {} : { fullAccessOverride }),
-              },
-            ],
+              } as const,
+            ].filter(
+              (item) =>
+                filter?.turnItemTypes === undefined || filter.turnItemTypes.includes(item.type),
+            ),
           }),
         dispatch: (command) => {
           dispatched.push(command);
@@ -401,63 +401,17 @@ it.effect.each(["approval-required", "auto-accept-edits", "auto", "full-access"]
   },
 );
 
-it.effect("an agent can accept a pending approval only in a full-access thread", () => {
+it.effect("an agent cannot accept a pending approval, even in a full-access thread", () => {
   const target = approvalTarget("full-access");
   return Effect.gen(function* () {
-    expect(declaredFailure(yield* target.call({ action: "respond" }))).toMatchObject({
-      code: "invalid_request",
-      message: "This action needs `decision`.",
+    const refused = yield* Effect.flip(target.call({ action: "respond", decision: "accept" }));
+    expect(refused).toMatchObject({
+      _tag: "InvalidParams",
+      message: expect.stringContaining('Expected "decline"'),
     });
-    const accepted = yield* target.call({ action: "respond", decision: "accept" });
-    expect(accepted.isError).not.toBe(true);
-    expect(target.dispatched).toMatchObject([
-      { type: "runtime-request.respond", requestId: target.requestId, decision: "accept" },
-    ]);
+    expect(target.dispatched).toEqual([]);
   }).pipe(Effect.provide(target.layer));
 });
-
-it.effect(
-  "an agent cannot accept an approval the user's ask rule raised in a full-access thread",
-  () => {
-    const target = approvalTarget("full-access", "ask_rule");
-    return Effect.gen(function* () {
-      expect(
-        declaredFailure(yield* target.call({ action: "respond", decision: "accept" })),
-      ).toMatchObject({
-        code: "runtime_mode_escalation_denied",
-        message: expect.stringContaining("ask rule requires the user"),
-      });
-      expect(target.dispatched).toEqual([]);
-      yield* target.call({ action: "respond", decision: "decline" });
-      expect(target.dispatched).toMatchObject([{ decision: "decline" }]);
-    }).pipe(Effect.provide(target.layer));
-  },
-);
-
-it.effect("an agent can accept a provider-check approval in a full-access thread", () => {
-  const target = approvalTarget("full-access", "provider_check");
-  return Effect.gen(function* () {
-    const accepted = yield* target.call({ action: "respond", decision: "accept" });
-    expect(accepted.isError).not.toBe(true);
-    expect(target.dispatched).toMatchObject([{ decision: "accept" }]);
-  }).pipe(Effect.provide(target.layer));
-});
-
-it.effect.each(["approval-required", "auto-accept-edits", "auto"] as const)(
-  "an agent cannot accept a pending approval in a %s thread",
-  (runtimeMode) => {
-    const target = approvalTarget(runtimeMode);
-    return Effect.gen(function* () {
-      expect(
-        declaredFailure(yield* target.call({ action: "respond", decision: "accept" })),
-      ).toMatchObject({
-        code: "runtime_mode_escalation_denied",
-        message: expect.stringContaining(`this thread runs ${runtimeMode}`),
-      });
-      expect(target.dispatched).toEqual([]);
-    }).pipe(Effect.provide(target.layer));
-  },
-);
 
 it("bounds public command rejections and redacts internal dispatch causes", () => {
   const command = { commandId: CommandId.make("mcp-core-command"), commandType: "thread.settle" };

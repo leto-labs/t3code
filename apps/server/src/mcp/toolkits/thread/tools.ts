@@ -132,14 +132,14 @@ const question = Schema.Struct({
 const PendingRequestTool = Tool.make("t3_pending_request", {
   ...commandTool,
   description:
-    "Pending user questions and approvals in a thread. Omit `threadId` for this thread. list: their ids. read: one by `requestId`. respond: answer a question with `answers`, or resolve an approval with `decision`. Accept works only in a full-access thread.",
+    "Pending user questions and approvals in a thread. Omit `threadId` for this thread. list: their ids. read: one by `requestId`. respond: answer a question with `answers`, or decline an approval with `decision`. Only the user can approve.",
   parameters: Schema.Struct({
     action: Schema.Literals(["list", "read", "respond"]),
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     requestId: Schema.optional(RuntimeRequestId),
     answers: Schema.optional(ProviderUserInputAnswers),
-    decision: Schema.optional(Schema.Literals(["accept", "decline"])),
+    decision: Schema.optional(Schema.Literal("decline")),
   }),
   success: Schema.Union([
     Schema.Struct({ requestIds: Schema.Array(RuntimeRequestId) }),
