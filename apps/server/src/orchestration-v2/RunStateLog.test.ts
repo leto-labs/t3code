@@ -145,10 +145,16 @@ describe("RunStateLog file", () => {
             threadId,
             runId,
             attemptId,
-            kind: "reconciler",
-            from: "run running, attempt completed",
-            to: "finalized-and-redelivered",
-            cause: "reconciler:age-ms:660000",
+            kind: "run",
+            from: "running",
+            to: "completed",
+            cause: "command:finalize",
+          });
+          yield* log.recordEvent({
+            event: "reconciler.repair",
+            reason: "attempt_terminal_run_running",
+            threadId,
+            runId,
           });
         }).pipe(
           Effect.provide(
@@ -167,7 +173,7 @@ describe("RunStateLog file", () => {
         path.join(path.dirname(serverTracePath), "run-state.ndjson"),
       );
       const lines = text.trimEnd().split("\n");
-      assert.equal(lines.length, 1);
+      assert.equal(lines.length, 2);
       const line = JSON.parse(lines[0]!);
       assert.deepStrictEqual(Object.keys(line), [
         "ts",
@@ -179,7 +185,10 @@ describe("RunStateLog file", () => {
         "to",
         "cause",
       ]);
-      assert.equal(line.to, "finalized-and-redelivered");
+      assert.equal(line.to, "completed");
+      const repair = JSON.parse(lines[1]!);
+      assert.deepStrictEqual(Object.keys(repair), ["ts", "event", "reason", "threadId", "runId"]);
+      assert.equal(repair.reason, "attempt_terminal_run_running");
     }).pipe(Effect.provide(Layer.provideMerge(layerServerConfig, NodeServices.layer))),
   );
 });

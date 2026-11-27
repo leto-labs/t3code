@@ -25,17 +25,24 @@ export interface RunStateLogEntry {
   readonly threadId: ThreadId;
   readonly runId: RunId;
   readonly attemptId: RunAttemptId | null;
-  readonly kind: "run" | "attempt" | "delivery" | "reconciler";
+  readonly kind: "run" | "attempt" | "delivery";
   readonly from: string | null;
   readonly to: string;
   readonly cause: string;
 }
 
+/** A reconciler record: ids, statuses, counts and times only. */
+export interface RunStateLogEvent {
+  readonly event: string;
+  readonly [field: string]: unknown;
+}
+
 /** The default drops entries; the server provides the file-backed layer. */
 export class RunStateLog extends Context.Reference<{
   readonly record: (entry: RunStateLogEntry) => Effect.Effect<void>;
+  readonly recordEvent: (event: RunStateLogEvent) => Effect.Effect<void>;
 }>("t3/orchestration-v2/RunStateLog", {
-  defaultValue: () => ({ record: () => Effect.void }),
+  defaultValue: () => ({ record: () => Effect.void, recordEvent: () => Effect.void }),
 }) {}
 
 // Remembers each record's last state so only changes are logged. Bounded: the oldest entries
@@ -128,6 +135,9 @@ const encode = (ts: string, entry: RunStateLogEntry) =>
     cause: entry.cause,
   })}\n`;
 
+const encodeEvent = (ts: string, event: RunStateLogEvent) =>
+  `${JSON.stringify({ ts, ...event })}\n`;
+
 /** Writes `logs/run-state.ndjson`, off the commit path: lines buffer in memory and flush each second. */
 export const layer = Layer.effect(
   RunStateLog,
@@ -153,14 +163,15 @@ export const layer = Layer.effect(
     let buffer: Array<string> = [];
     let dropped = 0;
     // Runs for every run and attempt transition; the stream fiber needs no span per line.
-    const append = Effect.fnUntraced(function* (entry: RunStateLogEntry) {
+    const push = Effect.fnUntraced(function* (line: (ts: string) => string) {
       const now = yield* DateTime.now;
       if (buffer.length >= MAX_BUFFERED_LINES) {
         dropped += 1;
         return;
       }
-      buffer.push(encode(DateTime.formatIso(now), entry));
+      buffer.push(line(DateTime.formatIso(now)));
     });
+    const append = (entry: RunStateLogEntry) => push((ts) => encode(ts, entry));
     const flush = Effect.gen(function* () {
       if (dropped > 0) {
         yield* Effect.logWarning("run state log dropped lines", { filePath, dropped });
@@ -190,6 +201,7 @@ export const layer = Layer.effect(
       Effect.forkScoped,
     );
 
-    return RunStateLog.of({ record: append });
+    const appendEvent = (event: RunStateLogEvent) => push((ts) => encodeEvent(ts, event));
+    return RunStateLog.of({ record: append, recordEvent: appendEvent });
   }),
 );

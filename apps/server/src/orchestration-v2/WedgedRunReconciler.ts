@@ -29,7 +29,7 @@ import * as ProviderSessions from "./ProviderSessionManager.ts";
 import * as RunStateLog from "./RunStateLog.ts";
 
 /** RunExecutionService ends an attempt and its run in one transaction, so a gap only means a lost write. */
-const REPAIR_GRACE_MS = 30_000;
+const REPAIR_GRACE_MS = 2 * 60_000;
 /** Same rule as Core's external watchdog. Observed only: a Codex `sleep` call is silent for hours. */
 const STALE_OBSERVE_MS = 10 * 60_000;
 const TICK_INTERVAL_MS = 60_000;
@@ -45,6 +45,24 @@ const isTerminalAttemptStatus = (status: string | null): status is TerminalAttem
 const isSettledAttemptStatus = (status: string) =>
   isTerminalAttemptStatus(status) || status === "superseded";
 const OPEN_NODE_STATUSES = new Set(["idle", "pending", "running", "waiting"]);
+const RECENT_ITEM_COUNT = 3;
+
+/**
+ * Stable codes for `reconciler.repair` and `reconciler.observe` records. Every repair is a bug
+ * signal; an observation means a signal was uncertain, so nothing was changed.
+ */
+export type WedgedRunReason =
+  | "attempt_terminal_run_running"
+  | "attempt_terminal_provider_turn_live"
+  | "attempt_terminal_session_busy"
+  | "attempt_terminal_session_live"
+  | "attempt_terminal_session_unknown"
+  | "attempt_terminal_attempts_unsettled"
+  | "attempt_terminal_waiting_on_user"
+  | "attempt_terminal_write_refused"
+  | "attempt_terminal_repair_failed"
+  | "attempt_running_no_live_work"
+  | "inspection_failed";
 
 export class WedgedRunReconcilerError extends Schema.TaggedError<WedgedRunReconcilerError>()(
   "WedgedRunReconcilerError",
@@ -60,12 +78,7 @@ export class WedgedRunReconcilerError extends Schema.TaggedError<WedgedRunReconc
   }
 }
 
-export type WedgedRunAction =
-  | "finalized"
-  | "finalized-and-redelivered"
-  | "skipped-state-changed"
-  | "observed-stale"
-  | "failed";
+export type WedgedRunAction = "finalized" | "finalized-and-redelivered" | "none";
 
 export interface WedgedRunReconcileSummary {
   readonly scanned: number;
@@ -73,6 +86,8 @@ export interface WedgedRunReconcileSummary {
     readonly threadId: ThreadId;
     readonly runId: RunId;
     readonly attemptId: RunAttemptId | null;
+    readonly event: "reconciler.repair" | "reconciler.observe";
+    readonly reason: WedgedRunReason;
     readonly action: WedgedRunAction;
   }>;
 }
@@ -95,6 +110,9 @@ const RunningRunRow = Schema.Struct({
   attemptStatus: Schema.NullOr(Schema.String),
   attemptStartedAt: Schema.NullOr(Schema.String),
   attemptCompletedAt: Schema.NullOr(Schema.String),
+  deliveryDisposition: Schema.NullOr(Schema.String),
+  deliveryGeneration: Schema.NullOr(Schema.Number),
+  providerThreadRowId: Schema.NullOr(ProviderThreadId),
   providerSessionId: Schema.NullOr(ProviderSessionId),
   pendingBackgroundTaskCount: Schema.NullOr(Schema.Number),
 });
@@ -120,8 +138,8 @@ const make = Effect.gen(function* () {
   const backoff = yield* Ref.make(
     new Map<RunId, { readonly failures: number; readonly retryAtMs: number }>(),
   );
-  // Observed-only runs log once until they leave the stale state.
-  const observed = yield* Ref.make(new Set<RunId>());
+  // `${runId}:${reason}` of observations already logged; each logs once while its reason holds.
+  const observed = yield* Ref.make(new Set<string>());
 
   const mapError =
     (operation: WedgedRunReconcilerError["operation"], threadId?: ThreadId, runId?: RunId) =>
@@ -147,6 +165,9 @@ const make = Effect.gen(function* () {
           a.status AS "attemptStatus",
           json_extract(a.payload_json, '$.startedAt') AS "attemptStartedAt",
           json_extract(a.payload_json, '$.completedAt') AS "attemptCompletedAt",
+          json_extract(r.payload_json, '$.delegatedCompletion.disposition') AS "deliveryDisposition",
+          json_extract(r.payload_json, '$.delegatedCompletion.delivery.generation') AS "deliveryGeneration",
+          pt.provider_thread_id AS "providerThreadRowId",
           pt.provider_session_id AS "providerSessionId",
           json_array_length(pt.payload_json, '$.pendingBackgroundTasks') AS "pendingBackgroundTaskCount"
         FROM orchestration_v2_projection_runs r
@@ -170,12 +191,12 @@ const make = Effect.gen(function* () {
       WHERE run_id = ${row.runId}
     `;
     const attemptIds = attempts.map((attempt) => attempt.attemptId);
-    const liveTurns = yield* sql<{ readonly found: number }>`
-      SELECT 1 AS found
+    const providerTurns = yield* sql<{ readonly status: string }>`
+      SELECT status
       FROM orchestration_v2_projection_provider_turns
       WHERE run_attempt_id IN (SELECT value FROM json_each(${encodeIdList(attemptIds)}))
-        AND status IN ('pending', 'running')
-      LIMIT 1
+      ORDER BY ordinal DESC
+      LIMIT 5
     `;
     const pendingRequests = yield* sql<{ readonly found: number }>`
       SELECT 1 AS found
@@ -203,22 +224,55 @@ const make = Effect.gen(function* () {
         AND run_id = ${row.runId}
       LIMIT 1
     `;
-    const busySession =
-      row.providerSessionId === null || row.providerThreadId === null
-        ? false
-        : yield* sessions.hasBusyTurn({
-            providerSessionId: row.providerSessionId,
-            providerThreadId: row.providerThreadId,
-            runOrdinal: row.ordinal,
-          });
+    // Kinds, statuses and times only; item bodies stay out of the record.
+    const recentItems = yield* sql<{
+      readonly type: string;
+      readonly status: string;
+      readonly updatedAt: string;
+    }>`
+      SELECT type, status, updated_at AS "updatedAt"
+      FROM orchestration_v2_projection_turn_items
+      WHERE run_id = ${row.runId}
+      ORDER BY ordinal DESC
+      LIMIT ${RECENT_ITEM_COUNT}
+    `;
+    const queue = yield* sql<{ readonly queued: number; readonly held: number | null }>`
+      SELECT
+        COUNT(*) AS queued,
+        SUM(CASE WHEN json_extract(payload_json, '$.queueHeld') = 1 THEN 1 ELSE 0 END) AS held
+      FROM orchestration_v2_projection_runs
+      WHERE thread_id = ${row.threadId} AND status = 'queued'
+    `;
+    // Without the provider thread row the session cannot be checked, so it stays unknown.
+    const session =
+      row.providerThreadId === null || row.providerThreadRowId === null
+        ? ("unknown" as const)
+        : row.providerSessionId === null
+          ? ("none" as const)
+          : (yield* sessions.hasBusyTurn({
+                providerSessionId: row.providerSessionId,
+                providerThreadId: row.providerThreadId,
+                runOrdinal: row.ordinal,
+              }))
+            ? ("busy" as const)
+            : (yield* sessions.isLive(row.providerSessionId))
+              ? ("live" as const)
+              : ("none" as const);
     return {
+      attemptStatuses: attempts.map((attempt) => attempt.status),
       attemptsSettled: attempts.every((attempt) => isSettledAttemptStatus(attempt.status)),
-      liveProviderTurn: liveTurns.length > 0,
+      providerTurnStatuses: providerTurns.map((turn) => turn.status),
+      liveProviderTurn: providerTurns.some(
+        (turn) => turn.status === "pending" || turn.status === "running",
+      ),
       waitingOnUser: pendingRequests.length > 0 || waitingCards.length > 0,
       openWork: openWork.length > 0 || (row.pendingBackgroundTaskCount ?? 0) > 0,
-      busySession,
+      session,
+      queue: { queued: queue[0]?.queued ?? 0, held: queue[0]?.held ?? 0 },
+      recentItems,
     };
   });
+  type Inspection = Effect.Success<ReturnType<typeof inspectRun>>;
 
   /** Ends the run with its attempt's outcome, gated on the run still being this attempt's and running. */
   const finalizeRun = Effect.fn("WedgedRunReconciler.finalizeRun")(function* (
@@ -343,39 +397,71 @@ const make = Effect.gen(function* () {
     return true;
   });
 
-  const logAction = (input: {
-    readonly row: RunningRunRow;
-    readonly observedState: string;
+  const report = Effect.fnUntraced(function* (input: {
+    readonly event: "reconciler.repair" | "reconciler.observe";
+    readonly reason: WedgedRunReason;
+    readonly rule: string;
     readonly action: WedgedRunAction;
+    readonly row: RunningRunRow;
+    readonly inspection: Inspection | undefined;
+    readonly sinceMs: number;
     readonly ageMs: number;
-  }) =>
-    Effect.logInfo("orchestration.reconciler", {
-      threadId: input.row.threadId,
-      runId: input.row.runId,
-      attemptId: input.row.activeAttemptId,
-      observed: input.observedState,
+  }) {
+    const { row, inspection } = input;
+    const record = {
+      event: input.event,
+      reason: input.reason,
+      rule: input.rule,
       action: input.action,
+      threadId: row.threadId,
+      runId: row.runId,
+      attemptId: row.activeAttemptId,
+      runStatus: "running",
+      attemptStatus: row.attemptStatus,
+      attemptStatuses: inspection?.attemptStatuses ?? null,
+      providerTurnStatuses: inspection?.providerTurnStatuses ?? null,
+      session: inspection?.session ?? null,
+      waitingOnUser: inspection?.waitingOnUser ?? null,
+      openWork: inspection?.openWork ?? null,
+      deliveryDisposition: row.deliveryDisposition,
+      deliveryGeneration: row.deliveryGeneration,
+      queued: inspection?.queue.queued ?? null,
+      queueHeld: inspection?.queue.held ?? null,
+      recentItems: inspection?.recentItems ?? null,
+      wedgedSince: DateTime.formatIso(DateTime.makeUnsafe(input.sinceMs)),
       ageMs: input.ageMs,
-    }).pipe(
-      Effect.andThen(
-        runStateLog.record({
-          threadId: input.row.threadId,
-          runId: input.row.runId,
-          attemptId: input.row.activeAttemptId,
-          kind: "reconciler",
-          from: input.observedState,
-          to: input.action,
-          cause: `reconciler:age-ms:${input.ageMs}`,
-        }),
-      ),
-    );
+    };
+    yield* input.event === "reconciler.repair"
+      ? Effect.logWarning(input.event, record)
+      : Effect.logInfo(input.event, record);
+    yield* runStateLog.recordEvent(record);
+  });
+
+  const backOff = (runId: RunId, nowMs: number) =>
+    Ref.update(backoff, (current) => {
+      const failures = (current.get(runId)?.failures ?? 0) + 1;
+      const next = new Map(current);
+      next.set(runId, {
+        failures,
+        retryAtMs: nowMs + Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS),
+      });
+      return next;
+    });
+
+  const clearBackOff = (runId: RunId) =>
+    Ref.update(backoff, (current) => {
+      if (!current.has(runId)) return current;
+      const next = new Map(current);
+      next.delete(runId);
+      return next;
+    });
 
   const reconcile = Effect.fn("WedgedRunReconciler.reconcile", { attributes: routineSpan })(
     function* () {
       const nowMs = yield* Clock.currentTimeMillis;
       const rows = yield* scanRunningRuns;
       const actions: Array<WedgedRunReconcileSummary["actions"][number]> = [];
-      const stillObserved = new Set<RunId>();
+      const stillObserved = new Set<string>();
       const previouslyObserved = yield* Ref.get(observed);
       for (const row of rows) {
         if (actions.length >= MAX_ACTIONS_PER_TICK) break;
@@ -391,72 +477,117 @@ const make = Effect.gen(function* () {
         if (sinceMs === undefined) continue;
         const ageMs = nowMs - sinceMs;
         if (ageMs < (terminal ? REPAIR_GRACE_MS : STALE_OBSERVE_MS)) continue;
+        const rule = terminal
+          ? `attempt ${attemptStatus} and run running for over ${REPAIR_GRACE_MS} ms`
+          : `attempt ${attemptStatus} with no live work for over ${STALE_OBSERVE_MS} ms`;
 
-        const backOff = Ref.update(backoff, (current) => {
-          const failures = (current.get(row.runId)?.failures ?? 0) + 1;
-          const next = new Map(current);
-          next.set(row.runId, {
-            failures,
-            retryAtMs: nowMs + Math.min(BACKOFF_BASE_MS * 2 ** (failures - 1), BACKOFF_MAX_MS),
-          });
-          return next;
-        });
-        const logFailure = (cause: unknown) =>
-          backOff.pipe(
-            Effect.andThen(
-              Effect.logWarning("orchestration.reconciler.action-failed", {
-                threadId: row.threadId,
-                runId: row.runId,
-                cause,
-              }),
-            ),
-          );
-        const inspection = yield* inspectRun(row).pipe(
-          Effect.mapError(mapError("inspect", row.threadId, row.runId)),
-          Effect.catchCause((cause) => logFailure(cause).pipe(Effect.as(undefined))),
-        );
-        if (inspection === undefined) continue;
-        if (inspection.liveProviderTurn || inspection.busySession) continue;
-        if (!terminal) {
-          if (inspection.openWork || inspection.waitingOnUser) continue;
-          stillObserved.add(row.runId);
-          if (previouslyObserved.has(row.runId)) continue;
-          yield* logAction({
+        // Logs each run's observation once while its reason holds.
+        const observe = Effect.fnUntraced(function* (
+          reason: WedgedRunReason,
+          inspection: Inspection | undefined,
+        ) {
+          const key = `${row.runId}:${reason}`;
+          stillObserved.add(key);
+          if (previouslyObserved.has(key)) return;
+          yield* report({
+            event: "reconciler.observe",
+            reason,
+            rule,
+            action: "none",
             row,
-            observedState: `run running, attempt ${attemptStatus}, no live turn`,
-            action: "observed-stale",
+            inspection,
+            sinceMs,
             ageMs,
           });
-          actions.push({ ...row, attemptId, action: "observed-stale" });
+          actions.push({ ...row, attemptId, event: "reconciler.observe", reason, action: "none" });
+        });
+
+        const inspection = yield* inspectRun(row).pipe(
+          Effect.mapError(mapError("inspect", row.threadId, row.runId)),
+          Effect.tapCause((cause) =>
+            Effect.logWarning("reconciler.inspection-failed", {
+              threadId: row.threadId,
+              runId: row.runId,
+              cause,
+            }),
+          ),
+          Effect.catchCause(() => Effect.undefined),
+        );
+        if (inspection === undefined) {
+          yield* backOff(row.runId, nowMs);
+          yield* observe("inspection_failed", undefined);
           continue;
         }
-        if (!inspection.attemptsSettled || inspection.waitingOnUser) continue;
+        if (!terminal) {
+          // A live turn or a busy session is a healthy long run; only silence with nothing open is noted.
+          if (inspection.liveProviderTurn || inspection.session === "busy") continue;
+          if (inspection.openWork || inspection.waitingOnUser) continue;
+          yield* observe("attempt_running_no_live_work", inspection);
+          continue;
+        }
+        const uncertain: WedgedRunReason | undefined = inspection.liveProviderTurn
+          ? "attempt_terminal_provider_turn_live"
+          : inspection.session === "busy"
+            ? "attempt_terminal_session_busy"
+            : inspection.session === "live"
+              ? "attempt_terminal_session_live"
+              : inspection.session === "unknown"
+                ? "attempt_terminal_session_unknown"
+                : !inspection.attemptsSettled
+                  ? "attempt_terminal_attempts_unsettled"
+                  : inspection.waitingOnUser
+                    ? "attempt_terminal_waiting_on_user"
+                    : undefined;
+        if (uncertain !== undefined) {
+          yield* observe(uncertain, inspection);
+          continue;
+        }
 
-        const observedState = `run running, attempt ${attemptStatus}`;
         const outcome = yield* Effect.gen(function* () {
           const finalized = yield* finalizeRun(row, attemptId, attemptStatus);
-          if (!finalized.committed || finalized.run === undefined) {
-            return "skipped-state-changed" as const;
-          }
+          if (!finalized.committed || finalized.run === undefined) return "refused" as const;
           const redelivered = yield* redeliver(finalized.run, finalized.providerThread);
           return redelivered ? ("finalized-and-redelivered" as const) : ("finalized" as const);
         }).pipe(
           Effect.mapError(mapError("finalize", row.threadId, row.runId)),
-          Effect.catchCause((cause) => logFailure(cause).pipe(Effect.as("failed" as const))),
+          Effect.tapCause((cause) =>
+            Effect.logWarning("reconciler.repair-failed", {
+              threadId: row.threadId,
+              runId: row.runId,
+              cause,
+            }),
+          ),
+          Effect.catchCause(() => Effect.succeed("failed" as const)),
         );
-        // A refused write repeats each tick while a Stop is pending, so it backs off too.
-        if (outcome === "skipped-state-changed") {
-          yield* backOff;
-        } else if (outcome !== "failed") {
-          yield* Ref.update(backoff, (current) => {
-            if (!current.has(row.runId)) return current;
-            const next = new Map(current);
-            next.delete(row.runId);
-            return next;
-          });
+        if (outcome === "refused" || outcome === "failed") {
+          // A refused write repeats each tick while a Stop is pending, so it backs off too.
+          yield* backOff(row.runId, nowMs);
+          yield* observe(
+            outcome === "refused"
+              ? "attempt_terminal_write_refused"
+              : "attempt_terminal_repair_failed",
+            inspection,
+          );
+          continue;
         }
-        yield* logAction({ row, observedState, action: outcome, ageMs });
-        actions.push({ ...row, attemptId, action: outcome });
+        yield* clearBackOff(row.runId);
+        yield* report({
+          event: "reconciler.repair",
+          reason: "attempt_terminal_run_running",
+          rule,
+          action: outcome,
+          row,
+          inspection,
+          sinceMs,
+          ageMs,
+        });
+        actions.push({
+          ...row,
+          attemptId,
+          event: "reconciler.repair",
+          reason: "attempt_terminal_run_running",
+          action: outcome,
+        });
       }
       yield* Ref.set(observed, stillObserved);
       return { scanned: rows.length, actions } satisfies WedgedRunReconcileSummary;

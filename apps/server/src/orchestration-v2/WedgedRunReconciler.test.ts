@@ -12,6 +12,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
@@ -49,7 +50,9 @@ import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
+import * as ProviderSessions from "./ProviderSessionManager.ts";
 import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.testkit.ts";
+import * as RunStateLog from "./RunStateLog.ts";
 import * as RuntimeLayer from "./runtimeLayer.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as WedgedRunReconciler from "./WedgedRunReconciler.ts";
@@ -151,7 +154,37 @@ const layerOrchestration = Layer.mergeAll(
 );
 
 // The continuation worker and the reconciler share the orchestrator's request queue, as in production.
-const layerTest = Layer.mergeAll(ProviderContinuationService.layer, WedgedRunReconciler.layer).pipe(
+const LIVE_SESSION_ID = ProviderSessionId.make("provider-session:live");
+// Tests read their own run's records; every run id is unique to its test.
+const recordedEvents: Array<RunStateLog.RunStateLogEvent> = [];
+const layerRecordedRunStateLog = Layer.succeed(RunStateLog.RunStateLog, {
+  record: () => Effect.void,
+  recordEvent: (event) =>
+    Effect.sync(() => {
+      recordedEvents.push(event);
+    }),
+});
+// The real manager, with one session that stays open after its turn ended.
+const layerSessionsWithLiveSession = Layer.effect(
+  ProviderSessions.ProviderSessionManagerV2,
+  Effect.gen(function* () {
+    const sessions = yield* ProviderSessions.ProviderSessionManagerV2;
+    return ProviderSessions.ProviderSessionManagerV2.of({
+      ...sessions,
+      isLive: (providerSessionId) =>
+        providerSessionId === LIVE_SESSION_ID
+          ? Effect.succeed(true)
+          : sessions.isLive(providerSessionId),
+    });
+  }),
+);
+
+const layerTest = Layer.mergeAll(
+  ProviderContinuationService.layer,
+  WedgedRunReconciler.layer.pipe(
+    Layer.provide(Layer.merge(layerSessionsWithLiveSession, layerRecordedRunStateLog)),
+  ),
+).pipe(
   Layer.provide(Layer.merge(ProviderContinuationRequests.layer, IdAllocator.layer)),
   Layer.provideMerge(layerOrchestration),
 );
@@ -166,6 +199,8 @@ interface Seed {
   readonly pendingQuestion?: boolean;
   /** Codex Auto: placeholder provider thread id, no provider turn id. */
   readonly codexPlaceholder?: boolean;
+  /** The run's provider session is still open. */
+  readonly liveSession?: boolean;
 }
 
 const seedWedgedRun = (seed: Seed) =>
@@ -218,7 +253,7 @@ const seedWedgedRun = (seed: Seed) =>
           id: providerThreadId,
           driver,
           providerInstanceId: modelSelection.instanceId,
-          providerSessionId: null,
+          providerSessionId: seed.liveSession === true ? LIVE_SESSION_ID : null,
           appThreadId: threadId,
           ownerNodeId: rootNodeId,
           nativeThreadRef:
@@ -416,7 +451,9 @@ const seedWedgedRun = (seed: Seed) =>
   });
 
 const actionsFor = (summary: WedgedRunReconciler.WedgedRunReconcileSummary, runId: RunId) =>
-  summary.actions.filter((action) => action.runId === runId).map((action) => action.action);
+  summary.actions
+    .filter((action) => action.runId === runId)
+    .map((action) => `${action.event}:${action.reason}:${action.action}`);
 
 it.layer(layerTest)("WedgedRunReconciler", (it) => {
   it.effect("re-drives the run-5110 state: finalizes, redelivers the wake, starts the queue", () =>
@@ -433,7 +470,30 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
       const afterSequence = yield* sink.latestSequence();
 
       const summary = yield* reconciler.reconcile;
-      assert.deepStrictEqual(actionsFor(summary, seeded.runId), ["finalized-and-redelivered"]);
+      assert.deepStrictEqual(actionsFor(summary, seeded.runId), [
+        "reconciler.repair:attempt_terminal_run_running:finalized-and-redelivered",
+      ]);
+      const [record, ...others] = recordedEvents.filter((event) => event.runId === seeded.runId);
+      assert.deepStrictEqual(others, []);
+      assert.deepInclude(record, {
+        event: "reconciler.repair",
+        reason: "attempt_terminal_run_running",
+        action: "finalized-and-redelivered",
+        threadId: seeded.threadId,
+        attemptId: seeded.attemptId,
+        runStatus: "running",
+        attemptStatus: "completed",
+        attemptStatuses: ["completed"],
+        providerTurnStatuses: [],
+        session: "none",
+        deliveryDisposition: "open",
+        deliveryGeneration: 1,
+        queued: 1,
+        queueHeld: 0,
+        ageMs: 11 * 60_000,
+      });
+      assert.isString(record?.rule);
+      assert.isString(record?.wedgedSince);
 
       // The wake becomes a turn of its own, and the run that queued behind the wedge starts.
       yield* sink.stream({ afterSequence, eventType: "run.created" }).pipe(
@@ -478,11 +538,13 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
       const seeded = yield* seedWedgedRun({
         key: "no-delivery",
         attemptStatus: "completed",
-        ageMs: 60_000,
+        ageMs: 3 * 60_000,
       });
       const afterSequence = yield* sink.latestSequence();
       const summary = yield* reconciler.reconcile;
-      assert.deepStrictEqual(actionsFor(summary, seeded.runId), ["finalized"]);
+      assert.deepStrictEqual(actionsFor(summary, seeded.runId), [
+        "reconciler.repair:attempt_terminal_run_running:finalized",
+      ]);
       yield* sink.stream({ afterSequence, eventType: "run.updated" }).pipe(
         Stream.filter(
           (stored) =>
@@ -508,12 +570,23 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
       // A Codex Auto run sleeping in one tool call: no turn row, a placeholder thread id.
       name: "a silent Codex Auto attempt (logged only)",
       seed: { attemptStatus: "running", ageMs: 3 * 60 * 60_000, codexPlaceholder: true },
-      expected: ["observed-stale"],
+      expected: ["reconciler.observe:attempt_running_no_live_work:none"],
     },
     {
       name: "a run inside the repair grace",
-      seed: { attemptStatus: "completed", ageMs: 10_000, openDelivery: true },
+      seed: { attemptStatus: "completed", ageMs: 90_000, openDelivery: true },
       expected: [],
+    },
+    {
+      // Its process may still deliver the turn's last events, so the state is uncertain.
+      name: "a terminal attempt whose session is still live",
+      seed: {
+        attemptStatus: "completed",
+        ageMs: 11 * 60_000,
+        openDelivery: true,
+        liveSession: true,
+      },
+      expected: ["reconciler.observe:attempt_terminal_session_live:none"],
     },
     {
       name: "a run waiting on a question",
@@ -523,7 +596,7 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
         openDelivery: true,
         pendingQuestion: true,
       },
-      expected: [],
+      expected: ["reconciler.observe:attempt_terminal_waiting_on_user:none"],
     },
   ] as const)("leaves $name running", ({ name, seed, expected }) =>
     Effect.gen(function* () {
@@ -532,6 +605,15 @@ it.layer(layerTest)("WedgedRunReconciler", (it) => {
       const seeded = yield* seedWedgedRun({ key: name.replaceAll(" ", "-"), ...seed });
       const summary = yield* reconciler.reconcile;
       assert.deepStrictEqual(actionsFor(summary, seeded.runId), [...expected]);
+      assert.deepStrictEqual(
+        recordedEvents
+          .filter((event) => event.runId === seeded.runId)
+          .map((event) => `${event.event}:${String(event.reason)}:${String(event.action)}`),
+        [...expected],
+      );
+      // An observation logs once while its reason holds.
+      const again = yield* reconciler.reconcile;
+      assert.deepStrictEqual(actionsFor(again, seeded.runId), []);
       const projection = yield* orchestrator.getThreadProjection(seeded.threadId);
       assert.equal(projection.runs.find((run) => run.id === seeded.runId)?.status, "running");
       assert.equal(projection.runs.find((run) => run.id === seeded.queuedRunId)?.status, "queued");
