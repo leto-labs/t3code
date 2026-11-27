@@ -1,7 +1,8 @@
-import { assert, it } from "@effect/vitest";
+import { assert, it, vi } from "@effect/vitest";
 import * as TestClock from "effect/testing/TestClock";
 import {
   ChatAttachmentId,
+  CheckpointId,
   COMPOSER_CONTEXT_TERMINAL_TEXT_MAX_CHARS,
   ComposerContextId,
   CommandId,
@@ -2646,6 +2647,58 @@ it.effect("wakes the parent for a sibling result after a steer restarts the comp
         "delivered",
         "the steered wake run's own task stays claimed after that run completed",
       );
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("keeps a parent run update committed while a steer restarts its completion wake", () =>
+  Effect.gen(function* () {
+    const harness = yield* nextTurnSelectionHarness("steered-wake-parent-update", true, false);
+    yield* Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const checkpointId = CheckpointId.make("checkpoint:steered-wake-parent-update");
+      const commit = sink.commitCommand;
+      let updated = false;
+      const { threadId, origin } = yield* Effect.acquireUseRelease(
+        Effect.sync(() =>
+          vi.spyOn(sink, "commitCommand").mockImplementation((input) =>
+            Effect.gen(function* () {
+              if (!updated && input.commandId === "command:steer-wake") {
+                updated = true;
+                // The parent's checkpoint lands after the steer read the parent run.
+                const parent = (yield* orchestrator.getThreadProjection(input.threadId)).runs.find(
+                  (run) => run.ordinal === 1,
+                )!;
+                const { delegatedCompletion: _cohort, ...captured } = parent;
+                yield* sink.write({
+                  events: [
+                    {
+                      id: EventId.make("event:steered-wake-parent-checkpoint"),
+                      type: "run.updated",
+                      threadId: input.threadId,
+                      runId: parent.id,
+                      occurredAt: yield* DateTime.now,
+                      payload: { ...captured, checkpointId },
+                    },
+                  ],
+                });
+              }
+              return yield* commit(input);
+            }).pipe(Effect.orDie),
+          ),
+        ),
+        () => restartCompletionWake(harness, false),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      assert.isTrue(updated);
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+        (run) => run.id === origin.runId,
+      )!;
+      assert.equal(parent.status, "completed");
+      assert.equal(parent.checkpointId, checkpointId);
+      assert.equal(parent.delegatedCompletion?.disposition, "open");
+      assert.isNull(parent.delegatedCompletion?.delivery);
     }).pipe(Effect.provide(harness.layer));
   }),
 );

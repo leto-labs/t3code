@@ -1847,6 +1847,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return withId;
       });
 
+  type RunUpdatedEvent = Extract<OrchestrationV2DomainEvent, { readonly type: "run.updated" }>;
+  const delegatedCompletionOnlyEvents = new WeakSet<OrchestrationV2DomainEvent>();
+  // A cohort write's run snapshot is read before the commit, so a run can finish in between.
+  // Marked writes commit only delegatedCompletion onto the stored row; see delegatedCompletionOnlyRunIds.
+  const emitDelegatedCompletionOnly =
+    (events: Ref.Ref<Array<OrchestrationV2DomainEvent>>, command: OrchestrationV2ServerCommand) =>
+    (event: Omit<RunUpdatedEvent, "id">) =>
+      emit(
+        events,
+        command,
+      )(event).pipe(
+        Effect.tap((stored) => Effect.sync(() => delegatedCompletionOnlyEvents.add(stored))),
+      );
+  // A run the command also writes in full keeps that write: it changes the run on purpose.
+  const delegatedCompletionOnlyRunIds = (
+    events: ReadonlyArray<OrchestrationV2DomainEvent>,
+    returnedRunId: RunId | undefined,
+  ) => {
+    const marked = new Set<RunId>(returnedRunId === undefined ? [] : [returnedRunId]);
+    const written = new Set<RunId>();
+    for (const event of events) {
+      if (event.type !== "run.updated" && event.type !== "run.created") continue;
+      (delegatedCompletionOnlyEvents.has(event) ? marked : written).add(event.payload.id);
+    }
+    return [...marked].filter((runId) => runId === returnedRunId || !written.has(runId));
+  };
+
   // Detaching kills background work running inside the provider process.
   // Probe even with an empty roster: Claude's native subagents never reach
   // pendingBackgroundTasks. Sessions shared across threads probe per thread.
@@ -2324,7 +2351,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: { ...task, completionDelivery: { state, observedByRunId: null }, updatedAt: now },
       });
     }
-    yield* emitEvent({
+    yield* emitDelegatedCompletionOnly(
+      input.events,
+      input.command,
+    )({
       type: "run.updated",
       threadId,
       runId: parentRun.id,
@@ -4056,7 +4086,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             nextGeneration: cohort?.nextGeneration ?? 1,
             delivery: null,
           } as const);
-    yield* emitEvent({
+    yield* emitDelegatedCompletionOnly(
+      input.events,
+      input.command,
+    )({
       type: "run.updated",
       threadId: parentRun.threadId,
       runId: parentRun.id,
@@ -10613,7 +10646,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     };
     const emitEvent = emit(events, command);
     // Stop disposed the results owed at the time; a follow-up started after it is owed a wake again.
-    // Re-read the owner so a terminal update since `parent` was read is kept.
     const currentOwner =
       owner.delegatedCompletion?.disposition === "stopped"
         ? (yield* projectionStore
@@ -10621,7 +10653,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             .pipe(mapDispatchError(command))).runs[0]
         : undefined;
     if (currentOwner?.delegatedCompletion?.disposition === "stopped") {
-      yield* emitEvent({
+      yield* emitDelegatedCompletionOnly(
+        events,
+        command,
+      )({
         type: "run.updated",
         threadId: parentThreadId,
         runId: currentOwner.id,
@@ -16258,18 +16293,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       ];
     });
-    yield* writeSystemEvents([
-      ...taskEvents,
-      {
-        type: "run.updated",
-        threadId,
-        runId: updatedParentRun.id,
-        ...(updatedParentRun.rootNodeId === null ? {} : { nodeId: updatedParentRun.rootNodeId }),
-        providerInstanceId: updatedParentRun.providerInstanceId,
-        occurredAt: now,
-        payload: updatedParentRun,
-      },
-    ]);
+    yield* writeSystemEvents(
+      [
+        ...taskEvents,
+        {
+          type: "run.updated",
+          threadId,
+          runId: updatedParentRun.id,
+          ...(updatedParentRun.rootNodeId === null ? {} : { nodeId: updatedParentRun.rootNodeId }),
+          providerInstanceId: updatedParentRun.providerInstanceId,
+          occurredAt: now,
+          payload: updatedParentRun,
+        },
+      ],
+      [],
+      { updateDelegatedCompletionOnly: true },
+    );
     if (nextDelivery !== null) {
       yield* offerDelegatedCompletionDelivery(threadId, parentRun.id);
     }
@@ -16321,7 +16360,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
         readonly reason: string;
       };
-      readonly updateDelegatedCompletionOnlyRunId?: RunId;
+      readonly updateDelegatedCompletionOnlyRunIds?: ReadonlyArray<RunId>;
     },
     OrchestratorV2Error
   > {
@@ -16814,13 +16853,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       default:
         return yield* dispatchUnsupported(command);
     }
+    const plannedEvents = yield* Ref.get(events);
+    const updateDelegatedCompletionOnlyRunIds = delegatedCompletionOnlyRunIds(
+      plannedEvents,
+      updateDelegatedCompletionOnlyRunId,
+    );
     return {
-      events: yield* Ref.get(events),
+      events: plannedEvents,
       effects: yield* Ref.get(effects),
       ...(cancelUnsettledEffects === undefined ? {} : { cancelUnsettledEffects }),
-      ...(updateDelegatedCompletionOnlyRunId === undefined
+      ...(updateDelegatedCompletionOnlyRunIds.length === 0
         ? {}
-        : { updateDelegatedCompletionOnlyRunId }),
+        : { updateDelegatedCompletionOnlyRunIds }),
     };
   });
 
@@ -17083,9 +17127,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
-        ...(plan.updateDelegatedCompletionOnlyRunId === undefined
+        ...(plan.updateDelegatedCompletionOnlyRunIds === undefined
           ? {}
-          : { updateDelegatedCompletionOnlyRunId: plan.updateDelegatedCompletionOnlyRunId }),
+          : { updateDelegatedCompletionOnlyRunIds: plan.updateDelegatedCompletionOnlyRunIds }),
       })
       .pipe(
         Effect.mapError(

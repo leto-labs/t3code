@@ -217,8 +217,8 @@ export interface EventSinkV2Shape {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
     };
-    /** Like writeWithEffects' updateDelegatedCompletionOnly, for this run's run.updated only. */
-    readonly updateDelegatedCompletionOnlyRunId?: RunId;
+    /** Like writeWithEffects' updateDelegatedCompletionOnly, for these runs' run.updated only. */
+    readonly updateDelegatedCompletionOnlyRunIds?: ReadonlyArray<RunId>;
   }) => Effect.Effect<
     {
       readonly receipt: CommandReceiptStore.CommandReceiptV2;
@@ -899,11 +899,11 @@ const layerBase: Layer.Layer<
             }
           }
 
-          const runId = input.updateDelegatedCompletionOnlyRunId;
+          const runIds = input.updateDelegatedCompletionOnlyRunIds;
           const normalized = yield* normalizeEvents(
-            runId === undefined
+            runIds === undefined
               ? input.events
-              : yield* updateDelegatedCompletionOnly(input.events, (id) => id === runId),
+              : yield* updateDelegatedCompletionOnly(input.events, (id) => runIds.includes(id)),
           );
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,
