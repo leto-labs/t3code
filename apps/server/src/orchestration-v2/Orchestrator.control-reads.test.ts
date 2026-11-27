@@ -1444,10 +1444,9 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
     const question = requestEvent("event:question", "request:question", "live");
     const asyncQuestion = requestEvent("event:async-question", "request:async-question");
     const answered = requestEvent("event:answered", "request:answered", "live");
-    const approval = requestEvent("event:approval", "request:approval", "message", "command");
     const eventSink = yield* EventSink.EventSinkV2;
     yield* eventSink.write({
-      events: [question, asyncQuestion, answered, approval],
+      events: [question, asyncQuestion, answered],
     });
 
     yield* reactor.handle(question);
@@ -1475,7 +1474,6 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
       ],
     });
     yield* reactor.handle(answered);
-    yield* reactor.handle(approval);
 
     const wakes = (yield* projections.getThreadProjection(parentThreadId)).messages.filter(
       (message) => message.notification !== undefined,
@@ -1693,6 +1691,109 @@ it.effect("wakes the parent once when its delegated task asks a question", () =>
       kind: "delegated_task",
       taskIds: [followup.delegatedTaskId],
       childThreadId: task.childThreadId!,
+    });
+  }).pipe(Effect.provide(DelegatedTaskQuestionReactor.layer.pipe(Layer.provideMerge(layerTest)))),
+);
+
+it.effect("wakes the parent when its delegated task is blocked on an approval", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const reactor = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const parentThreadId = ThreadId.make("thread:approval-parent");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-approval-parent"),
+      threadId: parentThreadId,
+      projectId: ProjectId.make("project:approval"),
+      title: "Parent",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* orchestrator.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("start-approval-parent"),
+      threadId: parentThreadId,
+      messageId: MessageId.make("message:approval-parent"),
+      text: "Delegate the edit",
+      attachments: [],
+      dispatchMode: { type: "start_immediately" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const parentRun = (yield* projections.getThreadProjection(parentThreadId)).runs[0]!;
+    yield* orchestrator.dispatch({
+      type: "delegated_task.request",
+      commandId: CommandId.make("delegate-approval-task"),
+      parentThreadId,
+      parentRunId: parentRun.id,
+      parentNodeId: parentRun.rootNodeId!,
+      task: "Edit the file",
+      completionWake: "settled_only",
+      modelSelection,
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      createdBy: "agent",
+      creationSource: "mcp",
+    });
+    const task = (yield* projections.getThreadProjection(parentThreadId)).subagents[0]!;
+    const childRun = (yield* projections.getThreadRecords(task.childThreadId!, ["runs"])).runs[0]!;
+    const now = yield* DateTime.now;
+    const approval = {
+      id: EventId.make("event:child-approval"),
+      type: "runtime-request.updated",
+      threadId: task.childThreadId!,
+      runId: childRun.id,
+      occurredAt: now,
+      payload: {
+        id: RuntimeRequestId.make("request:child-approval"),
+        nodeId: childRun.rootNodeId!,
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "command",
+        status: "pending",
+        responseCapability: {
+          type: "live",
+          providerSessionId: ProviderSessionId.make("session:approval"),
+        },
+        createdAt: now,
+        resolvedAt: null,
+      },
+    } satisfies OrchestrationV2DomainEvent;
+    yield* eventSink.write({ events: [approval] });
+    const notifications = Effect.map(
+      projections.getThreadRecords(parentThreadId, ["messages"]),
+      ({ messages }) => messages.filter((message) => message.notification !== undefined),
+    );
+
+    // The parent's blocking delegate_task wait reports it as pendingApproval.
+    yield* reactor.handle(approval);
+    assert.lengthOf(yield* notifications, 0);
+
+    const parentCompleted = {
+      id: EventId.make("event:approval-parent-completed"),
+      type: "run.updated",
+      threadId: parentThreadId,
+      runId: parentRun.id,
+      occurredAt: now,
+      payload: { ...parentRun, status: "completed", completedAt: now },
+    } satisfies OrchestrationV2DomainEvent;
+    yield* eventSink.write({ events: [parentCompleted] });
+    yield* reactor.handle(parentCompleted);
+    const wakes = yield* notifications;
+    assert.lengthOf(wakes, 1);
+    assert.include(wakes[0]?.text, `blocked on a command approval`);
+    assert.include(wakes[0]?.text, `requestId ${approval.payload.id}.`);
+    assert.deepEqual(wakes[0]?.notification, {
+      source: { kind: "delegated_task", taskIds: [task.id], childThreadId: task.childThreadId! },
+      outcome: "updated",
+      summary: 'Delegated task "Edit the file" needs an approval',
     });
   }).pipe(Effect.provide(DelegatedTaskQuestionReactor.layer.pipe(Layer.provideMerge(layerTest)))),
 );

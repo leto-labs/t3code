@@ -499,6 +499,7 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   itemCount: NonNegativeInt,
   pendingRequestCount: NonNegativeInt,
   pendingRemoteChildQuestionCount: Schema.optional(NonNegativeInt),
+  pendingRemoteChildApprovalCount: Schema.optional(NonNegativeInt),
   archived: Schema.Boolean,
   settled: Schema.Boolean,
   settledAt: Schema.NullOr(IsoDateTime),

@@ -1014,6 +1014,8 @@ export const MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH = 1_024;
 const OrchestrationV2DelegatedTaskQuestion = Schema.Struct({
   id: RuntimeRequestId.check(Schema.isMaxLength(MAX_REMOTE_DELEGATED_TASK_QUESTION_ID_LENGTH)),
   blocking: Schema.Boolean,
+  /** Set for an approval; absent for a user-input question. */
+  kind: Schema.optional(ProviderRequestKind),
 });
 export type OrchestrationV2DelegatedTaskQuestion = typeof OrchestrationV2DelegatedTaskQuestion.Type;
 export const OrchestrationV2DelegatedTaskQuestions = Schema.Array(

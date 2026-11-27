@@ -1165,12 +1165,13 @@ it.effect("a task delegated to the box wakes the laptop's parent when it ends th
 );
 
 it.effect.each([
-  { clearedBy: "answer", blocking: false, count: 1 },
-  { clearedBy: "finish", blocking: true, count: 1 },
-  { clearedBy: "cancel", blocking: true, count: 2 },
+  { clearedBy: "answer", blocking: false, count: 1, kind: undefined },
+  { clearedBy: "finish", blocking: true, count: 1, kind: undefined },
+  { clearedBy: "cancel", blocking: true, count: 2, kind: undefined },
+  { clearedBy: "answer", blocking: true, count: 1, kind: "command" },
 ] as const)(
-  "remote question updates reach the parent and clear on $clearedBy",
-  ({ clearedBy, blocking, count }) =>
+  "remote $kind question updates reach the parent and clear on $clearedBy",
+  ({ clearedBy, blocking, count, kind }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const thread = yield* makeBoxThread;
@@ -1194,6 +1195,7 @@ it.effect.each([
               : `request:box-question:${index}`,
           ),
           blocking,
+          ...(kind === undefined ? {} : { kind }),
         }));
         const afterSequence = yield* a.threads.getThreadEventSequence(parentThreadId);
         yield* SubscriptionRef.set(thread.questions, questions);
@@ -1230,6 +1232,7 @@ it.effect.each([
             text: expect.stringContaining(`environmentId ${box.environmentId}`),
             notification: { outcome: "updated", source: { taskIds: [task.taskId] } },
           });
+          if (kind !== undefined) expect(message.text).toContain(`blocked on a ${kind} approval`);
         }
         const assertSummary = (pending: boolean, status = "running") =>
           Effect.gen(function* () {
@@ -1238,7 +1241,8 @@ it.effect.each([
               thread: {
                 status,
                 pendingRequestCount: 0,
-                pendingRemoteChildQuestionCount: pending ? count : 0,
+                pendingRemoteChildQuestionCount: pending && kind === undefined ? count : 0,
+                pendingRemoteChildApprovalCount: pending && kind !== undefined ? count : 0,
               },
             });
             const listed = yield* a.call("t3_thread_list", { statuses: [status] });
@@ -1250,7 +1254,11 @@ it.effect.each([
           Effect.gen(function* () {
             const taskStatus = yield* a.call("task_status", { taskId: task.taskId });
             expect(taskStatus.structuredContent).toMatchObject({
-              hasPendingQuestion: pending && blocking,
+              hasPendingQuestion: pending && blocking && kind === undefined,
+              pendingApproval:
+                pending && kind !== undefined
+                  ? { requestId: questions[0]!.id, kind, runId: expect.any(String) }
+                  : null,
             });
             yield* assertSummary(pending);
           });

@@ -16,7 +16,11 @@ import * as Stream from "effect/Stream";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import { forkParked } from "../serverActivation.ts";
-import { delegatedTaskQuestionWake } from "./delegatedTaskQuestionWake.ts";
+import {
+  delegatedTaskQuestion,
+  delegatedTaskQuestionWake,
+  wakesDelegatedTaskParent,
+} from "./delegatedTaskQuestionWake.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -37,12 +41,7 @@ const make = Effect.gen(function* () {
     request: OrchestrationV2RuntimeRequest,
   ) {
     if (task.childThreadId === null) return;
-    yield* engine.dispatch(
-      delegatedTaskQuestionWake(task, {
-        id: request.id,
-        blocking: request.responseCapability.type !== "message",
-      }),
-    );
+    yield* engine.dispatch(delegatedTaskQuestionWake(task, delegatedTaskQuestion(request)));
   });
 
   const cancelQueuedWakes = Effect.fnUntraced(function* (
@@ -99,7 +98,7 @@ const make = Effect.gen(function* () {
           ]);
           for (const request of child.runtimeRequests) {
             if (
-              request.kind !== "user_input" ||
+              !wakesDelegatedTaskParent(request.kind) ||
               request.status !== "pending" ||
               request.responseCapability.type !== "live"
             ) {
@@ -131,7 +130,9 @@ const make = Effect.gen(function* () {
         const { runtimeRequests } = yield* projections.getThreadRecords(task.childThreadId, [
           "runtimeRequests",
         ]);
-        const questions = runtimeRequests.filter((request) => request.kind === "user_input");
+        const questions = runtimeRequests.filter((request) =>
+          wakesDelegatedTaskParent(request.kind),
+        );
         if (questions.length === 0) return;
         const child = yield* projections.getThreadRecords(task.childThreadId, ["runs", "nodes"]);
         const taskRunIds = new Set(
@@ -158,7 +159,10 @@ const make = Effect.gen(function* () {
         );
         return;
       }
-      if (event.type !== "runtime-request.updated" || event.payload.kind !== "user_input") {
+      if (
+        event.type !== "runtime-request.updated" ||
+        !wakesDelegatedTaskParent(event.payload.kind)
+      ) {
         return;
       }
       const child = yield* projections.getThread(event.threadId);
@@ -221,7 +225,7 @@ const make = Effect.gen(function* () {
       case "subagent.updated":
         return Effect.succeed(event.payload.threadId);
       case "runtime-request.updated":
-        return event.payload.kind === "user_input"
+        return wakesDelegatedTaskParent(event.payload.kind)
           ? projections
               .getThread(event.threadId)
               .pipe(Effect.map((child) => child.lineage.parentThreadId))

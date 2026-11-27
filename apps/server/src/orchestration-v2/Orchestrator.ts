@@ -152,6 +152,7 @@ import { notificationTurnItem } from "@t3tools/provider-core/server/notification
 import {
   delegatedTaskQuestionMessageId,
   delegatedTaskQuestionWake,
+  wakesDelegatedTaskParent,
 } from "./delegatedTaskQuestionWake.ts";
 import {
   cancelledBeforeStart,
@@ -2554,7 +2555,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     return !child.runtimeRequests.some(
       (request) =>
-        request.kind === "user_input" &&
+        wakesDelegatedTaskParent(request.kind) &&
         request.status === "pending" &&
         messageId === delegatedTaskQuestionMessageId(task, request.id),
     );

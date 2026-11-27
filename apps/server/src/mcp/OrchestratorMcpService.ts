@@ -54,7 +54,6 @@ import {
   type ProviderInteractionMode,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
-  ProviderRequestKind,
   type RuntimeMode,
   type ScheduledTask,
   type ScheduledTaskUpsertInput,
@@ -116,6 +115,7 @@ import {
 } from "../orchestration-v2/RestartBackgroundNote.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import { placeholderThreadTitle } from "../orchestration-v2/placeholderThreadTitle.ts";
+import { isApprovalRequestKind } from "../orchestration-v2/delegatedTaskQuestionWake.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
@@ -638,8 +638,6 @@ function endsTaskWait(result: OrchestratorMcpDelegateTaskResult): boolean {
   );
 }
 
-const isApprovalRequestKind = Schema.is(ProviderRequestKind);
-
 function pendingTaskApproval(
   child: Pick<OrchestrationV2ThreadProjection, "runs" | "nodes" | "runtimeRequests">,
   taskId: NodeId,
@@ -675,6 +673,15 @@ function pendingTaskApproval(
     }
   }
   return approval;
+}
+
+function remotePendingApproval(
+  remote: OrchestrationV2Subagent["remoteChild"],
+): OrchestratorMcpDelegateTaskResult["pendingApproval"] {
+  const approval = remote?.pendingQuestions?.find((question) => question.kind !== undefined);
+  return approval?.kind === undefined || remote?.runId === undefined
+    ? null
+    : { requestId: approval.id, kind: approval.kind, runId: remote.runId };
 }
 
 /** Every task `directAppOwnedChildTasks` can return, so callers load only those. */
@@ -1135,7 +1142,12 @@ function threadDetail(
     pendingRequestCount: projection.runtimeRequests.filter(
       (request) => request.status === "pending",
     ).length,
-    pendingRemoteChildQuestionCount: remoteQuestions.length,
+    pendingRemoteChildQuestionCount: remoteQuestions.filter(
+      (question) => question.kind === undefined,
+    ).length,
+    pendingRemoteChildApprovalCount: remoteQuestions.filter(
+      (question) => question.kind !== undefined,
+    ).length,
     archived: projection.thread.archivedAt !== null,
     ...threadSettlement(projection.thread),
     ...threadSnooze(shell, nowMs),
@@ -2297,8 +2309,11 @@ const make = Effect.gen(function* () {
       latestTerminalResultContextTransferId: null,
       hasPendingQuestion:
         !terminal &&
-        (task.remoteChild?.pendingQuestions?.some((question) => question.blocking) ?? false),
-      pendingApproval: null,
+        (task.remoteChild?.pendingQuestions?.some(
+          (question) => question.blocking && question.kind === undefined,
+        ) ??
+          false),
+      pendingApproval: terminal ? null : remotePendingApproval(task.remoteChild),
       waitTimedOut,
     } satisfies OrchestratorMcpDelegateTaskResult;
   });

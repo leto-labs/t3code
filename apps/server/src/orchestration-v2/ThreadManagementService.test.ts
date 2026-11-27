@@ -407,7 +407,7 @@ const decodeClaudeQuestion = Schema.decodeUnknownEffect(
 );
 
 it.effect.each(["selected", "captured", "later", "completed-later", "oversize"] as const)(
-  "waitForThread reports questions in the %s run and wakes when they clear",
+  "waitForThread reports questions and approvals in the %s run and wakes when they clear",
   (source) => {
     const warnings: unknown[] = [];
     const logger = Logger.make(({ logLevel, message }) => {
@@ -535,8 +535,9 @@ it.effect.each(["selected", "captured", "later", "completed-later", "oversize"] 
           event: { threadId, type: "runtime-request.updated", payload },
         } as OrchestrationV2StoredEvent);
 
+      const approvalEntry = { id: approval, blocking: true, kind: "command" as const };
       const asked = yield* service
-        .waitForThread({ ...wait, knownPendingQuestions: [] })
+        .waitForThread({ ...wait, knownPendingQuestions: [approvalEntry] })
         .pipe(Effect.forkChild);
       yield* Effect.raceFirst(Queue.take(subscribed), Fiber.await(asked));
       const pending = captured?.request ?? {
@@ -548,7 +549,7 @@ it.effect.each(["selected", "captured", "later", "completed-later", "oversize"] 
       const result = yield* Fiber.join(asked);
       expect(result).toMatchObject({
         timedOut: false,
-        pendingQuestions: [{ id: question, blocking }],
+        pendingQuestions: [approvalEntry, { id: question, blocking }],
       });
       if (source === "captured") expect(question).toHaveLength(371);
 
@@ -574,8 +575,13 @@ it.effect.each(["selected", "captured", "later", "completed-later", "oversize"] 
           pendingQuestions: [{ id: question, blocking: false }],
         });
       }
+      // The approval belongs to a run that completed later, so it no longer blocks the task.
+      const stillPending = source === "completed-later" ? [] : [approvalEntry];
       const answered = yield* service
-        .waitForThread({ ...wait, knownPendingQuestions: [{ id: question, blocking }] })
+        .waitForThread({
+          ...wait,
+          knownPendingQuestions: [...stillPending, { id: question, blocking }],
+        })
         .pipe(Effect.forkChild);
       yield* Effect.raceFirst(Queue.take(subscribed), Fiber.await(answered));
       const resolved = {
@@ -585,7 +591,10 @@ it.effect.each(["selected", "captured", "later", "completed-later", "oversize"] 
       };
       requests = requests.map((candidate) => (candidate.id === question ? resolved : candidate));
       yield* send(resolved);
-      expect(yield* Fiber.join(answered)).toMatchObject({ timedOut: false, pendingQuestions: [] });
+      expect(yield* Fiber.join(answered)).toMatchObject({
+        timedOut: false,
+        pendingQuestions: stillPending,
+      });
       expect(warnings).toEqual(
         source === "oversize"
           ? [

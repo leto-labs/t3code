@@ -77,6 +77,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimit.ts";
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import { cancelledBeforeStart } from "./RestartBackgroundNote.ts";
+import { delegatedTaskQuestion, wakesDelegatedTaskParent } from "./delegatedTaskQuestionWake.ts";
 import { contextBoundaryOrdinal } from "./contextBoundary.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -1251,7 +1252,7 @@ const make = Effect.gen(function* () {
       });
       const requests = runtimeRequests.filter(
         (request) =>
-          request.kind === "user_input" &&
+          wakesDelegatedTaskParent(request.kind) &&
           request.status === "pending" &&
           request.responseCapability.type !== "not_resumable",
       );
@@ -1308,7 +1309,7 @@ const make = Effect.gen(function* () {
           });
           continue;
         }
-        pendingQuestions.push({ id: request.id, blocking });
+        pendingQuestions.push(delegatedTaskQuestion(request));
       }
       const questions = pendingQuestions
         .sort((left, right) => Number(right.blocking) - Number(left.blocking))
