@@ -498,6 +498,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
     readonly eventStreamsEnded?: Queue.Queue<ProviderSessionId>;
+    readonly closeEvent?: ProviderAdapter.ProviderAdapterV2Event;
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
@@ -564,6 +565,10 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
         if (options.spawnBeforeOpen !== true) {
           yield* countClose;
           if (options.hangSessionScopeClose === true) yield* hangClose;
+        }
+        if (options.closeEvent !== undefined) {
+          const closeEvent = options.closeEvent;
+          yield* Effect.addFinalizer(() => Queue.offer(events, closeEvent));
         }
 
         return {
@@ -692,6 +697,7 @@ function layerTest(input: {
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly eventStreamsEnded?: Queue.Queue<ProviderSessionId>;
+  readonly closeEvent?: ProviderAdapter.ProviderAdapterV2Event;
   readonly releaseRecorded?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
@@ -751,6 +757,7 @@ function layerTest(input: {
       ...(input.eventStreamsEnded === undefined
         ? {}
         : { eventStreamsEnded: input.eventStreamsEnded }),
+      ...(input.closeEvent === undefined ? {} : { closeEvent: input.closeEvent }),
     }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
   );
   const layerConfiguredMcpRegistry =
@@ -2453,6 +2460,69 @@ it.effect("ProviderSessionManagerV2 interrupts event subscriptions on server shu
     });
 
     yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+  }),
+);
+
+// Restart continuation needs the run left unsettled: an event the adapter emits while shutdown
+// closes it must not reach the run's subscriber and settle the run first.
+it.effect("ProviderSessionManagerV2 detaches subscribers before shutdown closes the adapter", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const shutdownAt = yield* DateTime.now;
+    const closeEvent = {
+      type: "provider_session.updated",
+      driver: CODEX_DRIVER,
+      providerSession: makeProviderSession({
+        providerSessionId: ProviderSessionId.make("session:close-event"),
+        now: shutdownAt,
+      }),
+    } satisfies ProviderAdapter.ProviderAdapterV2Event;
+    const effect = Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const threadId = ThreadId.make("thread-provider-session-manager-shutdown-close-event");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now: shutdownAt })],
+      });
+      const runtime = yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const subscription = yield* runtime.subscribeEvents!;
+      const received = yield* Ref.make<ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>>([]);
+      const firstReceived = yield* Deferred.make<void>();
+      const consumer = yield* subscription.events.pipe(
+        Stream.runForEach((event) =>
+          Ref.update(received, (events) => [...events, event]).pipe(
+            Effect.andThen(Deferred.succeed(firstReceived, undefined)),
+          ),
+        ),
+        Effect.forkChild,
+      );
+      const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId))!;
+      yield* Queue.offer(adapterQueue, {
+        type: "provider_session.updated",
+        driver: CODEX_DRIVER,
+        providerSession: runtime.providerSession,
+      });
+      yield* Deferred.await(firstReceived);
+
+      yield* manager.shutdown;
+
+      const exit = yield* Fiber.await(consumer);
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause));
+      assert.isFalse((yield* Ref.get(received)).some((event) => event === closeEvent));
+      assert.lengthOf(yield* Ref.get(received), 1);
+    });
+
+    yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, closeEvent })));
   }),
 );
 

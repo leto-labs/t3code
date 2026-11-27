@@ -5,6 +5,7 @@ import {
   type OrchestrationV2DomainEvent,
   type ProviderThreadId,
   type RunAttemptId,
+  type RunId,
   type OrchestrationV2RestartCancelledBackgroundWork,
   type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
@@ -180,6 +181,8 @@ export const make = Effect.gen(function* () {
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
+  // Runs whose shutdown continuation failed to save; the shutdown reconcile saves it with their cancel.
+  const unpreparedContinuations = new Map<ThreadId, RunId>();
   /** Shared sessions stop on their first recovered thread; later threads still decide wakes from pre-recovery liveness. */
   const sessionsLiveAtStart = (
     projection: ProjectionStore.ProjectionRuntimeRecoveryState,
@@ -1016,16 +1019,24 @@ export const make = Effect.gen(function* () {
         if (Option.isSome(previous) && previous.value.request.type === "provider-runtime.continue")
           processLossCount += previous.value.request.processLossCount ?? 0;
       }
-      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuationRun
+      const unpreparedRunId =
+        trigger === "shutdown" ? unpreparedContinuations.get(projection.thread.id) : undefined;
+      const unpreparedRun = runs.find((run) => run.id === unpreparedRunId);
+      const continuation = continuationRun
+        ? { run: continuationRun, processLossCount }
+        : continueAfterRestart && unpreparedRun
+          ? { run: unpreparedRun, processLossCount: 0 }
+          : undefined;
+      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = continuation
         ? [
             {
-              id: `effect:restart-continuation:${continuationRun.id}`,
+              id: `effect:restart-continuation:${continuation.run.id}`,
               commandId,
               threadId: projection.thread.id,
               request: {
                 type: "provider-runtime.continue",
-                sourceRunId: continuationRun.id,
-                processLossCount,
+                sourceRunId: continuation.run.id,
+                processLossCount: continuation.processLossCount,
               },
             },
           ]
@@ -1210,6 +1221,7 @@ export const make = Effect.gen(function* () {
           );
           if (!run) return;
           const commandId = CommandId.make(`command:restart-prepare:${run.id}`);
+          unpreparedContinuations.set(threadId, run.id);
           yield* eventSink.writeWithEffects({
             commandId,
             events: [],
@@ -1226,6 +1238,7 @@ export const make = Effect.gen(function* () {
               },
             ],
           });
+          unpreparedContinuations.delete(threadId);
         }).pipe(
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
