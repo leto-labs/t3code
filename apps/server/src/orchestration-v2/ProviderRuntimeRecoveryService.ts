@@ -1021,7 +1021,8 @@ export const make = Effect.gen(function* () {
       }
       const unpreparedRunId =
         trigger === "shutdown" ? unpreparedContinuations.get(projection.thread.id) : undefined;
-      const unpreparedRun = runs.find((run) => run.id === unpreparedRunId);
+      // Prepare also continues settled runs that reconcile leaves alone, so search every run.
+      const unpreparedRun = projection.runs.find((run) => run.id === unpreparedRunId);
       const continuation = continuationRun
         ? { run: continuationRun, processLossCount }
         : continueAfterRestart && unpreparedRun
@@ -1065,6 +1066,17 @@ export const make = Effect.gen(function* () {
           );
         cancelledEffectIds = retiredEffectIds;
         retiredEffects = retiredEffectIds.length;
+        if (effects.length > 0)
+          yield* eventSink.writeWithEffects({ commandId, events: [], effects }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderRuntimeRecoveryError({
+                  operation: "reconcile",
+                  threadId: projection.thread.id,
+                  cause,
+                }),
+            ),
+          );
       } else {
         const result = yield* eventSink
           .commitCommand({

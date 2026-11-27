@@ -1370,6 +1370,70 @@ it.effect("saves a continuation whose shutdown prepare failed with its run's can
   }),
 );
 
+it.effect("saves a failed shutdown prepare for a completed run awaiting background work", () =>
+  Effect.gen(function* () {
+    const base = makeProjection();
+    // Reconcile cancels nothing here: the run completed and only its awaited shell is open.
+    const projection = {
+      ...base,
+      runs: [{ ...base.runs[0]!, status: "completed", startedAt: now, completedAt: now }],
+      providerThreads: [
+        {
+          ...base.providerThreads[0]!,
+          status: "idle",
+          pendingBackgroundTasks: [
+            {
+              kind: "command",
+              taskId: "shell:1",
+              description: "sleep 150",
+              parentTaskId: "agent:1",
+            },
+          ],
+        },
+      ],
+      providerTurns: [{ ...base.providerTurns[0]!, status: "completed" }],
+    } as unknown as ReturnType<typeof makeProjection>;
+    assert.equal(restartContinuationRun(projection, now)?.id, runId);
+    const commits: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0][] = [];
+    const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([threadId]),
+            getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            writeWithEffects: () => Effect.die("database is locked"),
+            commitCommand: (input) =>
+              Effect.sync(() => {
+                commits.push(input);
+                return { committed: true, cancelledEffectCount: 0 } as never;
+              }),
+          }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+          }),
+        ),
+      ),
+    );
+    yield* recovery.prepareForShutdown;
+    yield* recovery.reconcile("shutdown");
+    assert.lengthOf(commits, 1);
+    assert.deepEqual(
+      commits[0]!.effects.map((effect) => [effect.id, effect.request]),
+      [
+        [
+          `effect:restart-continuation:${runId}`,
+          { type: "provider-runtime.continue", sourceRunId: runId, processLossCount: 0 },
+        ],
+      ],
+    );
+  }),
+);
+
 it.effect.each([
   ["user_input", "pending", "live", false],
   ["user_input", "expired", "not_resumable", false],
