@@ -539,7 +539,7 @@ it.effect("keeps a forwarded wait short and its retries scoped to the caller", (
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("an older peer can still settle a wait that asked for question updates", () =>
+it.effect("falls back on an older peer and probes its wait options again after expiry", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const {
@@ -590,10 +590,15 @@ it.effect("an older peer can still settle a wait that asked for question updates
         })
         .pipe(Effect.provideService(FetchHttpClient.Fetch, fetch));
       expect((yield* wait).structuredContent).toEqual(settled);
+      yield* TestClock.adjust(Duration.minutes(4));
+      expect((yield* wait).structuredContent).toEqual(settled);
+      yield* TestClock.adjust(Duration.minutes(1));
       expect((yield* wait).structuredContent).toEqual(settled);
       expect(requests.map((body) => body.includes('"knownPendingQuestions"'))).toEqual([
         true,
         false,
+        false,
+        true,
         false,
       ]);
     }),

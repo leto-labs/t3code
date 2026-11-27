@@ -11,6 +11,7 @@ import {
   type PeerLinkError,
   RuntimeMode,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -101,6 +102,7 @@ const BEFORE_POSITION_REFUSAL =
 const THREAD_WAIT_ARGUMENT_REFUSAL =
   /^Invalid parameters for tool 't3_thread_wait': Unknown arguments? ((?:"[^"]+", )*"[^"]+")\. Accepted arguments: /;
 const THREAD_WAIT_COMPAT_OPTIONS = ["knownPendingQuestions", "untilDelegatedWorkSettled"] as const;
+const THREAD_WAIT_COMPAT_TTL_MS = 5 * 60_000;
 export const refusesBeforePosition = (failure: {
   readonly code: string;
   readonly message: string;
@@ -122,7 +124,10 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const legacyThreadWaitOptions = new Map<
     EnvironmentId,
-    Set<(typeof THREAD_WAIT_COMPAT_OPTIONS)[number]>
+    {
+      readonly unsupported: Set<(typeof THREAD_WAIT_COMPAT_OPTIONS)[number]>;
+      readonly expiresAtMs: number;
+    }
   >();
 
   /**
@@ -243,8 +248,13 @@ const make = Effect.gen(function* () {
     "PeerForwarding.waitForThread",
   )(function* (scope, environmentId, input) {
     const { knownPendingQuestions, untilDelegatedWorkSettled, ...params } = input;
+    const nowMs = yield* Clock.currentTimeMillis;
+    const cached = legacyThreadWaitOptions.get(environmentId);
+    if (cached !== undefined && cached.expiresAtMs <= nowMs) {
+      legacyThreadWaitOptions.delete(environmentId);
+    }
     const wait = () => {
-      const unsupported = legacyThreadWaitOptions.get(environmentId);
+      const unsupported = legacyThreadWaitOptions.get(environmentId)?.unsupported;
       return forward<OrchestratorMcpThreadWaitResult>(
         scope,
         "t3_thread_wait",
@@ -279,12 +289,20 @@ const make = Effect.gen(function* () {
     return yield* wait().pipe(
       Effect.catchIf(
         (error) => refusedOptions(error).length > 0,
-        (error) => {
-          const unsupported = legacyThreadWaitOptions.get(environmentId) ?? new Set();
-          for (const option of refusedOptions(error)) unsupported.add(option);
-          legacyThreadWaitOptions.set(environmentId, unsupported);
-          return wait();
-        },
+        (error) =>
+          Effect.gen(function* () {
+            const nowMs = yield* Clock.currentTimeMillis;
+            const current = legacyThreadWaitOptions.get(environmentId);
+            const unsupported = new Set(
+              current !== undefined && current.expiresAtMs > nowMs ? current.unsupported : [],
+            );
+            for (const option of refusedOptions(error)) unsupported.add(option);
+            legacyThreadWaitOptions.set(environmentId, {
+              unsupported,
+              expiresAtMs: nowMs + THREAD_WAIT_COMPAT_TTL_MS,
+            });
+            return yield* wait();
+          }),
       ),
     );
   });
