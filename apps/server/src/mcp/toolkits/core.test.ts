@@ -174,7 +174,7 @@ it.effect("an answered question reports already answered instead of not found", 
     });
     expect(declaredFailure(yield* respond("missing-question"))).toMatchObject({
       code: "invalid_request",
-      message: "The pending user-input request was not found.",
+      message: "The pending request was not found.",
     });
   }).pipe(
     Effect.provide(
@@ -304,6 +304,129 @@ it.effect("a pending question read keeps option previews", () => {
     ),
   );
 });
+
+const approvalTarget = (runtimeMode: OrchestrationV2ThreadShell["runtimeMode"]) => {
+  const shell = McpToolAccessTestkit.liveThreadShell(threadId, { runtimeMode });
+  const requestId = RuntimeRequestId.make(`approval:${runtimeMode}`);
+  const dispatched: OrchestrationV2ServerCommand[] = [];
+  const projection = McpToolAccessTestkit.idleThreadProjection(shell);
+  const layer = layerThreadToolkit.pipe(
+    Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
+    Layer.provide(NodeCrypto.layer),
+    Layer.provide(
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        getThreadShell: () => Effect.succeed(shell),
+        getProjectThreadRecords: () =>
+          Effect.succeed({
+            ...projection,
+            runtimeRequests: [
+              {
+                id: requestId,
+                nodeId: NodeId.make("root"),
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "command",
+                status: "pending",
+                responseCapability: { type: "message" },
+                createdAt: shell.createdAt,
+                resolvedAt: null,
+              },
+            ],
+            turnItems: [
+              {
+                id: TurnItemId.make(`approval-item:${runtimeMode}`),
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "running",
+                title: null,
+                startedAt: shell.createdAt,
+                completedAt: null,
+                updatedAt: shell.updatedAt,
+                type: "approval_request",
+                requestId,
+                requestKind: "command",
+                prompt: "Run rm -rf build?",
+              },
+            ],
+          }),
+        dispatch: (command) => {
+          dispatched.push(command);
+          return Effect.succeed({ sequence: 3, storedEvents: [] });
+        },
+      }),
+    ),
+  );
+  const call = (args: Record<string, unknown>) =>
+    Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      return yield* server
+        .callTool({ name: "t3_pending_request", arguments: { requestId, ...args } })
+        .pipe(
+          Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+          Effect.provideService(McpSchema.McpServerClient, client),
+        );
+    });
+  return { requestId, dispatched, layer, call };
+};
+
+it.effect.each(["approval-required", "auto-accept-edits", "auto", "full-access"] as const)(
+  "an agent can read and decline a pending approval in a %s thread",
+  (runtimeMode) => {
+    const target = approvalTarget(runtimeMode);
+    return Effect.gen(function* () {
+      const listed = yield* target.call({ action: "list" });
+      expect(listed.structuredContent).toEqual({ requestIds: [target.requestId] });
+      const read = yield* target.call({ action: "read" });
+      expect(read.structuredContent).toEqual({
+        requestId: target.requestId,
+        kind: "command",
+        prompt: "Run rm -rf build?",
+      });
+      const declined = yield* target.call({ action: "respond", decision: "decline" });
+      expect(declined.isError).not.toBe(true);
+      expect(target.dispatched).toMatchObject([
+        { type: "runtime-request.respond", requestId: target.requestId, decision: "decline" },
+      ]);
+    }).pipe(Effect.provide(target.layer));
+  },
+);
+
+it.effect("an agent can accept a pending approval only in a full-access thread", () => {
+  const target = approvalTarget("full-access");
+  return Effect.gen(function* () {
+    expect(declaredFailure(yield* target.call({ action: "respond" }))).toMatchObject({
+      code: "invalid_request",
+      message: "This action needs `decision`.",
+    });
+    const accepted = yield* target.call({ action: "respond", decision: "accept" });
+    expect(accepted.isError).not.toBe(true);
+    expect(target.dispatched).toMatchObject([
+      { type: "runtime-request.respond", requestId: target.requestId, decision: "accept" },
+    ]);
+  }).pipe(Effect.provide(target.layer));
+});
+
+it.effect.each(["approval-required", "auto-accept-edits", "auto"] as const)(
+  "an agent cannot accept a pending approval in a %s thread",
+  (runtimeMode) => {
+    const target = approvalTarget(runtimeMode);
+    return Effect.gen(function* () {
+      expect(
+        declaredFailure(yield* target.call({ action: "respond", decision: "accept" })),
+      ).toMatchObject({
+        code: "runtime_mode_escalation_denied",
+        message: expect.stringContaining(`this thread runs ${runtimeMode}`),
+      });
+      expect(target.dispatched).toEqual([]);
+    }).pipe(Effect.provide(target.layer));
+  },
+);
 
 it("bounds public command rejections and redacts internal dispatch causes", () => {
   const command = { commandId: CommandId.make("mcp-core-command"), commandType: "thread.settle" };

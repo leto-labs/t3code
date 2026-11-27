@@ -11,6 +11,7 @@ import {
   RuntimeMode,
   ProviderInteractionMode,
   RuntimeRequestId,
+  ProviderRequestKind,
   ProviderUserInputAnswers,
   IsoDateTime,
   OrchestratorMcpFailure,
@@ -131,17 +132,24 @@ const question = Schema.Struct({
 const PendingRequestTool = Tool.make("t3_pending_request", {
   ...commandTool,
   description:
-    "Pending user questions in a thread. Omit `threadId` for this thread. list: their ids; approvals are not listed. read: one by `requestId`. respond: answer one with `answers`; this cannot approve a permission request.",
+    "Pending user questions and approvals in a thread. Omit `threadId` for this thread. list: their ids. read: one by `requestId`. respond: answer a question with `answers`, or resolve an approval with `decision`. Accept works only in a full-access thread.",
   parameters: Schema.Struct({
     action: Schema.Literals(["list", "read", "respond"]),
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     requestId: Schema.optional(RuntimeRequestId),
     answers: Schema.optional(ProviderUserInputAnswers),
+    decision: Schema.optional(Schema.Literals(["accept", "decline"])),
   }),
   success: Schema.Union([
     Schema.Struct({ requestIds: Schema.Array(RuntimeRequestId) }),
     Schema.Struct({ requestId: RuntimeRequestId, questions: Schema.Array(question) }),
+    Schema.Struct({
+      requestId: RuntimeRequestId,
+      kind: ProviderRequestKind,
+      prompt: Schema.optional(Schema.String),
+      reason: Schema.optional(Schema.String),
+    }),
     OrchestrationV2DispatchCommandResult,
   ]),
 })

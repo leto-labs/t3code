@@ -6,6 +6,7 @@ import {
   type RunId,
   OrchestratorMcpFailure,
   type OrchestrationV2Command,
+  type ProviderUserInputAnswers,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
@@ -31,6 +32,7 @@ import { rejectionText } from "../../../orchestration-v2/runOutput.ts";
 import { ThreadToolkit } from "./tools.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { requireOutsideAutoPool } from "../../OrchestratorMcpService.ts";
+import { isApprovalRequestKind } from "../../../orchestration-v2/delegatedTaskQuestionWake.ts";
 
 function queueEntry(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
@@ -72,29 +74,37 @@ const topOfPinnedRunKey = Effect.fn("mcp.topOfPinnedRunKey")(function* (
   return topOfPinnedRunOrderKey(pinnedKeys) ?? undefined;
 });
 
-const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
+const readPendingRequest = Effect.fn("mcp.readPendingRequest")(function* (input: {
   threadId?: ThreadId | undefined;
   requestId: RuntimeRequestId;
 }) {
   const context = yield* readThread(input.threadId, ["runtimeRequests", "turnItems"]);
   const request = context.projection.runtimeRequests.find(
-    (request) => request.id === input.requestId && request.kind === "user_input",
+    (request) =>
+      request.id === input.requestId &&
+      (request.kind === "user_input" || isApprovalRequestKind(request.kind)),
   );
   const item = context.projection.turnItems.find(
-    (item) => item.type === "user_input_request" && item.requestId === input.requestId,
+    (item) =>
+      (item.type === "user_input_request" || item.type === "approval_request") &&
+      item.requestId === input.requestId,
   );
-  if (request === undefined || item?.type !== "user_input_request")
+  if (
+    request === undefined ||
+    (item?.type !== "user_input_request" && item?.type !== "approval_request")
+  )
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
-      message: "The pending user-input request was not found.",
+      message: "The pending request was not found.",
     });
+  const noun = item.type === "approval_request" ? "approval" : "user-input request";
   if (request.status !== "pending")
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
       message:
         request.status === "resolved"
-          ? "The user-input request was already answered."
-          : `The user-input request is no longer pending (${request.status}).`,
+          ? `The ${noun} was already ${item.type === "approval_request" ? "resolved" : "answered"}.`
+          : `The ${noun} is no longer pending (${request.status}).`,
     });
   return { ...context, request, item };
 });
@@ -275,30 +285,52 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           const { projection } = yield* readThread(input.threadId, ["runtimeRequests"]);
           return {
             requestIds: projection.runtimeRequests
-              .filter((request) => request.kind === "user_input" && request.status === "pending")
+              .filter(
+                (request) =>
+                  (request.kind === "user_input" || isApprovalRequestKind(request.kind)) &&
+                  request.status === "pending",
+              )
               .map((request) => request.id),
           };
         }
         const requestId = yield* required(input.requestId, "requestId");
-        const { item } = yield* readQuestion({ threadId: input.threadId, requestId });
-        return { requestId, questions: item.questions };
+        const { item } = yield* readPendingRequest({ threadId: input.threadId, requestId });
+        if (item.type === "user_input_request") return { requestId, questions: item.questions };
+        return {
+          requestId,
+          kind: item.requestKind,
+          ...(item.prompt === undefined ? {} : { prompt: item.prompt }),
+          ...(item.reason === undefined ? {} : { reason: item.reason }),
+        };
       }),
     ),
     writesThread((input) =>
       Effect.gen(function* () {
         const requestId = yield* required(input.requestId, "requestId");
-        const answers = yield* required(input.answers, "answers");
-        const { threads, projection } = yield* readQuestion({
+        const { threads, projection, item } = yield* readPendingRequest({
           threadId: input.threadId,
           requestId,
         });
+        let response: { answers: ProviderUserInputAnswers } | { decision: "accept" | "decline" };
+        if (item.type === "user_input_request") {
+          response = { answers: yield* required(input.answers, "answers") };
+        } else {
+          const decision = yield* required(input.decision, "decision");
+          // Agents may always decline; accepting stays a human call unless the thread runs unsupervised.
+          if (decision === "accept" && projection.thread.runtimeMode !== "full-access")
+            return yield* new OrchestratorMcpFailure({
+              code: "runtime_mode_escalation_denied",
+              message: `Accept works only in a full-access thread; this thread runs ${projection.thread.runtimeMode}. Decline it, or ask the user to approve it.`,
+            });
+          response = { decision };
+        }
         const result = yield* threads
           .dispatch({
             type: "runtime-request.respond",
             threadId: projection.thread.id,
             commandId: yield* newCommandId(),
             requestId,
-            answers,
+            ...response,
           })
           .pipe(Effect.mapError(dispatchFailure));
         return { sequence: result.sequence };
