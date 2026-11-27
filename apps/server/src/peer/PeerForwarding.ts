@@ -103,6 +103,7 @@ const THREAD_WAIT_ARGUMENT_REFUSAL =
   /^Invalid parameters for tool 't3_thread_wait': Unknown arguments? ((?:"[^"]+", )*"[^"]+")\. Accepted arguments: /;
 const THREAD_WAIT_COMPAT_OPTIONS = ["knownPendingQuestions", "untilDelegatedWorkSettled"] as const;
 const THREAD_WAIT_COMPAT_TTL_MS = 5 * 60_000;
+type ThreadWaitCompatOption = (typeof THREAD_WAIT_COMPAT_OPTIONS)[number];
 export const refusesBeforePosition = (failure: {
   readonly code: string;
   readonly message: string;
@@ -125,7 +126,7 @@ const make = Effect.gen(function* () {
   const legacyThreadWaitOptions = new Map<
     EnvironmentId,
     {
-      readonly unsupported: Set<(typeof THREAD_WAIT_COMPAT_OPTIONS)[number]>;
+      readonly unsupported: ReadonlySet<ThreadWaitCompatOption>;
       readonly expiresAtMs: number;
     }
   >();
@@ -250,12 +251,13 @@ const make = Effect.gen(function* () {
     const { knownPendingQuestions, untilDelegatedWorkSettled, ...params } = input;
     const nowMs = yield* Clock.currentTimeMillis;
     const cached = legacyThreadWaitOptions.get(environmentId);
-    if (cached !== undefined && cached.expiresAtMs <= nowMs) {
+    const omitted =
+      cached !== undefined && cached.expiresAtMs > nowMs ? cached.unsupported : undefined;
+    if (cached !== undefined && omitted === undefined) {
       legacyThreadWaitOptions.delete(environmentId);
     }
-    const wait = () => {
-      const unsupported = legacyThreadWaitOptions.get(environmentId)?.unsupported;
-      return forward<OrchestratorMcpThreadWaitResult>(
+    const wait = (unsupported?: ReadonlySet<ThreadWaitCompatOption>) =>
+      forward<OrchestratorMcpThreadWaitResult>(
         scope,
         "t3_thread_wait",
         OrchestratorMcpThreadWaitInput,
@@ -276,32 +278,33 @@ const make = Effect.gen(function* () {
             : { untilDelegatedWorkSettled }),
         },
       );
-    };
     const refusedOptions = (error: OrchestratorMcpFailure) => {
       const args =
         error.code === "invalid_request"
           ? THREAD_WAIT_ARGUMENT_REFUSAL.exec(error.message)?.[1]
           : undefined;
       return THREAD_WAIT_COMPAT_OPTIONS.filter(
-        (option) => input[option] !== undefined && args?.includes(`"${option}"`),
+        (option) =>
+          input[option] !== undefined && !omitted?.has(option) && args?.includes(`"${option}"`),
       );
     };
-    return yield* wait().pipe(
+    return yield* wait(omitted).pipe(
       Effect.catchIf(
         (error) => refusedOptions(error).length > 0,
         (error) =>
           Effect.gen(function* () {
             const nowMs = yield* Clock.currentTimeMillis;
             const current = legacyThreadWaitOptions.get(environmentId);
-            const unsupported = new Set(
-              current !== undefined && current.expiresAtMs > nowMs ? current.unsupported : [],
-            );
+            const unsupported = new Set(omitted);
+            if (current !== undefined && current.expiresAtMs > nowMs) {
+              for (const option of current.unsupported) unsupported.add(option);
+            }
             for (const option of refusedOptions(error)) unsupported.add(option);
             legacyThreadWaitOptions.set(environmentId, {
               unsupported,
               expiresAtMs: nowMs + THREAD_WAIT_COMPAT_TTL_MS,
             });
-            return yield* wait();
+            return yield* wait(unsupported);
           }),
       ),
     );
