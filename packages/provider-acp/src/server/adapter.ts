@@ -7825,7 +7825,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* projectCarryoverSubagentStatus(match, status, result);
             return true;
           }
-          if (match.task.status !== "running" && match.task.status !== "pending") {
+          if (acpSubagentStatusIsTerminal(match.task.status)) {
             return false;
           }
           if (!shouldProject) {

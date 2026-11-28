@@ -10187,7 +10187,7 @@ describe("AcpAdapterV2", () => {
           const adjustFiber = yield* TestClock.adjust("3 seconds").pipe(Effect.forkScoped);
           yield* Deferred.await(finalizationClockRead);
           secondSubagentStatus = "completed";
-          yield* sessionUpdateHandler!({
+          const childTerminalFiber = yield* sessionUpdateHandler!({
             sessionId: secondChildSessionId,
             update: {
               sessionUpdate: "tool_call_update",
@@ -10197,9 +10197,10 @@ describe("AcpAdapterV2", () => {
               status: "completed",
               rawOutput: { content: "SECOND_DONE" },
             },
-          });
+          }).pipe(Effect.forkScoped({ startImmediately: true }));
           yield* Deferred.succeed(releaseFinalizationClockRead, undefined);
           yield* Fiber.join(adjustFiber);
+          yield* Fiber.join(childTerminalFiber);
           yield* Effect.yieldNow;
           yield* Effect.yieldNow;
 
