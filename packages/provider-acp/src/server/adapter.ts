@@ -721,9 +721,15 @@ export interface AcpAdapterV2Flavor {
    */
   readonly toolOutlivesPrompt?: (toolCall: AcpToolCallState) => boolean;
   /**
-   * Finalize a settled turn held only by running commands once the session has been silent for
-   * `timeout`, so a command that never reports back cannot leave the thread in Working forever.
-   * Other holds (questions, schedules, subagents) keep the turn open as before.
+   * A tool the agent keeps running in its live process after its originating turn finishes
+   * without holding that turn open. Keeps idle release from closing the session before the wake
+   * fires and routes late tool updates back to the originating turn's row.
+   */
+  readonly toolContinuesDetached?: (toolCall: AcpToolCallState) => boolean;
+  /**
+   * Finalize a settled turn held only by matching tools once the session has been silent for
+   * `timeout`, so a lost wake cannot leave the thread in Working forever.
+   * Other holds (questions, subagents) keep the turn open as before.
    */
   readonly postSettleCommandHold?: {
     readonly timeout: Duration.Input;
@@ -3066,6 +3072,25 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           new Map(),
         );
         const endedDetachedBackgroundCommandLimit = 16;
+        // Detached tool call id → originating turn and whether the tool is still live in the process.
+        const detachedTools = yield* Ref.make<
+          ReadonlyMap<string, { readonly turn: ActiveAcpTurn; readonly live: boolean }>
+        >(new Map());
+        const detachedWakeReplyPending = yield* Ref.make(false);
+        const detachTools = (context: ActiveAcpTurn, toolCallIds: ReadonlyArray<string>) =>
+          toolCallIds.length === 0
+            ? Effect.void
+            : Ref.update(detachedTools, (current) => {
+                const next = new Map(current);
+                for (const toolCallId of toolCallIds) {
+                  next.set(toolCallId, { turn: context, live: true });
+                }
+                const ended = [...next].filter(([, entry]) => !entry.live);
+                for (const [toolCallId] of ended.slice(0, -endedDetachedBackgroundCommandLimit)) {
+                  next.delete(toolCallId);
+                }
+                return next;
+              });
         const detachedBackgroundCommandTurn = (taskId: string) =>
           Ref.get(detachedBackgroundCommands).pipe(Effect.map((turns) => turns.get(taskId)));
         /** The turn a background task's terminal belongs to: its detached turn, else the live one. */
@@ -3317,6 +3342,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               agentRequests.clear();
               yield* Ref.set(wakeBuffer, []);
               yield* Ref.set(continuationRequested, false);
+              yield* Ref.set(detachedTools, new Map());
+              yield* Ref.set(detachedWakeReplyPending, false);
               yield* cancelPendingRuntimeRequests();
               const context = yield* Ref.get(activeTurn);
               if (context !== null) {
@@ -6300,6 +6327,52 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           return true;
         });
 
+        // Late updates for a detached tool (e.g. a long schedule) stay on its originating run's row.
+        const projectDetachedTool = Effect.fnUntraced(function* (
+          notification: EffectAcpSchema.SessionNotification,
+          active: ActiveAcpTurn | null,
+        ) {
+          const update = notification.update;
+          if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+            return false;
+          }
+          if (active?.finalized === false && active.tools.has(update.toolCallId)) return false;
+          if (notification.sessionId !== (yield* Ref.get(activeSessionId))) return false;
+          const detached = (yield* Ref.get(detachedTools)).get(update.toolCallId);
+          if (detached === undefined) return false;
+          let terminalStatus: "completed" | "failed" | undefined;
+          for (const event of parseSessionUpdateEvent(notification).events) {
+            if (event._tag !== "ToolCallUpdated") continue;
+            yield* emitTool(detached.turn, event.toolCall);
+            const normalized = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
+            if (normalized.status === "completed" || normalized.status === "failed") {
+              terminalStatus = normalized.status;
+            }
+          }
+          if (terminalStatus !== undefined) {
+            const transitionedToTerminal = yield* Ref.modify(detachedTools, (current) => {
+              const existing = current.get(update.toolCallId);
+              if (existing === undefined || !existing.live) return [false, current] as const;
+              const next = new Map(current);
+              next.set(update.toolCallId, { ...existing, live: false });
+              return [true, next] as const;
+            });
+            if (
+              transitionedToTerminal &&
+              active === null &&
+              terminalStatus === "completed" &&
+              postSettleContinuationEnabled &&
+              !(yield* Ref.get(stoppedRunQuarantine))
+            ) {
+              if (flavor.replyEndsWithUsageUpdate === true) {
+                yield* Ref.set(detachedWakeReplyPending, true);
+              }
+              yield* offerContinuationRun(notification.sessionId);
+            }
+          }
+          return true;
+        });
+
         const bufferPostSettleWake = Effect.fnUntraced(function* (
           notification: EffectAcpSchema.SessionNotification,
         ) {
@@ -6681,12 +6754,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* projectExtractedContextUsage(notification, true);
           if (yield* projectAgentTerminalUpdate(notification, context)) return;
           if (yield* projectDetachedBackgroundCommand(notification, context)) return;
+          if (yield* projectDetachedTool(notification, context)) return;
           if (flavor.replyEndsWithUsageUpdate === true) {
             if (context === null) {
               // A reply can end before its continuation run starts; replay its end with its output.
               if (
                 update.sessionUpdate === "usage_update" &&
-                (yield* Ref.get(wakeBuffer)).length > 0
+                ((yield* Ref.get(wakeBuffer)).length > 0 ||
+                  (yield* Ref.get(detachedWakeReplyPending)))
               ) {
                 yield* Ref.update(wakeBuffer, (current) => [...current, notification]);
               }
@@ -8905,6 +8980,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 yield* Ref.set(continuationRequested, false);
                 yield* Ref.set(runningBackgroundTaskIds, new Set());
                 yield* Ref.set(detachedBackgroundCommands, new Map());
+                yield* Ref.set(detachedTools, new Map());
+                yield* Ref.set(detachedWakeReplyPending, false);
                 yield* Ref.set(endedBackgroundTaskIds, new Set());
                 yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
                 yield* Ref.set(handledBackgroundTaskIdsInActiveTurn, new Set());
@@ -9487,6 +9564,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               yield* Ref.set(continuationRequested, false);
               yield* Ref.set(runningBackgroundTaskIds, new Set());
               yield* Ref.set(detachedBackgroundCommands, new Map());
+              yield* Ref.set(detachedTools, new Map());
+              yield* Ref.set(detachedWakeReplyPending, false);
               yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
               const previousCarryover = yield* Ref.getAndSet(carryoverSubagents, null);
               if (previousCarryover !== null) {
@@ -9566,6 +9645,20 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               });
             }
           }
+          const detachedToolIds =
+            settledStatus === "completed" &&
+            !directStopQuarantine &&
+            flavor.toolContinuesDetached !== undefined
+              ? [...context.tools.values()]
+                  .filter((tool) => {
+                    const toolState = toolStatus(tool.status);
+                    return (
+                      (toolState === "pending" || toolState === "running") &&
+                      flavor.toolContinuesDetached!(tool)
+                    );
+                  })
+                  .map((tool) => tool.toolCallId)
+              : [];
           if (settledStatus === "completed") {
             yield* terminalizeOpenForegroundTools(context);
           } else if (settledStatus === "interrupted") {
@@ -9712,6 +9805,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* Ref.set(activeTurn, null);
           if (settledStatus === "completed" && !directStopQuarantine) {
             yield* detachBackgroundCommands(context);
+            yield* detachTools(context, detachedToolIds);
           }
           steerInjections.clear();
           if (
@@ -9740,6 +9834,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (hasDeferredBackgroundWork(context)) return;
           context.backgroundFinalizeGeneration += 1;
           const generation = context.backgroundFinalizeGeneration;
+          const callbackGeneration = yield* Ref.get(runtimeCallbackGeneration);
           const replyOpen = context.replyOpen;
           const debounce = replyOpen ? ACP_OPEN_REPLY_QUIET_LIMIT : ACP_DEFERRED_FINALIZE_DEBOUNCE;
           yield* Effect.gen(function* () {
@@ -9754,14 +9849,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               !replyOpen && flavor.hasPendingReply !== undefined
                 ? yield* flavor.hasPendingReply(context.nativeThreadId)
                 : false;
-            if (!stillCurrent()) return;
-            if (pendingReply) {
-              context.replyOpen = true;
-              yield* scheduleDeferredFinalize(context);
-              return;
-            }
-            const status = context.promptSettledStatus ?? "completed";
-            yield* finalizeTurn(context, status);
+            yield* runRuntimeCallbackAtGeneration(
+              callbackGeneration,
+              Effect.gen(function* () {
+                if (!stillCurrent()) return;
+                if (pendingReply) {
+                  context.replyOpen = true;
+                  yield* scheduleDeferredFinalize(context);
+                  return;
+                }
+                const status = context.promptSettledStatus ?? "completed";
+                yield* finalizeTurn(context, status);
+              }),
+            );
           }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           yield* options.testHooks?.onDeferredFinalizeScheduled?.(debounce) ?? Effect.void;
         });
@@ -9771,13 +9871,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             const hold = flavor.postSettleCommandHold;
             if (hold === undefined) return;
             if (!context.promptSettled || context.finalized) return;
+            const generation = yield* Ref.get(runtimeCallbackGeneration);
+            const settledPromptSequence = context.promptSequence;
             const timeoutMillis = Duration.toMillis(hold.timeout);
             const isRunningCommand = (tool: AcpToolCallState) =>
               toolStatus(tool.status) === "running" && hold.isCommand(tool);
             let quietSince = yield* Clock.currentTimeMillis;
             // Armed even without a command yet: a pending reply can still start one.
             yield* Effect.gen(function* () {
-              while (!context.finalized) {
+              while (
+                !context.finalized &&
+                context.promptSettled &&
+                context.promptSequence === settledPromptSequence
+              ) {
                 quietSince = Math.max(quietSince, context.lastProgressAt);
                 const now = yield* Clock.currentTimeMillis;
                 const remaining = quietSince + timeoutMillis - now;
@@ -9785,15 +9891,38 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   yield* Effect.sleep(Duration.millis(remaining));
                   continue;
                 }
-                if (
-                  context.tools.values().some(isRunningCommand) &&
-                  !hasDeferredBackgroundWork(context, isRunningCommand)
-                ) {
-                  yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
-                  return;
+                const outcome = yield* runRuntimeCallbackAtGeneration(
+                  generation,
+                  Effect.gen(function* () {
+                    if (
+                      context.finalized ||
+                      !context.promptSettled ||
+                      context.promptSequence !== settledPromptSequence
+                    ) {
+                      return { _tag: "done" } as const;
+                    }
+                    const latestNow = yield* Clock.currentTimeMillis;
+                    const latestQuietSince = Math.max(quietSince, context.lastProgressAt);
+                    if (latestQuietSince + timeoutMillis - latestNow > 0) {
+                      return { _tag: "sleep", quietSince: latestQuietSince } as const;
+                    }
+                    if (
+                      context.tools.values().some(isRunningCommand) &&
+                      !hasDeferredBackgroundWork(context, isRunningCommand)
+                    ) {
+                      yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
+                      return { _tag: "done" } as const;
+                    }
+                    return { _tag: "rearm", now: latestNow } as const;
+                  }),
+                );
+                if (Option.isNone(outcome) || outcome.value._tag === "done") return;
+                if (outcome.value._tag === "sleep") {
+                  quietSince = outcome.value.quietSince;
+                  continue;
                 }
                 // Something else still holds the turn; count silence again once it clears.
-                quietSince = now;
+                quietSince = outcome.value.now;
               }
             }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           },
@@ -10507,6 +10636,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 if (!isContinuationTurn && !isAppOwnedWakeTurn && !preserveBufferedContinuation) {
                   yield* Ref.set(wakeBuffer, []);
                   yield* Ref.set(wakeReports, noWakeReports);
+                  yield* Ref.set(detachedWakeReplyPending, false);
                 }
                 if (preserveBufferedContinuation) return wasRequested;
                 yield* Ref.update(continuationGeneration, (value) => value + 1);
@@ -10679,6 +10809,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* projectDeferredCarryoverTerminals(rehydratedCarryoverSubagents);
             // Retain projected terminals during wake drain so monotonic guards reject replayed spawns.
             if (isContinuationTurn) {
+              const detachedWakeReply = yield* Ref.getAndSet(detachedWakeReplyPending, false);
+              if (detachedWakeReply && flavor.replyEndsWithUsageUpdate === true) {
+                context.replyOpen = true;
+              }
               yield* Ref.set(continuationRequested, false);
               yield* Ref.update(wakeReports, ({ reports, offered }) => ({
                 reports: new Map([...reports].filter(([key]) => !offered.has(key))),
@@ -10730,7 +10864,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               // The replayed reply ended before the prompt counted as settled.
               yield* idleReportedSubagents(context);
               if (drainedWakeCount === 0) {
-                if (continuationWasRequested && defersFinalizeForBackgroundWork) {
+                if (
+                  (continuationWasRequested || detachedWakeReply) &&
+                  defersFinalizeForBackgroundWork
+                ) {
+                  if (detachedWakeReply) yield* schedulePostSettleHoldExpiry(context);
                   if (hasDeferredBackgroundWork(context)) {
                     yield* rearmDeferredFinalize(context);
                   } else {
@@ -10858,6 +10996,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
                 });
               }
+              if (
+                turnInput.isDelegatedCompletion === true &&
+                (context.promptSettled || (yield* Deferred.isDone(context.promptWireSettled)))
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                  driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
+              }
               const generation = yield* Ref.get(runtimeCallbackGeneration);
               const checkPromptOutcome =
                 flavor.watchPromptOutcome === undefined
@@ -10867,7 +11015,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const steered = yield* runRuntimeCallbackAtGeneration(
                 generation,
                 Effect.gen(function* () {
-                  if (context.finalized || context.interrupted) return false;
+                  if (context.finalized || context.interrupted) return "ended" as const;
+                  if (
+                    turnInput.isDelegatedCompletion === true &&
+                    (context.promptSettled || (yield* Deferred.isDone(context.promptWireSettled)))
+                  ) {
+                    return "declined" as const;
+                  }
                   const compactionMarker = (yield* Ref.get(compactionMarkers)).get(
                     context.nativeThreadId,
                   );
@@ -10951,10 +11105,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     },
                   ).pipe(Effect.forkIn(sessionScope));
                   yield* Deferred.succeed(released, undefined);
-                  return true;
+                  return "steered" as const;
                 }),
               );
-              if (!Option.contains(steered, true)) {
+              if (Option.contains(steered, "declined")) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                  driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
+              }
+              if (!Option.contains(steered, "steered")) {
                 return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver,
                   detail: `Provider turn ${turnInput.providerTurnId} ended before it could be steered.`,
@@ -11055,6 +11216,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if ((yield* Ref.get(midTurnUnreportedCompletedTaskIds)).size > 0) return true;
           if (yield* Ref.get(continuationRequested)) return true;
           if ((yield* Ref.get(runningBackgroundTaskIds)).size > 0) return true;
+          if (yield* Ref.get(detachedWakeReplyPending)) return true;
+          if ([...(yield* Ref.get(detachedTools)).values()].some((entry) => entry.live)) {
+            return true;
+          }
           const active = yield* Ref.get(activeTurn);
           if (
             active !== null &&
@@ -11285,6 +11450,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
                 });
               }
+              if (
+                turnInput.isDelegatedCompletion === true &&
+                (context.promptSettled || (yield* Deferred.isDone(context.promptWireSettled)))
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                  driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
+              }
               // An agent that drops an early cancel drops an early steer too.
               const startHold = flavor.cancelAfterPromptStarts;
               if (startHold !== undefined) {
@@ -11319,6 +11494,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     : appContextEntries.map(formatAcpAppContextEntry).join("\n");
               const appContextSequence =
                 appContextEntries.length === 0 ? 0 : ++context.appContextSequence;
+              if (
+                turnInput.isDelegatedCompletion === true &&
+                (context.promptSettled || (yield* Deferred.isDone(context.promptWireSettled)))
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                  driver,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
+              }
               const steerId = yield* steering.send(
                 runtime,
                 context.nativeThreadId,
@@ -11337,6 +11522,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 ).pipe(Effect.timeoutOption(STEER_DELIVERY_BOUND));
                 steerInjections.delete(steerId);
                 if (Option.contains(outcome, "settled") && !(yield* Deferred.isDone(injected))) {
+                  if (turnInput.isDelegatedCompletion === true) {
+                    return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                      driver,
+                      providerThreadId: turnInput.providerThread.id,
+                      providerTurnId: turnInput.providerTurnId,
+                    });
+                  }
                   return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                     driver,
                     detail: `Provider turn ${turnInput.providerTurnId} ended before it read the steering message.`,
@@ -11367,7 +11559,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             (effect, turnInput) =>
               effect.pipe(
                 Effect.mapError((cause) =>
-                  cause._tag === "ProviderAdapterSteerRunUnsupportedError"
+                  cause._tag === "ProviderAdapterSteerRunUnsupportedError" ||
+                  cause._tag === "ProviderAdapterSteerDeclinedError"
                     ? cause
                     : new ProviderAdapter.ProviderAdapterSteerRunError({
                         driver,

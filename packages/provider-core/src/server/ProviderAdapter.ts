@@ -640,6 +640,8 @@ export interface ProviderAdapterV2SteerInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurnId: ProviderTurnId;
   readonly message: ProviderAdapterV2TurnMessage;
+  /** True when steering delivers a delegated child's completion rather than a user/agent message. */
+  readonly isDelegatedCompletion?: true;
   /** The selection sent with the message when it differs from the running turn's. */
   readonly modelSelection?: ModelSelection;
   /** The thread's MCP app notes; the adapter sends those the agent has not seen yet. */

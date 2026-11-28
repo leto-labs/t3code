@@ -461,6 +461,7 @@ it.effect("steers a running turn with its sender and the thread's MCP app model 
     }).pipe(Effect.provide(layerControl));
 
     assert.equal(steered.length, 1);
+    assert.isUndefined(steered[0]!.isDelegatedCompletion);
     assert.equal(
       steered[0]!.message.text,
       '[T3 Code: the agent in T3 thread "thread:steer-sender" sent this message, not the user.]\n\nWhat did the app report?',
@@ -472,5 +473,88 @@ it.effect("steers a running turn with its sender and the thread's MCP app model 
         updatedAt: "2026-11-23T14:02:17.000Z",
       },
     ]);
+  }),
+);
+
+it.effect("marks delegated-completion steers so settled background holds can decline them", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:steer-delegated");
+    const sessionId = ProviderSessionId.make("session:steer-delegated");
+    const attemptId = RunAttemptId.make("attempt:steer-delegated");
+    const providerTurnId = ProviderTurnId.make("turn:steer-delegated");
+    const runId = RunId.make("run:steer-delegated");
+    const messageId = MessageId.make("message:steer-delegated");
+    const taskId = NodeId.make("task:steer-delegated");
+    const providerThread = {
+      id: ProviderThreadId.make("provider-thread:steer-delegated"),
+      driver,
+      providerInstanceId,
+      providerSessionId: sessionId,
+    } as OrchestrationV2ProviderThread;
+    const projection = makeProjection({ now, threadId, providerThread, providerTurnId, attemptId });
+    const steered: Array<ProviderAdapter.ProviderAdapterV2SteerInput> = [];
+    const runtime = {
+      instanceId: providerInstanceId,
+      driver,
+      providerSessionId: sessionId,
+      steerTurn: (input: ProviderAdapter.ProviderAdapterV2SteerInput) =>
+        Effect.sync(() => void steered.push(input)),
+    } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    const parentRun = {
+      id: runId,
+      status: "running",
+      activeAttemptId: attemptId,
+      delegatedCompletion: {
+        disposition: "open",
+        nextGeneration: 2,
+        delivery: { generation: 1, messageId, taskIds: [taskId] },
+      },
+    } as unknown as OrchestrationV2Run;
+    const layerControl = ProviderTurnControlService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getProviderControlContext: () =>
+              Effect.succeed({
+                providerThread,
+                providerTurn: projection.providerTurns[0],
+                attempt: projection.attempts[0],
+                message: {
+                  id: messageId,
+                  text: "Delegated task completed",
+                  attachments: [],
+                  createdBy: "agent",
+                  creationSource: "server",
+                  delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
+                } as unknown as NonNullable<
+                  ProjectionStore.ProjectionProviderControlContext["message"]
+                >,
+                run: parentRun,
+              }),
+            getThreadRecords: () => Effect.succeed({ runs: [parentRun] } as never),
+          }),
+          layerSessions(sessionId, runtime),
+          Layer.mock(EventSink.EventSinkV2)({}),
+          Layer.mock(McpAppModelContext.McpAppModelContext)({
+            forThread: () => Effect.succeed([]),
+          }),
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+      yield* control.steer({
+        threadId,
+        providerSessionId: sessionId,
+        providerThreadId: providerThread.id,
+        providerTurnId,
+        messageId,
+      });
+    }).pipe(Effect.provide(layerControl));
+
+    assert.equal(steered.length, 1);
+    assert.isTrue(steered[0]!.isDelegatedCompletion);
   }),
 );

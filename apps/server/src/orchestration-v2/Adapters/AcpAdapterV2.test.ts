@@ -14284,6 +14284,120 @@ describe("AcpAdapterV2", () => {
         assert.notInclude(prompts.at(-1) ?? "", "external_mcp_app_item-1");
       }).pipe(Effect.provide(layerTest)),
   );
+
+  it.live(
+    "declines a delegated-completion native flavor.steering call when the prompt wire settles unread",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const steerSent = yield* Deferred.make<void>();
+        const promptStarted = yield* Deferred.make<void>();
+        const promptGate = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+        const instanceId = ProviderInstanceId.make("acp-test-native-steer-delegated-decline");
+        const threadId = ThreadId.make("thread-acp-native-steer-delegated-decline");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          selfInvocation,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: {
+              ...AcpProviderCapabilitiesV2,
+              turns: {
+                ...AcpProviderCapabilitiesV2.turns,
+                supportsActiveSteering: true,
+              },
+            },
+            steering: {
+              send: () =>
+                Deferred.succeed(steerSent, undefined).pipe(Effect.as("steer-unread-delegated-1")),
+              injectedSteerId: () => undefined,
+            },
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                prompt: (_payload, promptOptions) =>
+                  Effect.gen(function* () {
+                    if (promptOptions?.dispatched) {
+                      yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                    }
+                    yield* Deferred.succeed(promptStarted, undefined);
+                    return yield* Deferred.await(promptGate);
+                  }),
+              }),
+            }),
+          },
+        });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-native-steer-decline"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const sessionId = providerThread.nativeThreadRef!.nativeId;
+        const turnInput = makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now: yield* DateTime.now,
+          ordinal: 1,
+          messageText: "Start native turn",
+        });
+        yield* runtime.startTurn(turnInput);
+        yield* Deferred.await(promptStarted);
+
+        const steerFiber = yield* Effect.forkScoped(
+          runtime
+            .steerTurn({
+              threadId,
+              runId: turnInput.runId,
+              providerThread,
+              providerTurnId: idAllocator.derive.providerTurn({
+                driver: ACP_TEST_DRIVER,
+                nativeTurnId: acpScopedNativeId(instanceId, `${sessionId}:turn:1`),
+              }),
+              isDelegatedCompletion: true,
+              message: {
+                messageId: MessageId.make("message-native-steer-delegated"),
+                text: "Delegated task completed",
+                attachments: [],
+                createdBy: "agent",
+                creationSource: "server",
+              },
+            })
+            .pipe(Effect.exit),
+        );
+        yield* Deferred.await(steerSent);
+        yield* Deferred.succeed(promptGate, { stopReason: "end_turn" });
+        const exit = yield* Fiber.join(steerFiber);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          const failure = Cause.squash(exit.cause);
+          assert.equal(
+            typeof failure === "object" && failure !== null && "_tag" in failure
+              ? failure._tag
+              : undefined,
+            "ProviderAdapterSteerDeclinedError",
+          );
+        }
+      }).pipe(Effect.provide(layerTest)),
+  );
 });
 
 describe("acpPostSettleContinuationOfferEvidence", () => {

@@ -6,6 +6,7 @@ import * as AcpWireSchema from "effect-acp/schema-v1";
 import {
   extractAntigravityUserInputQuestion,
   antigravityApprovalOptions,
+  antigravityDetachedScheduleTool,
   antigravitySubagentOutput,
   antigravityToolOutlivesPrompt,
   classifyAntigravitySubagentToolCall,
@@ -562,15 +563,16 @@ describe("Antigravity tool results", () => {
   });
 
   it.each([
-    { name: "a command", update: commandStarted.update, outlives: true },
+    { name: "a command", update: commandStarted.update, outlives: true, detached: false },
     {
       name: "a daemon",
       update: { ...commandStarted.update, rawInput: { CommandLine: "serve", IsDaemon: true } },
       outlives: false,
+      detached: false,
     },
     // agy 1.5.13 keeps this call in progress until the wake fires.
     {
-      name: "a scheduled wake",
+      name: "a short one-shot scheduled wake (30s)",
       update: {
         sessionUpdate: "tool_call",
         toolCallId: "call_4902666363527503248",
@@ -580,6 +582,85 @@ describe("Antigravity tool results", () => {
         rawInput: { DurationSeconds: 30, Prompt: "Reply only with the word DONE." },
       },
       outlives: true,
+      detached: false,
+    },
+    {
+      name: "a short one-shot scheduled wake at the 120s bound",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_schedule_120",
+        status: "in_progress",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { DurationSeconds: 120, Prompt: "Check status." },
+      },
+      outlives: true,
+      detached: false,
+    },
+    {
+      name: "a long scheduled wake (121s)",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_schedule_121",
+        status: "in_progress",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { DurationSeconds: 121, Prompt: "Check status later." },
+      },
+      outlives: false,
+      detached: true,
+    },
+    {
+      name: "a 3-hour scheduled wake",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_schedule_3h",
+        status: "in_progress",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { DurationSeconds: 10800, Prompt: "05:15Z timer fired" },
+      },
+      outlives: false,
+      detached: true,
+    },
+    {
+      name: "a recurring cron schedule (even with a short DurationSeconds)",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_schedule_cron",
+        status: "in_progress",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { CronExpression: "*/5 * * * *", DurationSeconds: 30, Prompt: "Poll status" },
+      },
+      outlives: false,
+      detached: true,
+    },
+    {
+      name: "a daemon schedule",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_schedule_daemon",
+        status: "in_progress",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { DurationSeconds: 30, IsDaemon: true, Prompt: "Standing job" },
+      },
+      outlives: false,
+      detached: true,
+    },
+    {
+      name: "a schedule without a positive duration",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_schedule_missing",
+        status: "in_progress",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { Prompt: "Missing duration" },
+      },
+      outlives: false,
+      detached: true,
     },
     {
       name: "another native tool",
@@ -592,17 +673,22 @@ describe("Antigravity tool results", () => {
         rawInput: { DirectoryPath: "/workspace" },
       },
       outlives: false,
+      detached: false,
     },
   ] satisfies ReadonlyArray<{
     name: string;
     update: EffectAcpSchema.SessionNotification["update"];
     outlives: boolean;
-  }>)("knows whether $name outlives the prompt", ({ update, outlives }) => {
-    const event = parseToolUpdate({ sessionId: "session-1", update });
-    expect(antigravityToolOutlivesPrompt(normalizeAntigravityToolCall(event.toolCall))).toBe(
-      outlives,
-    );
-  });
+    detached: boolean;
+  }>)(
+    "knows whether $name outlives the prompt or continues detached",
+    ({ update, outlives, detached }) => {
+      const event = parseToolUpdate({ sessionId: "session-1", update });
+      const toolCall = normalizeAntigravityToolCall(event.toolCall);
+      expect(antigravityToolOutlivesPrompt(toolCall)).toBe(outlives);
+      expect(antigravityDetachedScheduleTool(toolCall)).toBe(detached);
+    },
+  );
 
   it("keeps the start of a long command line, where the program and target are", () => {
     const head = "cat > notes.md <<'EOF'";

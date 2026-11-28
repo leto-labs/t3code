@@ -380,6 +380,7 @@ export const layerExecutor: Layer.Layer<
                     const message = projection.messages.find((item) => item.id === messageId);
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
+                    if (run.userMessageId === message.id) return;
                     // Notifications must be queued messages.
                     const queued =
                       message.delegatedCompletion !== undefined ||

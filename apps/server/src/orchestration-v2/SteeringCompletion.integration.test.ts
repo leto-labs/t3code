@@ -1876,6 +1876,171 @@ it.effect("queues a delegated completion wake whose steer the provider declined"
   }),
 );
 
+it.effect(
+  "does not queue a duplicate run when run-end unread-steer recovery beats a declined steer fallback",
+  () =>
+    Effect.gen(function* () {
+      const steerStarted = yield* Deferred.make<void>();
+      const releaseDecline = yield* Deferred.make<void>();
+      const { events, started, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+        "steering-declined-recovery-race",
+        false,
+        true,
+        Effect.void,
+        true,
+        undefined,
+        (turn) =>
+          Deferred.succeed(steerStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseDecline)),
+            Effect.andThen(
+              Effect.fail(
+                new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                  driver,
+                  providerThreadId: turn.providerThread.id,
+                  providerTurnId: turn.providerTurnId,
+                }),
+              ),
+            ),
+          ),
+      );
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const threadId = yield* startFirstTurn;
+        const first = started[0]!;
+        const messageId = MessageId.make("message:declined-recovery-race");
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("steer-race"),
+          threadId,
+          messageId,
+          text: "follow up during run end",
+          attachments: [],
+          dispatchMode: { type: "steer_active", targetRunId: first.runId },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        // Mark the steer unread (pending), as adapters with read confirmation do before reading it.
+        const steerItem = (yield* orchestrator.getThreadProjection(threadId)).turnItems.find(
+          (item) => item.type === "user_message" && item.messageId === messageId,
+        );
+        assert.isDefined(steerItem);
+        const now = yield* DateTime.now;
+        yield* (yield* EventSink.EventSinkV2).write({
+          events: [
+            {
+              id: EventId.make("event:declined-recovery-race:pending-steer"),
+              type: "turn-item.updated",
+              threadId,
+              runId: first.runId,
+              ...(steerItem.nodeId === null ? {} : { nodeId: steerItem.nodeId }),
+              providerInstanceId: instanceId,
+              occurredAt: now,
+              payload: {
+                ...steerItem,
+                status: "pending",
+                startedAt: null,
+                completedAt: null,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+
+        const drainFiber = yield* worker.drain().pipe(Effect.forkScoped);
+        yield* Deferred.await(steerStarted);
+
+        const turn = (yield* orchestrator.getThreadProjection(threadId)).providerTurns[0]!;
+        const recovered = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.created" &&
+              event.payload.userMessageId === messageId &&
+              event.payload.id !== first.runId,
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* Queue.offer(events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "failed", completedAt: yield* DateTime.now },
+        });
+        yield* Queue.offer(events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: first.runOrdinal,
+          failureItemOrdinal: 99,
+          status: "failed",
+          failure: {
+            class: "provider_error",
+            message: "boom",
+            code: null,
+            retryable: false,
+          },
+          threadDisposition: "reusable",
+        });
+        // Wait until run-end unread-steer recovery has moved the message onto its own queued run
+        // BEFORE releasing the in-flight declined steer.
+        yield* Fiber.join(recovered);
+        const beforeDecline = yield* orchestrator.getThreadProjection(threadId);
+        const preDeclineRuns = beforeDecline.runs.filter((run) => run.userMessageId === messageId);
+        assert.lengthOf(
+          preDeclineRuns,
+          1,
+          "run-end recovery must move the unread steer onto one queued run",
+        );
+        const recoveredRun = preDeclineRuns[0]!;
+        assert.equal(
+          beforeDecline.messages.find((message) => message.id === messageId)?.runId,
+          recoveredRun.id,
+        );
+
+        // Now release the declined steer: EffectWorker sees run.userMessageId === message.id
+        // and must not enqueue a second follow-up run.
+        yield* Deferred.succeed(releaseDecline, undefined);
+        yield* Fiber.join(drainFiber);
+        yield* worker.drain();
+
+        const afterDecline = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(
+          afterDecline.runs.filter((run) => run.userMessageId === messageId),
+          1,
+          "declined-steer fallback after run-end recovery must not create a second run",
+        );
+
+        // Even if a stale fallback dispatches with steerFollowUpOfRunId pointing at the recovered run,
+        // the orchestrator must reject it instead of creating a second delivery run.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("stale-declined-follow-up"),
+          threadId,
+          messageId,
+          steerFollowUpOfRunId: recoveredRun.id,
+          text: "follow up during run end",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const finalProjection = yield* orchestrator.getThreadProjection(threadId);
+        assert.lengthOf(
+          finalProjection.runs.filter((run) => run.userMessageId === messageId),
+          1,
+          "a steerFollowUpOfRunId targeting the run that already owns the message must be ignored",
+        );
+        const messageItems = finalProjection.turnItems.filter(
+          (item) => item.type === "user_message" && item.messageId === messageId,
+        );
+        assert.lengthOf(messageItems, 1);
+        assert.equal(messageItems[0]?.runId, recoveredRun.id);
+      }).pipe(Effect.provide(layer));
+    }),
+);
+
 // regression: #26695 cancelling a Copilot prompt to steer it kills its background agents
 it.effect("queues a steer until the turn ends when the provider cannot steer it", () =>
   Effect.gen(function* () {

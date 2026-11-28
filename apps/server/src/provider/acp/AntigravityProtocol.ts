@@ -58,21 +58,45 @@ const decodeToolCallContent = Schema.decodeUnknownOption(AcpWireSchema.ToolCallC
 
 // agy keeps its own `schedule` call in progress until the wake fires, then replies by itself.
 const ANTIGRAVITY_SCHEDULE_TITLES = new Set(["Run schedule", "Running schedule"]);
+const MAX_HELD_SCHEDULE_SECONDS = 120;
 
-/**
- * The agent goes on running a command or a scheduled wake after its prompt ends, and replies by
- * itself when it finishes. A daemon may never finish.
- */
-export function antigravityToolOutlivesPrompt(toolCall: AcpToolCallState): boolean {
-  if (toolCall.title !== undefined && ANTIGRAVITY_SCHEDULE_TITLES.has(toolCall.title)) return true;
-  return antigravityCommandOutlivesPrompt(toolCall);
+function isShortOneShotSchedule(input: unknown): boolean {
+  if (!Predicate.isObject(input)) return false;
+  if (input.IsDaemon === true || input.isDaemon === true) return false;
+  const cron = input.CronExpression ?? input.cronExpression;
+  if (cron !== undefined && cron !== null && String(cron).trim().length > 0) return false;
+  const duration = input.DurationSeconds ?? input.durationSeconds;
+  return (
+    typeof duration === "number" &&
+    Number.isFinite(duration) &&
+    duration > 0 &&
+    duration <= MAX_HELD_SCHEDULE_SECONDS
+  );
 }
 
-/** A non-daemon command the agent awaits; unlike a schedule, it reports progress while it runs. */
-export function antigravityCommandOutlivesPrompt(toolCall: AcpToolCallState): boolean {
-  if (toolCall.title !== undefined && ANTIGRAVITY_SCHEDULE_TITLES.has(toolCall.title)) return false;
+/**
+ * The agent goes on running a non-daemon command or short one-shot schedule after its prompt ends,
+ * and replies by itself when it finishes. Long, recurring, or daemon schedules let the run finish
+ * and wake a new continuation run when they fire.
+ */
+export function antigravityToolOutlivesPrompt(toolCall: AcpToolCallState): boolean {
   const input = toolCall.data.rawInput;
+  if (toolCall.title !== undefined && ANTIGRAVITY_SCHEDULE_TITLES.has(toolCall.title)) {
+    return isShortOneShotSchedule(input);
+  }
   return toolCall.kind === "execute" && !(Predicate.isObject(input) && input.IsDaemon === true);
+}
+
+/**
+ * Long, recurring, or daemon schedules let the originating turn finish while staying alive in
+ * the agent process so idle release does not kill the timer before it wakes a continuation run.
+ */
+export function antigravityDetachedScheduleTool(toolCall: AcpToolCallState): boolean {
+  return (
+    toolCall.title !== undefined &&
+    ANTIGRAVITY_SCHEDULE_TITLES.has(toolCall.title) &&
+    !isShortOneShotSchedule(toolCall.data.rawInput)
+  );
 }
 
 /** Native questions share the permission method, but their choices are not approvals. */

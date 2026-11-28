@@ -19,6 +19,7 @@ import {
   previewRecordingIdFromToolItem,
   sentMessageFromToolItem,
 } from "@t3tools/shared/toolOutput";
+import * as Cause from "effect/Cause";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -28,6 +29,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -47,6 +49,14 @@ import { normalizeAntigravitySessionUpdate } from "../../provider/acp/Antigravit
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as ProviderInstallationGate from "../../provider/ProviderInstallationGate.ts";
+import * as CommandOutputHub from "../CommandOutputHub.ts";
+import * as EventSink from "../EventSink.ts";
+import * as ProjectionStore from "../ProjectionStore.ts";
+import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
+import * as ProviderEventIngestor from "../ProviderEventIngestor.ts";
+import * as ProviderSessionManager from "../ProviderSessionManager.ts";
 import { makeTurnInput } from "./AcpAdapterV2.testkit.ts";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import {
@@ -1579,8 +1589,12 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
     });
 
   return {
+    adapter,
     session,
+    events,
     providerThread,
+    modelSelection,
+    runtimePolicy,
     command,
     usage,
     offers,
@@ -1758,43 +1772,619 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
-  it.effect("keeps a silent scheduled wake in its run past the command hold bound", () =>
+  it.effect(
+    "does not keep a 3-hour Run schedule open, lets queued turns run, preserves tool ownership, and wakes a continuation run when it fires",
+    () =>
+      Effect.gen(function* () {
+        const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, {
+          initialToolCalls: [
+            {
+              sessionUpdate: "tool_call",
+              toolCallId: "call_schedule_3h",
+              kind: "other",
+              title: "Run schedule",
+              status: "in_progress",
+              rawInput: { DurationSeconds: 10800, Prompt: "3-hour timer fired" },
+            },
+          ],
+        });
+        const { session, usage, offers, send, startTurn, until, throughTerminal } = opened;
+
+        yield* startTurn(1, false);
+        const firstRun = yield* throughTerminal;
+        const firstTerminal = firstRun.at(-1);
+        assert.equal(
+          firstTerminal?.type === "turn.terminal" && firstTerminal.status,
+          "completed",
+          "a 3-hour Run schedule must finalize its run immediately once the prompt settles",
+        );
+        assert.lengthOf(offers, 0);
+        assert.isTrue(
+          yield* session.hasPendingBackgroundWork!,
+          "the detached 3-hour schedule must keep the session pinned against idle release",
+        );
+
+        // A queued message (such as an hourly heartbeat) must run without waiting on the 3h timer.
+        yield* opened.releaseSteer;
+        yield* startTurn(2, false);
+        const secondRun = yield* throughTerminal;
+        const secondTerminal = secondRun.at(-1);
+        assert.equal(
+          secondTerminal?.type === "turn.terminal" && secondTerminal.status,
+          "completed",
+          "queued messages must not be starved by a 3-hour Run schedule",
+        );
+        assert.lengthOf(opened.prompts, 2);
+        assert.isTrue(
+          yield* session.hasPendingBackgroundWork!,
+          "a later turn finishing must not drop the earlier detached schedule pin",
+        );
+
+        // When the 3-hour timer fires later, its status-only update stays on run 1 while
+        // post-settle continuation wakes a fresh run for the reply.
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_schedule_3h",
+          status: "completed",
+        });
+        yield* send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Three-hour timer fired." },
+        });
+        yield* send(usage);
+        assert.lengthOf(offers, 1, "the fired 3-hour schedule must offer a continuation run");
+        yield* offers[0]!.dispatchIfCurrent!(Effect.void);
+
+        yield* startTurn(3, true);
+        yield* TestClock.adjust("3 seconds");
+        const wakeRun = yield* until((event) => event.type === "turn.terminal");
+        const wakeTerminal = wakeRun.at(-1);
+        assert.equal(wakeTerminal?.type === "turn.terminal" && wakeTerminal.status, "completed");
+        assert.include(
+          JSON.stringify(wakeRun),
+          "Three-hour timer fired.",
+          "the continuation run carries the timer wake reply",
+        );
+        const scheduleUpdates = wakeRun.filter(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "call_schedule_3h",
+        );
+        assert.isAtLeast(scheduleUpdates.length, 1);
+        for (const event of scheduleUpdates) {
+          assert.equal(
+            event.type === "turn_item.updated" && event.turnItem.runId,
+            RunId.make("run-antigravity-wake-1"),
+            "the late schedule update must stay attached to its originating run",
+          );
+          assert.equal(event.type === "turn_item.updated" && event.turnItem.title, "Run schedule");
+          assert.include(
+            JSON.stringify(event),
+            "10800",
+            "the late status-only update must preserve the original schedule input",
+          );
+        }
+        assert.isFalse(
+          yield* session.hasPendingBackgroundWork!,
+          "once the detached schedule completes and wakes, the session may idle-release",
+        );
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "keeps a detached timer continuation open for a delayed first reply and ignores repeated terminal updates",
+    () =>
+      Effect.gen(function* () {
+        const { session, events, usage, offers, send, startTurn, until } =
+          yield* openSessionWithRunningCommand({}, undefined, undefined, {
+            initialToolCalls: [
+              {
+                sessionUpdate: "tool_call",
+                toolCallId: "call_schedule_3h_delayed",
+                kind: "other",
+                title: "Run schedule",
+                status: "in_progress",
+                rawInput: { DurationSeconds: 10800, Prompt: "Delayed wake reply" },
+              },
+            ],
+          });
+
+        yield* startTurn(1, false);
+        const firstRun = yield* until((event) => event.type === "turn.terminal");
+        assert.equal(firstRun.at(-1)?.type, "turn.terminal");
+
+        // Timer completes before the agent starts streaming its wake reply.
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_schedule_3h_delayed",
+          status: "completed",
+        });
+        assert.lengthOf(
+          offers,
+          1,
+          "transitioning from live to completed must offer one continuation",
+        );
+        yield* offers[0]!.dispatchIfCurrent!(Effect.void);
+
+        // Continuation starts immediately, before the first reply chunk arrives.
+        yield* startTurn(2, true);
+        yield* TestClock.adjust("10 seconds");
+        const beforeReply = yield* Queue.clear(events);
+        assert.isFalse(
+          beforeReply.some((event) => event.type === "turn.terminal"),
+          "a detached timer continuation must stay open past the 3s debounce while awaiting its first reply",
+        );
+
+        // Delayed first reply arrives 10s later and closes cleanly after usage_update.
+        yield* send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Delayed 3h wake reply." },
+        });
+        yield* send(usage);
+        yield* TestClock.adjust("3 seconds");
+        const wakeRun = yield* until((event) => event.type === "turn.terminal");
+        const wakeTerminal = wakeRun.at(-1);
+        assert.equal(wakeTerminal?.type === "turn.terminal" && wakeTerminal.status, "completed");
+        assert.include(JSON.stringify(wakeRun), "Delayed 3h wake reply.");
+
+        // A repeated terminal update on the already-completed timer must not queue a second continuation.
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_schedule_3h_delayed",
+          status: "completed",
+        });
+        assert.lengthOf(
+          offers,
+          1,
+          "repeated terminal updates on a detached timer must not queue a second continuation",
+        );
+        assert.isFalse(yield* session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "keeps a 3-hour Run schedule alive across ProviderSessionManager idle release and delivers its wake",
+    () =>
+      Effect.gen(function* () {
+        const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, {
+          initialToolCalls: [
+            {
+              sessionUpdate: "tool_call",
+              toolCallId: "call_schedule_3h_psm",
+              kind: "other",
+              title: "Run schedule",
+              status: "in_progress",
+              rawInput: { DurationSeconds: 10800, Prompt: "3-hour PSM timer fired" },
+            },
+          ],
+        });
+        const { adapter, modelSelection, runtimePolicy, usage, offers, send } = opened;
+        const threadId = ThreadId.make("thread-antigravity-wake-psm");
+        const sessionId = ProviderSessionId.make("provider-session-antigravity-wake-psm");
+        const managerLayer = ProviderSessionManager.layerWithOptions({
+          idleTimeoutMs: 2 * 60 * 1000,
+          maxIdlePinMs: 4 * 60 * 60 * 1000,
+        }).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              ProviderAdapterRegistry.layerSingle(adapter),
+              Layer.mock(CommandOutputHub.CommandOutputHub)({}),
+              Layer.mock(EventSink.EventSinkV2)({ write: () => Effect.succeed([]) }),
+              IdAllocator.layer,
+              Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+                ingestNormalized: () => Effect.succeed([]),
+              }),
+              Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+                issue: () =>
+                  Effect.succeed({
+                    config: {
+                      endpointUrl: "http://127.0.0.1:0/mcp",
+                      authorization: "Bearer test-token",
+                    },
+                  } as never),
+                revokeProviderSession: () => Effect.void,
+                revokeThread: () => Effect.void,
+              }),
+              Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                getThread: () =>
+                  Effect.succeed({
+                    id: threadId,
+                    lineage: {
+                      parentThreadId: null,
+                      relationshipToParent: null,
+                      rootThreadId: threadId,
+                    },
+                  } as never),
+                getThreadShell: () =>
+                  Effect.succeed({
+                    id: threadId,
+                    lineage: {
+                      parentThreadId: null,
+                      relationshipToParent: null,
+                      rootThreadId: threadId,
+                    },
+                  } as never),
+                getThreadRecords: () =>
+                  Effect.succeed({
+                    thread: null,
+                    runs: [],
+                    attempts: [],
+                    nodes: [],
+                    messages: [],
+                    providerThreads: [],
+                    providerTurns: [],
+                    turnItems: [],
+                    subagents: [],
+                    runtimeRequests: [],
+                    plans: [],
+                    checkpoints: [],
+                    contextTransfers: [],
+                  } as never),
+              }),
+              ProviderInstallationGate.layer,
+            ),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const managedSession = yield* manager.open({
+            threadId,
+            providerSessionId: sessionId,
+            modelSelection,
+            runtimePolicy,
+          });
+          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+          yield* managedSession.events.pipe(
+            Stream.runForEach((event) => Queue.offer(events, event)),
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          const providerThread = yield* managedSession.ensureThread({
+            threadId,
+            modelSelection,
+            runtimePolicy,
+          });
+          const now = yield* DateTime.now;
+          yield* managedSession.startTurn({
+            appThread: {
+              createdBy: "user",
+              creationSource: "web",
+              id: threadId,
+              projectId: ProjectId.make("project-antigravity-wake"),
+              title: "Antigravity wake PSM",
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: process.cwd(),
+              activeProviderThreadId: providerThread.id,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+            threadId,
+            runId: RunId.make("run-antigravity-psm-1"),
+            runOrdinal: 1,
+            providerTurnOrdinal: 1,
+            attemptId: RunAttemptId.make("attempt-antigravity-psm-1"),
+            rootNodeId: NodeId.make("node-antigravity-psm-1"),
+            providerThread,
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: MessageId.make("message-antigravity-psm-1"),
+              text: "schedule a 3h check",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy,
+          });
+          // Wait for run 1 to finish immediately.
+          while (true) {
+            const event = yield* Queue.take(events);
+            if (event.type === "turn.terminal" && event.runOrdinal === 1) break;
+          }
+
+          // Advance 3 hours in steps past the 2-minute idle timeout: session must stay open.
+          for (let step = 0; step < 6; step += 1) {
+            yield* TestClock.adjust("30 minutes");
+          }
+          assert.isTrue(
+            Option.isSome(yield* manager.get(sessionId)),
+            "ProviderSessionManager must keep the session open while a detached 3-hour schedule is live",
+          );
+
+          // Timer fires at 3 hours: continuation offer arrives on the still-live session.
+          yield* send({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_schedule_3h_psm",
+            status: "completed",
+          });
+          yield* send({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "3h PSM timer fired." },
+          });
+          yield* send(usage);
+          assert.lengthOf(offers, 1, "the live session must offer a continuation run at 3 hours");
+          yield* offers[0]!.dispatchIfCurrent!(Effect.void);
+
+          // Deliver the continuation run so buffered wake output drains, then verify idle release.
+          yield* managedSession.startTurn({
+            appThread: {
+              createdBy: "user",
+              creationSource: "web",
+              id: threadId,
+              projectId: ProjectId.make("project-antigravity-wake"),
+              title: "Antigravity wake PSM",
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: process.cwd(),
+              activeProviderThreadId: providerThread.id,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+            threadId,
+            runId: RunId.make("run-antigravity-psm-2"),
+            runOrdinal: 2,
+            providerTurnOrdinal: 2,
+            attemptId: RunAttemptId.make("attempt-antigravity-psm-2"),
+            rootNodeId: NodeId.make("node-antigravity-psm-2"),
+            providerThread,
+            message: {
+              createdBy: "agent",
+              creationSource: "provider",
+              messageId: MessageId.make("message-antigravity-psm-2"),
+              text: "3-hour wake",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy,
+          });
+          yield* TestClock.adjust("3 seconds");
+          let sawWakeText = false;
+          while (true) {
+            const event = yield* Queue.take(events);
+            if (
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "assistant_message" &&
+              event.turnItem.text.includes("3h PSM timer fired.")
+            ) {
+              sawWakeText = true;
+            }
+            if (event.type === "turn.terminal" && event.runOrdinal === 2) break;
+          }
+          assert.isTrue(sawWakeText, "the continuation run must deliver the 3-hour wake output");
+
+          // Once the detached schedule and its wake run have completed, the session releases on idle.
+          yield* TestClock.adjust("35 minutes");
+          assert.isTrue(
+            Option.isNone(yield* manager.get(sessionId)),
+            "ProviderSessionManager must release the session on idle once the detached schedule and wake run complete",
+          );
+        }).pipe(Effect.provide(managerLayer));
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("keeps a normal short one-shot Run schedule wake in the same run", () =>
     Effect.gen(function* () {
-      const { usage, offers, send, startTurn, until, throughPromptSettled } =
+      const { events, usage, offers, send, startTurn, until, throughPromptSettled } =
         yield* openSessionWithRunningCommand({}, undefined, undefined, {
           initialToolCalls: [
             {
               sessionUpdate: "tool_call",
-              toolCallId: "call_schedule",
+              toolCallId: "call_schedule_short_ok",
               kind: "other",
               title: "Run schedule",
               status: "in_progress",
-              rawInput: { DurationSeconds: 3600, Prompt: "Continue the task" },
+              rawInput: { DurationSeconds: 60, Prompt: "Short wait" },
             },
           ],
         });
       yield* startTurn(1, false);
       yield* throughPromptSettled;
-      yield* TestClock.adjust("61 minutes");
+      yield* TestClock.adjust("30 seconds");
+      const midWait = yield* Queue.clear(events);
+      assert.isFalse(
+        midWait.some((event) => event.type === "turn.terminal"),
+        "a 60s one-shot schedule must keep its run open while waiting",
+      );
+
       yield* send({
         sessionUpdate: "tool_call_update",
-        toolCallId: "call_schedule",
+        toolCallId: "call_schedule_short_ok",
         status: "completed",
       });
       yield* send({
         sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "Picked the task back up." },
+        content: { type: "text", text: "Short timer fired in-run." },
       });
       yield* send(usage);
       yield* TestClock.adjust("3 seconds");
       const run = yield* until((event) => event.type === "turn.terminal");
-      assert.include(
-        JSON.stringify(run),
-        "Picked the task back up.",
-        "the wake reply stays in the run",
-      );
+      assert.include(JSON.stringify(run), "Short timer fired in-run.");
       assert.lengthOf(offers, 0);
     }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("bounds a silent short one-shot Run schedule with the post-settle hold timeout", () =>
+    Effect.gen(function* () {
+      const { events, offers, startTurn, until, throughPromptSettled } =
+        yield* openSessionWithRunningCommand({}, undefined, undefined, {
+          initialToolCalls: [
+            {
+              sessionUpdate: "tool_call",
+              toolCallId: "call_schedule_short",
+              kind: "other",
+              title: "Run schedule",
+              status: "in_progress",
+              rawInput: { DurationSeconds: 60, Prompt: "Short wait" },
+            },
+          ],
+        });
+      yield* startTurn(1, false);
+      const prompt = yield* throughPromptSettled;
+      yield* TestClock.adjust("20 minutes");
+      const beforeExpiry = yield* Queue.clear(events);
+      assert.isFalse(
+        beforeExpiry.some((event) => event.type === "turn.terminal"),
+        "the short one-shot schedule must still hold the run open before the 30-minute hold bound",
+      );
+      yield* TestClock.adjust("11 minutes");
+      const run = yield* until((event) => event.type === "turn.terminal");
+      const terminal = run.at(-1);
+      assert.equal(
+        terminal?.type === "turn.terminal" && terminal.status,
+        "completed",
+        "a lost short schedule wake must still finalize at the bounded hold timeout",
+      );
+      assert.lengthOf(offers, 0);
+      const scheduleItem = [...prompt, ...beforeExpiry, ...run].findLast(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "call_schedule_short",
+      );
+      assert.isTrue(
+        scheduleItem?.type === "turn_item.updated" && scheduleItem.turnItem.status === "completed",
+      );
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "does not let an earlier post-settle hold timer finalize a reopened foreground steer",
+    () =>
+      Effect.gen(function* () {
+        const opened = yield* openSessionWithRunningCommand(
+          {},
+          undefined,
+          { agentVersion: "1.5.11", holdsFirstPrompt: false },
+          {
+            initialToolCalls: [
+              {
+                sessionUpdate: "tool_call",
+                toolCallId: "call_schedule_reopen",
+                kind: "other",
+                title: "Run schedule",
+                status: "in_progress",
+                rawInput: { DurationSeconds: 60, Prompt: "Short wait" },
+              },
+            ],
+          },
+        );
+        const {
+          session,
+          events,
+          providerThread,
+          usage,
+          send,
+          startTurn,
+          until,
+          throughPromptSettled,
+        } = opened;
+        yield* startTurn(1, false);
+        const prompt = yield* throughPromptSettled;
+        const providerTurnId = prompt.flatMap((event) =>
+          event.type === "provider_turn.updated" ? [event.providerTurn.id] : [],
+        )[0]!;
+
+        // A user steer reopens the foreground prompt while the short schedule is still running.
+        yield* session.steerTurn({
+          threadId: ThreadId.make("thread-antigravity-wake"),
+          runId: RunId.make("run-antigravity-wake-1"),
+          providerThread,
+          providerTurnId,
+          message: {
+            messageId: MessageId.make("message-antigravity-steer-reopen"),
+            text: "Keep going with the extra check",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        });
+        // Past the 30-minute hold window from prompt 1: the stale hold timer must not finalize the active steer.
+        yield* TestClock.adjust("31 minutes");
+        const duringSteer = yield* Queue.clear(events);
+        assert.isFalse(
+          duringSteer.some((event) => event.type === "turn.terminal"),
+          "a stale post-settle hold timer must not finalize a reopened foreground steer",
+        );
+
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_schedule_reopen",
+          status: "completed",
+        });
+        yield* send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Finished reopened steer." },
+        });
+        yield* send(usage);
+        yield* opened.releaseSteer;
+        const run = yield* until((event) => event.type === "turn.terminal");
+        const terminal = run.at(-1);
+        assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+        assert.include(JSON.stringify(run), "Finished reopened steer.");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "extends the post-settle hold timeout when fresh progress arrives right before expiry",
+    () =>
+      Effect.gen(function* () {
+        const { events, send, startTurn, until, throughPromptSettled } =
+          yield* openSessionWithRunningCommand({}, undefined, undefined, {
+            initialToolCalls: [
+              {
+                sessionUpdate: "tool_call",
+                toolCallId: "call_schedule_progress_reset",
+                kind: "other",
+                title: "Run schedule",
+                status: "in_progress",
+                rawInput: { DurationSeconds: 60, Prompt: "Short wait with progress" },
+              },
+            ],
+          });
+
+        yield* startTurn(1, false);
+        yield* throughPromptSettled;
+
+        // Advance right up to the 30-minute hold boundary, then emit fresh progress.
+        yield* TestClock.adjust("29 minutes");
+        yield* TestClock.adjust("59 seconds");
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_schedule_progress_reset",
+          status: "in_progress",
+        });
+        yield* TestClock.adjust("2 seconds");
+        const afterProgress = yield* Queue.clear(events);
+        assert.isFalse(
+          afterProgress.some((event) => event.type === "turn.terminal"),
+          "fresh progress just before hold expiry must reset the quiet deadline",
+        );
+
+        // After another full 30 minutes of silence, the bounded hold expires cleanly.
+        yield* TestClock.adjust("31 minutes");
+        const expired = yield* until((event) => event.type === "turn.terminal");
+        const terminal = expired.at(-1);
+        assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+      }).pipe(Effect.provide(layerSession)),
   );
 
   it.effect("keeps an unanswered question open past the command hold bound", () =>
@@ -2239,6 +2829,84 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
+  it.effect(
+    "declines a delegated-completion steer once the foreground prompt has settled on a background hold",
+    () =>
+      Effect.gen(function* () {
+        const opened = yield* openSessionWithRunningCommand(
+          { WaitMsBeforeAsync: 10000 },
+          undefined,
+          { agentVersion: "1.5.11", holdsFirstPrompt: false },
+        );
+        const {
+          session,
+          providerThread,
+          command,
+          usage,
+          send,
+          startTurn,
+          until,
+          throughPromptSettled,
+        } = opened;
+        yield* startTurn(1, false);
+        const prompt = yield* throughPromptSettled;
+        const providerTurnId = prompt.flatMap((event) =>
+          event.type === "provider_turn.updated" ? [event.providerTurn.id] : [],
+        )[0]!;
+
+        const exit = yield* session
+          .steerTurn({
+            threadId: ThreadId.make("thread-antigravity-wake"),
+            runId: RunId.make("run-antigravity-wake-1"),
+            providerThread,
+            providerTurnId,
+            isDelegatedCompletion: true,
+            message: {
+              messageId: MessageId.make("message-antigravity-delegated-wake"),
+              text: "Delegated task completed",
+              attachments: [],
+              createdBy: "agent",
+              creationSource: "server",
+            },
+          })
+          .pipe(Effect.exit);
+        assert.isTrue(
+          Exit.isFailure(exit),
+          "a post-settle hold must decline delegated-completion steers",
+        );
+        if (Exit.isFailure(exit)) {
+          const failure = Cause.squash(exit.cause);
+          assert.equal(
+            typeof failure === "object" && failure !== null && "_tag" in failure
+              ? failure._tag
+              : undefined,
+            "ProviderAdapterSteerDeclinedError",
+          );
+        }
+        assert.lengthOf(
+          opened.prompts,
+          1,
+          "declining must not inject a second prompt into the settled run",
+        );
+        assert.equal(opened.cancels(), 0, "declining must not cancel the held command");
+
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          ...command,
+          status: "completed",
+          rawOutput: { output: "Command exited with code 0.", exit_code: 0 },
+        });
+        yield* send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Command done." },
+        });
+        yield* send(usage);
+        yield* TestClock.adjust("3 seconds");
+        const terminal = (yield* until((event) => event.type === "turn.terminal")).at(-1);
+        assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
   // A wake run has no prompt of its own, yet agy can keep working in it for minutes.
   it.effect("steers a continuation run that keeps working after its wake", () =>
     Effect.gen(function* () {
@@ -2371,6 +3039,59 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
       assert.notInclude(subagentStatuses, "interrupted");
       assert.equal(subagentStatuses.at(-1), "idle");
     }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "accepts a delegated-completion steer while the foreground prompt is still active",
+    () =>
+      Effect.gen(function* () {
+        const opened = yield* openSessionWithRunningCommand(
+          { WaitMsBeforeAsync: 10000 },
+          undefined,
+          { agentVersion: "1.5.11", holdsFirstPrompt: true },
+        );
+        const { session, providerThread, command, usage, send, startTurn, until } = opened;
+        yield* startTurn(1, false);
+        const started = yield* until(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === command.toolCallId,
+        );
+        const providerTurnId = started.flatMap((event) =>
+          event.type === "provider_turn.updated" ? [event.providerTurn.id] : [],
+        )[0]!;
+
+        yield* session.steerTurn({
+          threadId: ThreadId.make("thread-antigravity-wake"),
+          runId: RunId.make("run-antigravity-wake-1"),
+          providerThread,
+          providerTurnId,
+          isDelegatedCompletion: true,
+          message: {
+            messageId: MessageId.make("message-antigravity-delegated-active"),
+            text: "Delegated task completed mid-prompt",
+            attachments: [],
+            createdBy: "agent",
+            creationSource: "server",
+          },
+        });
+        assert.lengthOf(opened.prompts, 2);
+
+        yield* send({
+          sessionUpdate: "tool_call_update",
+          ...command,
+          status: "completed",
+          rawOutput: { output: "Command exited with code 0.", exit_code: 0 },
+        });
+        yield* send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Handled mid-prompt completion." },
+        });
+        yield* send(usage);
+        yield* opened.releaseSteer;
+        const terminal = (yield* until((event) => event.type === "turn.terminal")).at(-1);
+        assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+      }).pipe(Effect.provide(layerSession)),
   );
 
   // Files as agy 1.5.12 wrote them: the launch sits in the child's inbox, and the child's report

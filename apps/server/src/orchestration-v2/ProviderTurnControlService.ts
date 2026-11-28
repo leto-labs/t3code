@@ -458,6 +458,7 @@ export const layer: Layer.Layer<
               runId: run.id,
               providerThread: loaded.providerThread,
               providerTurnId: loaded.providerTurn.id,
+              ...(ownership === undefined ? {} : { isDelegatedCompletion: true }),
               ...(input.modelSelection === undefined
                 ? {}
                 : { modelSelection: input.modelSelection }),
